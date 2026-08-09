@@ -158,6 +158,7 @@ export class WasmV8Worker {
   }
 
   async close() {
+    if (this.#terminationPromise) return this.#terminationPromise;
     if (this.#closePromise) return this.#closePromise;
     if (this.#closed) return;
     this.#closing = true;
@@ -167,7 +168,8 @@ export class WasmV8Worker {
       } finally {
         this.#closed = true;
         try {
-          await this.#worker.terminate();
+          if (this.#terminationPromise) await this.#terminationPromise;
+          else await this.#worker.terminate();
         } finally {
           this.#fail(new Error("Harness worker is closed"), true);
         }
@@ -177,6 +179,7 @@ export class WasmV8Worker {
   }
 
   async terminate() {
+    if (this.#terminationPromise) return this.#terminationPromise;
     if (this.#closed) return;
     await this.#abort(new Error("Harness worker was terminated"));
   }

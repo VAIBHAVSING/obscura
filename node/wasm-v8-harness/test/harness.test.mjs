@@ -376,6 +376,10 @@ test("outer request deadline terminates a Worker stuck in result inspection", as
     }),
     /hostEvaluate timed out after 50ms/,
   );
+  // A timeout starts termination asynchronously. Explicit termination must
+  // join that existing operation rather than returning early because closed
+  // was set before Worker.terminate() finished.
+  await worker.terminate();
   await assert.rejects(worker.inspect(), /closed/);
 });
 
