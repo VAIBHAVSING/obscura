@@ -287,6 +287,98 @@ test("rejects asynchronous host results instead of escaping the VM deadline", as
   }
 });
 
+test("keeps result getters, thrown-value getters, and thenables inside the VM deadline", async () => {
+  const worker = await WasmV8Worker.launch(mockModule);
+  try {
+    const startedAt = performance.now();
+    await assert.rejects(
+      worker.hostEvaluate(
+        `({
+          get delayed() {
+            const deadline = Date.now() + 1_000;
+            while (Date.now() < deadline) {}
+            return 42;
+          }
+        })`,
+        { timeoutMs: 20, requestTimeoutMs: 2_000 },
+      ),
+      /timed out/,
+    );
+    assert.ok(performance.now() - startedAt < 750, "finite result getter escaped the VM deadline");
+
+    await assert.rejects(
+      worker.hostEvaluate("({ get then() { while (true) {} } })", {
+        timeoutMs: 20,
+        requestTimeoutMs: 2_000,
+      }),
+      /timed out/,
+    );
+    await assert.rejects(
+      worker.hostEvaluate("(() => { throw { get message() { while (true) {} } }; })()", {
+        timeoutMs: 20,
+        requestTimeoutMs: 2_000,
+      }),
+      /timed out/,
+    );
+    assert.equal(await worker.hostEvaluate("6 * 7"), 42);
+  } finally {
+    await worker.close();
+  }
+});
+
+test("coerces selectors in the page realm and bounds hostile toString hooks", async () => {
+  const worker = await WasmV8Worker.launch(mockObscuraCore);
+  try {
+    const html = "<html><body><h1>bounded</h1></body></html>";
+    assert.equal(
+      await worker.bridgeEvaluate(
+        "document.querySelector({ toString() { return 'h1'; } }).textContent",
+        { html, timeoutMs: 100, requestTimeoutMs: 2_000 },
+      ),
+      "bounded",
+    );
+    await assert.rejects(
+      worker.bridgeEvaluate("document.querySelector({ toString() { while (true) {} } })", {
+        timeoutMs: 20,
+        requestTimeoutMs: 2_000,
+      }),
+      /timed out/,
+    );
+    assert.equal(await worker.bridgeEvaluate("document.querySelector('h1').textContent"), "bounded");
+  } finally {
+    await worker.close();
+  }
+});
+
+test("bounds hostStress result inspection inside each VM iteration", async () => {
+  const worker = await WasmV8Worker.launch(mockModule);
+  try {
+    await assert.rejects(
+      worker.request(
+        "hostStress",
+        { iterations: 1, source: "({ get then() { while (true) {} } })", timeoutMs: 20 },
+        2_000,
+      ),
+      /timed out/,
+    );
+    assert.equal(await worker.hostEvaluate("40 + 2"), 42);
+  } finally {
+    await worker.close();
+  }
+});
+
+test("outer request deadline terminates a Worker stuck in result inspection", async () => {
+  const worker = await WasmV8Worker.launch(mockModule);
+  await assert.rejects(
+    worker.hostEvaluate("({ get then() { while (true) {} } })", {
+      timeoutMs: 10_000,
+      requestTimeoutMs: 50,
+    }),
+    /hostEvaluate timed out after 50ms/,
+  );
+  await assert.rejects(worker.inspect(), /closed/);
+});
+
 test("terminates the isolation boundary when an operation deadline expires", async () => {
   const worker = await WasmV8Worker.launch(mockModule);
   await assert.rejects(
@@ -301,10 +393,51 @@ test("rejects invalid payloads and uncloneable results without poisoning the wor
   try {
     await assert.rejects(worker.request("probe", { source: () => 42 }), /clone/i);
     await assert.rejects(worker.hostEvaluate("Symbol('not-cloneable')"), /clone/i);
+    await assert.rejects(worker.hostEvaluate("new Date()"), /plain or null-prototype objects/);
+    await assert.rejects(worker.hostEvaluate("new Map([['answer', 42]])"), /plain or null-prototype objects/);
+    await assert.rejects(worker.hostEvaluate("new Uint8Array([4, 2])"), /plain or null-prototype objects/);
+    await assert.rejects(
+      worker.hostEvaluate("(() => { const value = []; value.length = 100001; return value; })()"),
+      /array length limit/,
+    );
     await assert.rejects(worker.hostEvaluate(42), /source must be a string/);
     await assert.rejects(worker.hostEvaluate("1 + 1", { timeoutMs: 1.5 }), /timeoutMs must be an integer/);
     await assert.rejects(worker.hostEvaluate("1 + 1", { requestTimeoutMs: 0 }), /request timeout must be an integer/);
     assert.equal(await worker.hostEvaluate("6 * 7"), 42);
+  } finally {
+    await worker.close();
+  }
+});
+
+test("round-trips bounded graph values without prototype mutation", async () => {
+  const worker = await WasmV8Worker.launch(mockModule);
+  try {
+    const result = await worker.hostEvaluate(`(() => {
+      const value = {
+        missing: undefined,
+        bigint: 12345678901234567890n,
+        nan: NaN,
+        positiveInfinity: Infinity,
+        negativeInfinity: -Infinity,
+        negativeZero: -0,
+      };
+      Object.defineProperty(value, "__proto__", {
+        enumerable: true,
+        value: "data-only",
+      });
+      value.self = value;
+      return value;
+    })()`);
+    assert.equal(result.missing, undefined);
+    assert.equal(result.bigint, 12345678901234567890n);
+    assert.equal(Number.isNaN(result.nan), true);
+    assert.equal(result.positiveInfinity, Infinity);
+    assert.equal(result.negativeInfinity, -Infinity);
+    assert.equal(Object.is(result.negativeZero, -0), true);
+    assert.equal(result.self, result);
+    assert.equal(Object.getPrototypeOf(result), Object.prototype);
+    assert.equal(Object.hasOwn(result, "__proto__"), true);
+    assert.equal(result.__proto__, "data-only");
   } finally {
     await worker.close();
   }

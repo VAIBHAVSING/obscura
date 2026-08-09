@@ -27,6 +27,181 @@ const DOCUMENT_ELEMENT_HTML_NAMES = ["document_element_html", "documentElementHt
 const MAX_VM_TIMEOUT_MS = 4_294_967_295;
 const QUERY_BINDING = "__obscuraHostQueryElement__";
 const DOCUMENT_HTML_BINDING = "__obscuraHostDocumentHtml__";
+const BOUNDED_EVALUATE_BINDING = "__obscuraBoundedEvaluate__";
+const MAX_BOUNDED_SERIALIZED_CHARS = 4 * 1024 * 1024;
+const MAX_BOUNDED_GRAPH_NODES = 50_000;
+const MAX_BOUNDED_GRAPH_PROPERTIES = 100_000;
+const MAX_BOUNDED_GRAPH_DEPTH = 256;
+const MAX_BOUNDED_ARRAY_LENGTH = 100_000;
+const installBoundedEvaluateScript = new vm.Script(
+  `(() => {
+    "use strict";
+    const safeApply = Reflect.apply;
+    const safeCreate = Object.create;
+    const safeKeys = Object.keys;
+    const safeGetPrototypeOf = Object.getPrototypeOf;
+    const safeObjectIs = Object.is;
+    const safeArrayIsArray = Array.isArray;
+    const safeNumberIsNaN = Number.isNaN;
+    const safeNumberIsSafeInteger = Number.isSafeInteger;
+    const safeJsonStringify = JSON.stringify;
+    const safeBigIntToString = BigInt.prototype.toString;
+    const safeStringSlice = String.prototype.slice;
+    const safeWeakMapGet = WeakMap.prototype.get;
+    const safeWeakMapSet = WeakMap.prototype.set;
+    const SafeWeakMap = WeakMap;
+    const ContextTypeError = TypeError;
+    const ContextRangeError = RangeError;
+    const ContextObjectPrototype = Object.prototype;
+    const ContextArrayPrototype = Array.prototype;
+    const contextString = String;
+    const indirectEval = eval;
+
+    const apply = (callback, receiver, args) => safeApply(callback, receiver, args);
+    const record = () => apply(safeCreate, undefined, [null]);
+    const tagged = (tag, value) => {
+      const result = record();
+      result.t = tag;
+      if (value !== undefined) result.v = value;
+      return result;
+    };
+    const errorText = (error, property, fallback) => {
+      try {
+        const value = error?.[property];
+        if (typeof value === "string") return value;
+        if (value == null) return fallback;
+        return apply(contextString, undefined, [value]);
+      } catch {
+        return fallback;
+      }
+    };
+    const failure = (error) => {
+      const envelope = record();
+      const detail = record();
+      envelope.ok = false;
+      detail.name = apply(safeStringSlice, errorText(error, "name", "Error"), [0, 256]);
+      detail.message = apply(
+        safeStringSlice,
+        errorText(error, "message", "Obscura page evaluation failed"),
+        [0, 16_384],
+      );
+      envelope.error = detail;
+      return apply(safeJsonStringify, undefined, [envelope]);
+    };
+    const success = (value) => {
+      const seen = new SafeWeakMap();
+      const nodes = record();
+      let nextId = 1;
+
+      let propertyCount = 0;
+      const encode = (input, depth = 0) => {
+        if (depth > ${MAX_BOUNDED_GRAPH_DEPTH}) {
+          throw new ContextRangeError("Evaluation result exceeds the clone-safe graph depth limit");
+        }
+        if (input === null) return tagged("null");
+        switch (typeof input) {
+          case "undefined":
+            return tagged("undefined");
+          case "boolean":
+            return tagged("boolean", input);
+          case "string":
+            return tagged("string", input);
+          case "number":
+            if (apply(safeNumberIsNaN, undefined, [input])) return tagged("number-special", "nan");
+            if (input === Infinity) return tagged("number-special", "infinity");
+            if (input === -Infinity) return tagged("number-special", "negative-infinity");
+            if (apply(safeObjectIs, undefined, [input, -0])) return tagged("number-special", "negative-zero");
+            return tagged("number", input);
+          case "bigint":
+            return tagged("bigint", apply(safeBigIntToString, input, []));
+          case "symbol":
+          case "function":
+            throw new ContextTypeError(
+              "Evaluation result is not clone-safe: symbol and function values are unsupported",
+            );
+          case "object":
+            break;
+          default:
+            throw new ContextTypeError("Evaluation result has an unsupported type");
+        }
+
+        // Promise and arbitrary thenable access is deliberately inside the VM
+        // timeout. Never inspect a page-owned result from the Worker realm.
+        if (typeof input.then === "function") {
+          throw new ContextTypeError("Evaluation returned a Promise; this operation requires a synchronous result");
+        }
+
+        const previous = apply(safeWeakMapGet, seen, [input]);
+        if (previous !== undefined) return tagged("reference", previous);
+
+        const id = nextId++;
+        if (id > ${MAX_BOUNDED_GRAPH_NODES}) {
+          throw new ContextRangeError("Evaluation result exceeds the clone-safe graph node limit");
+        }
+        apply(safeWeakMapSet, seen, [input, id]);
+        const node = record();
+        const properties = record();
+        const isArray = apply(safeArrayIsArray, undefined, [input]);
+        const prototype = apply(safeGetPrototypeOf, undefined, [input]);
+        if (isArray) {
+          if (prototype !== ContextArrayPrototype) {
+            throw new ContextTypeError("Evaluation result is not clone-safe: arrays must use the page Array prototype");
+          }
+          node.kind = "array";
+          node.length = input.length;
+          if (!apply(safeNumberIsSafeInteger, undefined, [node.length]) || node.length > ${MAX_BOUNDED_ARRAY_LENGTH}) {
+            throw new ContextRangeError("Evaluation result exceeds the clone-safe array length limit");
+          }
+        } else {
+          if (prototype !== null && prototype !== ContextObjectPrototype) {
+            throw new ContextTypeError(
+              "Evaluation result is not clone-safe: only plain or null-prototype objects are supported",
+            );
+          }
+          node.kind = "object";
+        }
+        node.properties = properties;
+        nodes[id] = node;
+
+        const keys = apply(safeKeys, undefined, [input]);
+        propertyCount += keys.length;
+        if (propertyCount > ${MAX_BOUNDED_GRAPH_PROPERTIES}) {
+          throw new ContextRangeError("Evaluation result exceeds the clone-safe property limit");
+        }
+        for (let index = 0; index < keys.length; index += 1) {
+          const key = keys[index];
+          properties[key] = encode(input[key], depth + 1);
+        }
+        return tagged("reference", id);
+      };
+
+      const envelope = record();
+      envelope.ok = true;
+      envelope.root = encode(value);
+      envelope.nodes = nodes;
+      const serialized = apply(safeJsonStringify, undefined, [envelope]);
+      if (serialized.length > ${MAX_BOUNDED_SERIALIZED_CHARS}) {
+        throw new ContextRangeError("Evaluation result exceeds the clone-safe serialized size limit");
+      }
+      return serialized;
+    };
+
+    const boundedEvaluate = function boundedEvaluate(source) {
+      try {
+        return success(apply(indirectEval, undefined, [source]));
+      } catch (error) {
+        return failure(error);
+      }
+    };
+    Object.freeze(boundedEvaluate);
+    Object.defineProperty(globalThis, "${BOUNDED_EVALUATE_BINDING}", {
+      value: boundedEvaluate,
+      writable: false,
+      configurable: false,
+    });
+  })()`,
+  { filename: "obscura-bounded-evaluate-install.js" },
+);
 const installDocumentFacadeScript = new vm.Script(
   `(() => {
     "use strict";
@@ -40,6 +215,7 @@ const installDocumentFacadeScript = new vm.Script(
     const ContextReferenceError = ReferenceError;
     const ContextEvalError = EvalError;
     const ContextURIError = URIError;
+    const ContextString = String;
 
     const translatedError = (record) => {
       const name = typeof record?.name === "string" ? record.name : "Error";
@@ -72,7 +248,10 @@ const installDocumentFacadeScript = new vm.Script(
     };
 
     const querySelector = function querySelector(selector) {
-      return callHost(hostQueryElement, [selector]);
+      // Coercion can invoke page-owned Symbol.toPrimitive/toString hooks. Keep
+      // it in the context so the VM timeout covers the complete operation.
+      const selectorText = safeApply(ContextString, undefined, [selector]);
+      return callHost(hostQueryElement, [selectorText]);
     };
     Object.freeze(querySelector);
 
@@ -195,6 +374,148 @@ function synchronousResult(value, label) {
   return value;
 }
 
+function boundedEvaluateScript(source, filename) {
+  const literal = JSON.stringify(sourceText(source));
+  return new vm.Script(`globalThis.${BOUNDED_EVALUATE_BINDING}(${literal})`, { filename });
+}
+
+function decodeBoundedEnvelope(serialized, label) {
+  if (typeof serialized !== "string") {
+    throw new TypeError(`${label} returned an invalid bounded-evaluation envelope`);
+  }
+  if (serialized.length > MAX_BOUNDED_SERIALIZED_CHARS) {
+    throw new RangeError(`${label} exceeded the bounded-evaluation serialized size limit`);
+  }
+
+  let envelope;
+  try {
+    envelope = JSON.parse(serialized);
+  } catch {
+    throw new TypeError(`${label} returned malformed bounded-evaluation JSON`);
+  }
+  if (envelope === null || typeof envelope !== "object" || typeof envelope.ok !== "boolean") {
+    throw new TypeError(`${label} returned an invalid bounded-evaluation envelope`);
+  }
+  if (!envelope.ok) {
+    const name = typeof envelope.error?.name === "string" ? envelope.error.name : "Error";
+    const message =
+      typeof envelope.error?.message === "string"
+        ? envelope.error.message
+        : "Obscura page evaluation failed";
+    const error = new Error(message);
+    error.name = name;
+    throw error;
+  }
+  if (envelope.nodes === null || typeof envelope.nodes !== "object") {
+    throw new TypeError(`${label} returned no bounded-evaluation node table`);
+  }
+  const nodeKeys = Object.keys(envelope.nodes);
+  if (nodeKeys.length > MAX_BOUNDED_GRAPH_NODES) {
+    throw new RangeError(`${label} exceeded the bounded-evaluation graph node limit`);
+  }
+
+  const decoded = new Map();
+  let propertyCount = 0;
+  const decode = (encoded, depth = 0) => {
+    if (depth > MAX_BOUNDED_GRAPH_DEPTH) {
+      throw new RangeError(`${label} exceeded the bounded-evaluation graph depth limit`);
+    }
+    if (encoded === null || typeof encoded !== "object" || typeof encoded.t !== "string") {
+      throw new TypeError(`${label} returned an invalid encoded value`);
+    }
+    switch (encoded.t) {
+      case "null":
+        return null;
+      case "undefined":
+        return undefined;
+      case "boolean":
+        if (typeof encoded.v !== "boolean") throw new TypeError(`${label} returned an invalid boolean`);
+        return encoded.v;
+      case "string":
+        if (typeof encoded.v !== "string") throw new TypeError(`${label} returned an invalid string`);
+        return encoded.v;
+      case "number":
+        if (typeof encoded.v !== "number" || !Number.isFinite(encoded.v)) {
+          throw new TypeError(`${label} returned an invalid number`);
+        }
+        return encoded.v;
+      case "number-special":
+        if (encoded.v === "nan") return Number.NaN;
+        if (encoded.v === "infinity") return Infinity;
+        if (encoded.v === "negative-infinity") return -Infinity;
+        if (encoded.v === "negative-zero") return -0;
+        throw new TypeError(`${label} returned an invalid special number`);
+      case "bigint":
+        if (typeof encoded.v !== "string" || !/^-?[0-9]+$/.test(encoded.v)) {
+          throw new TypeError(`${label} returned an invalid bigint`);
+        }
+        return BigInt(encoded.v);
+      case "reference":
+        break;
+      default:
+        throw new TypeError(`${label} returned an unknown encoded value type`);
+    }
+
+    const id = encoded.v;
+    if (!Number.isSafeInteger(id) || id < 1) {
+      throw new TypeError(`${label} returned an invalid object reference`);
+    }
+    if (decoded.has(id)) return decoded.get(id);
+    const node = envelope.nodes[id];
+    if (node === null || typeof node !== "object" || node.properties === null || typeof node.properties !== "object") {
+      throw new TypeError(`${label} returned a missing object node`);
+    }
+
+    let value;
+    if (node.kind === "array") {
+      if (
+        !Number.isSafeInteger(node.length) ||
+        node.length < 0 ||
+        node.length > MAX_BOUNDED_ARRAY_LENGTH
+      ) {
+        throw new TypeError(`${label} returned an invalid array length`);
+      }
+      value = [];
+      value.length = node.length;
+    } else if (node.kind === "object") {
+      value = {};
+    } else {
+      throw new TypeError(`${label} returned an invalid object node kind`);
+    }
+    decoded.set(id, value);
+    const propertyKeys = Object.keys(node.properties);
+    propertyCount += propertyKeys.length;
+    if (propertyCount > MAX_BOUNDED_GRAPH_PROPERTIES) {
+      throw new RangeError(`${label} exceeded the bounded-evaluation property limit`);
+    }
+    for (const key of propertyKeys) {
+      Object.defineProperty(value, key, {
+        configurable: true,
+        enumerable: true,
+        writable: true,
+        value: decode(node.properties[key], depth + 1),
+      });
+    }
+    return value;
+  };
+
+  return decode(envelope.root);
+}
+
+function runBoundedEvaluate(script, context, timeoutMs, label) {
+  timeoutMs = vmTimeout(timeoutMs);
+  let serialized;
+  try {
+    serialized = script.runInContext(context, { timeout: timeoutMs });
+  } catch {
+    // The installed evaluator catches and serializes every page-thrown value.
+    // A value that escapes runInContext is a VM timeout/termination or a host
+    // failure, so replace it without inspecting page-controlled properties.
+    throw new Error(`${label} timed out or was terminated after ${timeoutMs}ms`);
+  }
+  return decodeBoundedEnvelope(serialized, label);
+}
+
 function describeApi() {
   const version = member(target, VERSION_NAMES) ?? valueMember(target, VERSION_NAMES);
   const abiVersion = member(target, ABI_VERSION_NAMES) ?? valueMember(target, ABI_VERSION_NAMES);
@@ -281,13 +602,13 @@ function getHostContext() {
     codeGeneration: { strings: true, wasm: false },
     microtaskMode: "afterEvaluate",
   });
+  installBoundedEvaluateScript.runInContext(hostContext, { timeout: 1_000 });
   return hostContext;
 }
 
 function hostEvaluate(source, timeoutMs = 1_000) {
-  const script = new vm.Script(sourceText(source), { filename: "obscura-evaluate.js" });
-  const result = script.runInContext(getHostContext(), { timeout: vmTimeout(timeoutMs) });
-  return synchronousResult(result, "hostEvaluate");
+  const script = boundedEvaluateScript(source, "obscura-evaluate.js");
+  return runBoundedEvaluate(script, getHostContext(), timeoutMs, "hostEvaluate");
 }
 
 function syncCall(callable, ...args) {
@@ -311,13 +632,16 @@ function requireBridgeCore() {
 
 function queryElement(selector) {
   requireBridgeCore();
+  if (typeof selector !== "string") {
+    throw new TypeError("Obscura document bridge selectors must cross as strings");
+  }
   const api = bridgeApi();
   if (!api.queryText || !api.queryHtml) {
     throw new Error("ObscuraCore must expose query_text/queryText and query_html/queryHtml");
   }
-  const outerHTML = syncCall(api.queryHtml, String(selector));
+  const outerHTML = syncCall(api.queryHtml, selector);
   if (outerHTML == null) return null;
-  const textContent = syncCall(api.queryText, String(selector));
+  const textContent = syncCall(api.queryText, selector);
   if (typeof outerHTML !== "string" || (textContent != null && typeof textContent !== "string")) {
     throw new TypeError("ObscuraCore query methods must return strings or nullish values");
   }
@@ -540,15 +864,13 @@ async function hostStress({ iterations = 10_000, source = "1 + 1", timeoutMs = 1
     codeGeneration: { strings: true, wasm: false },
     microtaskMode: "afterEvaluate",
   });
-  const script = new vm.Script(sourceText(source), { filename: "obscura-stress.js" });
+  installBoundedEvaluateScript.runInContext(context, { timeout: 1_000 });
+  const script = boundedEvaluateScript(source, "obscura-stress.js");
   timeoutMs = vmTimeout(timeoutMs);
   const startedAt = performance.now();
   let lastResult;
   for (let index = 0; index < iterations; index += 1) {
-    lastResult = synchronousResult(
-      script.runInContext(context, { timeout: timeoutMs }),
-      "hostStress evaluation",
-    );
+    lastResult = runBoundedEvaluate(script, context, timeoutMs, "hostStress evaluation");
   }
   const elapsedMs = performance.now() - startedAt;
   return {
