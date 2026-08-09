@@ -76,7 +76,7 @@ CARGO_TARGET_DIR=/workspaces/.obscura-node-target \
   CARGO_BUILD_JOBS=2 \
   V8_FROM_SOURCE=1 \
   GN_ARGS='v8_monolithic=true v8_use_external_startup_data=false v8_monolithic_for_shared_library=true' \
-  cargo build --release -p obscura-node
+  cargo build --release --locked --manifest-path crates/obscura-node/Cargo.toml
 ```
 
 The prebuilt rusty_v8 archive cannot link into a shared object because it uses

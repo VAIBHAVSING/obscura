@@ -9,10 +9,10 @@ members = [
     "crates/obscura-mcp",
     "crates/obscura-render",
     "crates/obscura-cli",
-    "crates/obscura-node",
     "crates/obscura-wasm",
     "crates/obscura",
 ]
+exclude = ["crates/obscura-node"]
 
 [workspace.package]
 version = "0.1.0"
