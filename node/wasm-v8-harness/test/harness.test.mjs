@@ -8,12 +8,20 @@ import { fileURLToPath } from "node:url";
 import { promisify } from "node:util";
 
 import { WasmV8Worker } from "../src/client.mjs";
+import { loadModule } from "../src/module-loader.mjs";
 
 const mockModule = fileURLToPath(new URL("./fixtures/mock-wasm-bindgen.cjs", import.meta.url));
 const mockNativeAddon = fileURLToPath(new URL("./fixtures/mock-native-addon.cjs", import.meta.url));
 const mockObscuraCore = fileURLToPath(new URL("./fixtures/mock-obscura-core.cjs", import.meta.url));
+const mockObscuraCoreMissingAbi = fileURLToPath(
+  new URL("./fixtures/mock-obscura-core-missing-abi.cjs", import.meta.url),
+);
+const mockObscuraCoreMismatchedAbi = fileURLToPath(
+  new URL("./fixtures/mock-obscura-core-mismatched-abi.cjs", import.meta.url),
+);
 const mockLeakyRuntime = fileURLToPath(new URL("./fixtures/mock-leaky-runtime.cjs", import.meta.url));
 const harnessCli = fileURLToPath(new URL("../bin/run.mjs", import.meta.url));
+const realWasmModule = process.env.OBSCURA_REAL_WASM_MODULE;
 const execFileAsync = promisify(execFile);
 
 test("loads a wasm-bindgen-shaped wrapper in a persistent worker", async () => {
@@ -89,6 +97,17 @@ test("recognizes the native EmbeddedRuntime API and decodes its JSON text", asyn
   }
 });
 
+test("rejects ObscuraCore modules with a missing or mismatched ABI before ready", async () => {
+  await assert.rejects(WasmV8Worker.launch(mockObscuraCoreMissingAbi), {
+    code: "ERR_OBSCURA_WASM_ABI",
+    message: /exposes no ABI version/,
+  });
+  await assert.rejects(WasmV8Worker.launch(mockObscuraCoreMismatchedAbi), {
+    code: "ERR_OBSCURA_WASM_ABI",
+    message: /requires ABI version 1, but the module exposes 2/,
+  });
+});
+
 test("bridges ObscuraCore queries into the persistent host V8 document facade", async () => {
   const worker = await WasmV8Worker.launch(mockObscuraCore);
   try {
@@ -130,6 +149,21 @@ test("bridges ObscuraCore queries into the persistent host V8 document facade", 
       worker.bridgeEvaluate("document.querySelector('async-result')"),
       /requires a synchronous result/,
     );
+    assert.deepEqual(
+      await worker.bridgeEvaluate(`(() => {
+        try {
+          document.querySelector("[");
+          return null;
+        } catch (error) {
+          return [
+            error instanceof SyntaxError,
+            error.constructor === SyntaxError,
+            error.name,
+          ];
+        }
+      })()`),
+      [true, true, "SyntaxError"],
+    );
 
     assert.equal(
       await worker.bridgeEvaluate("document.querySelector('h1').textContent", {
@@ -148,6 +182,23 @@ test("bridges ObscuraCore queries into the persistent host V8 document facade", 
     await worker.close();
   }
 });
+
+test(
+  "real wasm-bindgen core exports ABI 1 and throws SyntaxError for invalid selectors",
+  { skip: !realWasmModule },
+  async () => {
+    const { namespace } = await loadModule(realWasmModule);
+    assert.equal(namespace.abi_version(), 1);
+    const core = new namespace.ObscuraCore("<!doctype html><html><body><h1>real</h1></body></html>");
+    try {
+      assert.throws(() => core.query_html("["), SyntaxError);
+      assert.throws(() => core.query_text(":not("), SyntaxError);
+      assert.throws(() => core.query_count("["), SyntaxError);
+    } finally {
+      core.free();
+    }
+  },
+);
 
 test("serializes concurrent bridge replacements in request order", async () => {
   const worker = await WasmV8Worker.launch(mockObscuraCore);

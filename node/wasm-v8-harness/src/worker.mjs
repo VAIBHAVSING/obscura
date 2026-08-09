@@ -24,6 +24,7 @@ const DISPOSE_NAMES = ["close", "dispose", "destroy", "free", "drop"];
 const QUERY_TEXT_NAMES = ["query_text", "queryText"];
 const QUERY_HTML_NAMES = ["query_html", "queryHtml"];
 const DOCUMENT_ELEMENT_HTML_NAMES = ["document_element_html", "documentElementHtml"];
+const REQUIRED_CORE_ABI_VERSION = 1;
 const MAX_VM_TIMEOUT_MS = 4_294_967_295;
 const QUERY_BINDING = "__obscuraHostQueryElement__";
 const DOCUMENT_HTML_BINDING = "__obscuraHostDocumentHtml__";
@@ -537,6 +538,28 @@ function describeApi() {
   };
 }
 
+async function requireCompatibleCoreAbi() {
+  if (!member(target, ["ObscuraCore"])) return;
+
+  const abiVersion = member(target, ABI_VERSION_NAMES) ?? valueMember(target, ABI_VERSION_NAMES);
+  if (!abiVersion) {
+    const error = new Error(
+      `ObscuraCore requires ABI version ${REQUIRED_CORE_ABI_VERSION}, but the module exposes no ABI version`,
+    );
+    error.code = "ERR_OBSCURA_WASM_ABI";
+    throw error;
+  }
+
+  const actual = abiVersion.fn ? await abiVersion.fn() : abiVersion.value;
+  if (!Number.isSafeInteger(actual) || actual !== REQUIRED_CORE_ABI_VERSION) {
+    const error = new Error(
+      `ObscuraCore requires ABI version ${REQUIRED_CORE_ABI_VERSION}, but the module exposes ${String(actual)}`,
+    );
+    error.code = "ERR_OBSCURA_WASM_ABI";
+    throw error;
+  }
+}
+
 async function createRuntime() {
   const factory = member(target, FACTORY_NAMES);
   if (factory) {
@@ -991,6 +1014,7 @@ async function handleMessage(message) {
 
 try {
   ({ namespace: target, metadata } = await loadModule(workerData.modulePath, workerData.cwd));
+  await requireCompatibleCoreAbi();
   // Operations mutate persistent runtime and bridge ownership state. Preserve
   // message order instead of allowing async listener invocations to overlap.
   let operationQueue = Promise.resolve();

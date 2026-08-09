@@ -28,10 +28,27 @@ fn boundary_result<T>(
     operation: &str,
     call: impl FnOnce() -> Result<T, String>,
 ) -> Result<T, JsValue> {
+    boundary_result_with(operation, call, |error| js_sys::Error::new(&error).into())
+}
+
+fn boundary_selector_result<T>(
+    operation: &str,
+    call: impl FnOnce() -> Result<T, String>,
+) -> Result<T, JsValue> {
+    boundary_result_with(operation, call, |error| {
+        js_sys::SyntaxError::new(&error).into()
+    })
+}
+
+fn boundary_result_with<T>(
+    operation: &str,
+    call: impl FnOnce() -> Result<T, String>,
+    error_value: impl FnOnce(String) -> JsValue,
+) -> Result<T, JsValue> {
     match catch_unwind(AssertUnwindSafe(call)) {
         Ok(Ok(value)) => Ok(value),
-        Ok(Err(error)) => Err(JsValue::from_str(&error)),
-        Err(payload) => Err(JsValue::from_str(&panic_message(operation, payload))),
+        Ok(Err(error)) => Err(error_value(error)),
+        Err(payload) => Err(js_sys::Error::new(&panic_message(operation, payload)).into()),
     }
 }
 
@@ -83,7 +100,7 @@ impl ObscuraCore {
 
     /// Return the first matching element's serialized HTML, or `undefined`.
     pub fn query_html(&self, selector: &str) -> Result<Option<String>, JsValue> {
-        boundary_result("query_html", || {
+        boundary_selector_result("query_html", || {
             self.dom
                 .query_selector(selector)
                 .map(|node| node.map(|node| self.dom.outer_html(node)))
@@ -92,7 +109,7 @@ impl ObscuraCore {
 
     /// Return the first matching element's textContent, or `undefined`.
     pub fn query_text(&self, selector: &str) -> Result<Option<String>, JsValue> {
-        boundary_result("query_text", || {
+        boundary_selector_result("query_text", || {
             self.dom
                 .query_selector(selector)
                 .map(|node| node.map(|node| self.dom.text_content(node)))
@@ -100,10 +117,12 @@ impl ObscuraCore {
     }
 
     pub fn query_count(&self, selector: &str) -> Result<u32, JsValue> {
-        boundary_result("query_count", || {
-            let count = self.dom.query_selector_all(selector)?.len();
-            u32::try_from(count).map_err(|_| "selector result exceeds u32".to_string())
-        })
+        let count = boundary_selector_result("query_count", || {
+            self.dom
+                .query_selector_all(selector)
+                .map(|nodes| nodes.len())
+        })?;
+        u32::try_from(count).map_err(|_| js_sys::Error::new("selector result exceeds u32").into())
     }
 }
 

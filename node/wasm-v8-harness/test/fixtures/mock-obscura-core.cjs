@@ -48,4 +48,4 @@ class ObscuraCore {
   }
 }
 
-module.exports = { ObscuraCore };
+module.exports = { abi_version: 1, ObscuraCore };

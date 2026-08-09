@@ -11,5 +11,6 @@ publish = false
 crate-type = ["cdylib", "rlib"]
 
 [dependencies]
+js-sys = "0.3"
 obscura-dom = { workspace = true }
 wasm-bindgen = "0.2"
