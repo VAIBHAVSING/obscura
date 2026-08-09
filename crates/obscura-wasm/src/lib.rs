@@ -5,6 +5,24 @@ use obscura_dom::{parse_html, DomTree};
 use wasm_bindgen::prelude::*;
 
 const ABI_VERSION: u32 = 1;
+const MAX_HTML_INPUT_BYTES: usize = 8 * 1024 * 1024;
+const MAX_SELECTOR_BYTES: usize = 64 * 1024;
+const MAX_RETURNED_STRING_BYTES: usize = 4 * 1024 * 1024;
+
+fn require_max_bytes(value: &str, maximum: usize, label: &str) -> Result<(), JsValue> {
+    if value.len() > maximum {
+        return Err(js_sys::RangeError::new(&format!(
+            "{label} exceeds the {maximum}-byte ABI limit"
+        ))
+        .into());
+    }
+    Ok(())
+}
+
+fn bounded_return(value: String, label: &str) -> Result<String, JsValue> {
+    require_max_bytes(&value, MAX_RETURNED_STRING_BYTES, label)?;
+    Ok(value)
+}
 
 fn panic_message(operation: &str, payload: Box<dyn Any + Send>) -> String {
     let detail = if let Some(message) = payload.downcast_ref::<&str>() {
@@ -20,7 +38,9 @@ fn panic_message(operation: &str, payload: Box<dyn Any + Send>) -> String {
 fn boundary_value<T>(operation: &str, call: impl FnOnce() -> T) -> T {
     match catch_unwind(AssertUnwindSafe(call)) {
         Ok(value) => value,
-        Err(payload) => wasm_bindgen::throw_str(&panic_message(operation, payload)),
+        Err(payload) => {
+            wasm_bindgen::throw_val(js_sys::Error::new(&panic_message(operation, payload)).into())
+        }
     }
 }
 
@@ -65,22 +85,28 @@ pub struct ObscuraCore {
 #[wasm_bindgen]
 impl ObscuraCore {
     #[wasm_bindgen(constructor)]
-    pub fn new(html: &str) -> Self {
-        Self {
+    pub fn new(html: &str) -> Result<Self, JsValue> {
+        require_max_bytes(html, MAX_HTML_INPUT_BYTES, "HTML input")?;
+        Ok(Self {
             dom: boundary_value("constructor", || parse_html(html)),
-        }
+        })
     }
 
     /// Replace the document using Obscura's existing html5ever-backed parser.
-    pub fn set_html(&mut self, html: &str) {
+    pub fn set_html(&mut self, html: &str) -> Result<(), JsValue> {
+        require_max_bytes(html, MAX_HTML_INPUT_BYTES, "HTML input")?;
         boundary_value("set_html", || {
             self.dom = parse_html(html);
         });
+        Ok(())
     }
 
     /// Serialize the complete document.
-    pub fn html(&self) -> String {
-        boundary_value("html", || self.dom.outer_html(self.dom.document()))
+    pub fn html(&self) -> Result<String, JsValue> {
+        bounded_return(
+            boundary_value("html", || self.dom.outer_html(self.dom.document())),
+            "serialized document",
+        )
     }
 
     /// Serialize the document element without the document doctype.
@@ -89,34 +115,61 @@ impl ObscuraCore {
     /// different values: `document.documentElement.outerHTML` is the `<html>`
     /// element, while serializing the document may also include its doctype.
     pub fn document_element_html(&self) -> Result<String, JsValue> {
-        boundary_result("document_element_html", || {
+        let html = boundary_result("document_element_html", || {
             let node = self
                 .dom
                 .query_selector("html")?
                 .ok_or_else(|| "document has no html element".to_string())?;
             Ok(self.dom.outer_html(node))
-        })
+        })?;
+        bounded_return(html, "serialized document element")
     }
 
     /// Return the first matching element's serialized HTML, or `undefined`.
     pub fn query_html(&self, selector: &str) -> Result<Option<String>, JsValue> {
-        boundary_selector_result("query_html", || {
+        require_max_bytes(selector, MAX_SELECTOR_BYTES, "selector")?;
+        let html = boundary_selector_result("query_html", || {
             self.dom
                 .query_selector(selector)
                 .map(|node| node.map(|node| self.dom.outer_html(node)))
-        })
+        })?;
+        html.map(|html| bounded_return(html, "query outerHTML"))
+            .transpose()
     }
 
     /// Return the first matching element's textContent, or `undefined`.
     pub fn query_text(&self, selector: &str) -> Result<Option<String>, JsValue> {
-        boundary_selector_result("query_text", || {
+        require_max_bytes(selector, MAX_SELECTOR_BYTES, "selector")?;
+        let text = boundary_selector_result("query_text", || {
             self.dom
                 .query_selector(selector)
                 .map(|node| node.map(|node| self.dom.text_content(node)))
-        })
+        })?;
+        text.map(|text| bounded_return(text, "query textContent"))
+            .transpose()
+    }
+
+    /// Return `[outerHTML, textContent]` for the first match, or `undefined`.
+    pub fn query_snapshot(&self, selector: &str) -> Result<JsValue, JsValue> {
+        require_max_bytes(selector, MAX_SELECTOR_BYTES, "selector")?;
+        let snapshot = boundary_selector_result("query_snapshot", || {
+            self.dom.query_selector(selector).map(|node| {
+                node.map(|node| (self.dom.outer_html(node), self.dom.text_content(node)))
+            })
+        })?;
+        let Some((outer_html, text_content)) = snapshot else {
+            return Ok(JsValue::UNDEFINED);
+        };
+        let outer_html = bounded_return(outer_html, "query outerHTML")?;
+        let text_content = bounded_return(text_content, "query textContent")?;
+        let result = js_sys::Array::new_with_length(2);
+        result.set(0, JsValue::from_str(&outer_html));
+        result.set(1, JsValue::from_str(&text_content));
+        Ok(result.into())
     }
 
     pub fn query_count(&self, selector: &str) -> Result<u32, JsValue> {
+        require_max_bytes(selector, MAX_SELECTOR_BYTES, "selector")?;
         let count = boundary_selector_result("query_count", || {
             self.dom
                 .query_selector_all(selector)
@@ -141,8 +194,10 @@ pub fn abi_version() -> u32 {
 #[wasm_bindgen]
 pub fn probe() -> String {
     boundary_value("probe", || {
-        r#"{"abiVersion":1,"dom":true,"selectors":true,"javascript":"host","embeddedV8":false}"#
-            .to_string()
+        format!(
+            r#"{{"abiVersion":{},"dom":true,"selectors":true,"javascript":"host","embeddedV8":false}}"#,
+            ABI_VERSION
+        )
     })
 }
 
@@ -154,7 +209,8 @@ mod tests {
     fn parses_and_queries_with_the_existing_dom_engine() {
         let core = ObscuraCore::new(
             "<!doctype html><main><h1 class='title'>Obscura</h1><p>portable</p></main>",
-        );
+        )
+        .unwrap();
         assert_eq!(core.query_count("main > *").unwrap(), 2);
         assert_eq!(
             core.query_text(".title").unwrap().as_deref(),

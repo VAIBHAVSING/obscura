@@ -32,6 +32,15 @@ class ObscuraCore {
     return findElement(this.source, selector)?.outerHTML;
   }
 
+  querySnapshot(selector) {
+    this.#assertOpen();
+    if (selector === "async-result") return Promise.resolve(["<async-result></async-result>", ""]);
+    if (selector === "snapshot-only") return ["<snapshot-only>batched</snapshot-only>", "batched"];
+    if (selector === "oversized-result") return ["x".repeat(4 * 1024 * 1024 + 1), ""];
+    const element = findElement(this.source, selector);
+    return element ? [element.outerHTML, element.textContent] : undefined;
+  }
+
   documentElementHtml() {
     this.#assertOpen();
     if (this.source.includes("data-document-error")) throw new RangeError("document serializer failed");

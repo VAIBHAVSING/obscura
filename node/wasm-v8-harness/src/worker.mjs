@@ -2,6 +2,12 @@ import vm from "node:vm";
 import { parentPort, workerData, threadId } from "node:worker_threads";
 
 import { loadModule } from "./module-loader.mjs";
+import {
+  MAX_HTML_INPUT_BYTES,
+  MAX_RETURNED_STRING_BYTES,
+  MAX_SELECTOR_BYTES,
+  requireBoundedString,
+} from "./limits.mjs";
 
 if (!parentPort) throw new Error("The WASM V8 harness worker must run as a Worker");
 
@@ -23,6 +29,7 @@ const EVALUATE_NAMES = ["evaluate", "eval", "evaluateScript", "evaluate_script",
 const DISPOSE_NAMES = ["close", "dispose", "destroy", "free", "drop"];
 const QUERY_TEXT_NAMES = ["query_text", "queryText"];
 const QUERY_HTML_NAMES = ["query_html", "queryHtml"];
+const QUERY_SNAPSHOT_NAMES = ["query_snapshot", "querySnapshot"];
 const DOCUMENT_ELEMENT_HTML_NAMES = ["document_element_html", "documentElementHtml"];
 const REQUIRED_CORE_ABI_VERSION = 1;
 const MAX_VM_TIMEOUT_MS = 4_294_967_295;
@@ -641,6 +648,7 @@ function syncCall(callable, ...args) {
 
 function bridgeApi(core = bridgeCore) {
   return {
+    querySnapshot: member(core, QUERY_SNAPSHOT_NAMES),
     queryText: member(core, QUERY_TEXT_NAMES),
     queryHtml: member(core, QUERY_HTML_NAMES),
     documentElementHtml: member(core, DOCUMENT_ELEMENT_HTML_NAMES),
@@ -655,19 +663,29 @@ function requireBridgeCore() {
 
 function queryElement(selector) {
   requireBridgeCore();
-  if (typeof selector !== "string") {
-    throw new TypeError("Obscura document bridge selectors must cross as strings");
-  }
+  requireBoundedString(selector, MAX_SELECTOR_BYTES, "selector");
   const api = bridgeApi();
-  if (!api.queryText || !api.queryHtml) {
-    throw new Error("ObscuraCore must expose query_text/queryText and query_html/queryHtml");
+  let outerHTML;
+  let textContent;
+  if (api.querySnapshot) {
+    const snapshot = syncCall(api.querySnapshot, selector);
+    if (snapshot == null) return null;
+    if (!Array.isArray(snapshot) || snapshot.length !== 2) {
+      throw new TypeError("ObscuraCore query_snapshot/querySnapshot must return a two-string array or nullish value");
+    }
+    [outerHTML, textContent] = snapshot;
+  } else {
+    if (!api.queryText || !api.queryHtml) {
+      throw new Error(
+        "ObscuraCore must expose query_snapshot/querySnapshot or both query_text/queryText and query_html/queryHtml",
+      );
+    }
+    outerHTML = syncCall(api.queryHtml, selector);
+    if (outerHTML == null) return null;
+    textContent = syncCall(api.queryText, selector);
   }
-  const outerHTML = syncCall(api.queryHtml, selector);
-  if (outerHTML == null) return null;
-  const textContent = syncCall(api.queryText, selector);
-  if (typeof outerHTML !== "string" || (textContent != null && typeof textContent !== "string")) {
-    throw new TypeError("ObscuraCore query methods must return strings or nullish values");
-  }
+  requireBoundedString(outerHTML, MAX_RETURNED_STRING_BYTES, "query outerHTML");
+  requireBoundedString(textContent, MAX_RETURNED_STRING_BYTES, "query textContent");
 
   const element = Object.create(null);
   Object.defineProperties(element, {
@@ -686,10 +704,7 @@ function documentOuterHtml() {
     );
   }
   const value = syncCall(html);
-  if (typeof value !== "string") {
-    throw new TypeError("ObscuraCore document element serializer must return a string");
-  }
-  return value;
+  return requireBoundedString(value, MAX_RETURNED_STRING_BYTES, "serialized document element");
 }
 
 function bridgeErrorRecord(error) {
@@ -777,12 +792,14 @@ async function replaceBridgeCore(html) {
   if (!constructor) {
     throw new Error("Module has no ObscuraCore constructor");
   }
-  const next = new constructor.fn(sourceText(html, "html"));
+  html = requireBoundedString(html, MAX_HTML_INPUT_BYTES, "HTML input");
+  const next = new constructor.fn(html);
   const nextApi = bridgeApi(next);
-  if (!nextApi.queryText || !nextApi.queryHtml || !nextApi.documentElementHtml || !nextApi.dispose) {
+  const hasQueryApi = nextApi.querySnapshot || (nextApi.queryText && nextApi.queryHtml);
+  if (!hasQueryApi || !nextApi.documentElementHtml || !nextApi.dispose) {
     await disposeRuntime(next);
     throw new Error(
-      "ObscuraCore must expose query_text/queryText, query_html/queryHtml, document_element_html/documentElementHtml, and free/dispose",
+      "ObscuraCore must expose query_snapshot/querySnapshot or the query_text/queryText and query_html/queryHtml pair, plus document_element_html/documentElementHtml and free/dispose",
     );
   }
   try {
@@ -807,6 +824,7 @@ function bridgeStatus() {
     generation: bridgeGeneration,
     disposed: bridgeDisposed,
     api: {
+      querySnapshot: api.querySnapshot?.name ?? null,
       queryText: api.queryText?.name ?? null,
       queryHtml: api.queryHtml?.name ?? null,
       documentElementHtml: api.documentElementHtml?.name ?? null,

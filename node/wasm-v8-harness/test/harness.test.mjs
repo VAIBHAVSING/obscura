@@ -9,10 +9,12 @@ import { promisify } from "node:util";
 
 import { WasmV8Worker } from "../src/client.mjs";
 import { loadModule } from "../src/module-loader.mjs";
+import { MAX_HTML_INPUT_BYTES, MAX_SELECTOR_BYTES } from "../src/limits.mjs";
 
 const mockModule = fileURLToPath(new URL("./fixtures/mock-wasm-bindgen.cjs", import.meta.url));
 const mockNativeAddon = fileURLToPath(new URL("./fixtures/mock-native-addon.cjs", import.meta.url));
 const mockObscuraCore = fileURLToPath(new URL("./fixtures/mock-obscura-core.cjs", import.meta.url));
+const mockObscuraCoreLegacy = fileURLToPath(new URL("./fixtures/mock-obscura-core-legacy.cjs", import.meta.url));
 const mockObscuraCoreMissingAbi = fileURLToPath(
   new URL("./fixtures/mock-obscura-core-missing-abi.cjs", import.meta.url),
 );
@@ -133,6 +135,7 @@ test("bridges ObscuraCore queries into the persistent host V8 document facade", 
       generation: 1,
       disposed: 0,
       api: {
+        querySnapshot: "querySnapshot",
         queryText: "queryText",
         queryHtml: "query_html",
         documentElementHtml: "documentElementHtml",
@@ -148,6 +151,12 @@ test("bridges ObscuraCore queries into the persistent host V8 document facade", 
     await assert.rejects(
       worker.bridgeEvaluate("document.querySelector('async-result')"),
       /requires a synchronous result/,
+    );
+    assert.deepEqual(
+      await worker.bridgeEvaluate(
+        "[document.querySelector('snapshot-only').outerHTML, document.querySelector('snapshot-only').textContent]",
+      ),
+      ["<snapshot-only>batched</snapshot-only>", "batched"],
     );
     assert.deepEqual(
       await worker.bridgeEvaluate(`(() => {
@@ -183,6 +192,61 @@ test("bridges ObscuraCore queries into the persistent host V8 document facade", 
   }
 });
 
+test("retains the legacy two-call query bridge fallback", async () => {
+  const worker = await WasmV8Worker.launch(mockObscuraCoreLegacy);
+  try {
+    assert.equal(
+      await worker.bridgeEvaluate("document.querySelector('h1').textContent", {
+        html: "<html><body><h1>legacy</h1></body></html>",
+      }),
+      "legacy",
+    );
+    assert.equal((await worker.bridgeStatus()).api.querySnapshot, null);
+  } finally {
+    await worker.close();
+  }
+});
+
+test("enforces bridge ABI limits and preserves Worker reuse", async () => {
+  const worker = await WasmV8Worker.launch(mockObscuraCore);
+  try {
+    const html = "<html><body><h1>bounded</h1></body></html>";
+    await worker.bridgeEvaluate("document.querySelector('h1').textContent", { html });
+    await assert.rejects(
+      worker.bridgeEvaluate("1", { html: "x".repeat(MAX_HTML_INPUT_BYTES + 1) }),
+      RangeError,
+    );
+    assert.equal(await worker.bridgeEvaluate("document.querySelector('h1').textContent"), "bounded");
+
+    const oversizedSelector = "x".repeat(MAX_SELECTOR_BYTES + 1);
+    assert.deepEqual(
+      await worker.bridgeEvaluate(`(() => {
+        try {
+          document.querySelector(${JSON.stringify(oversizedSelector)});
+          return null;
+        } catch (error) {
+          return [error instanceof RangeError, error.name];
+        }
+      })()`),
+      [true, "RangeError"],
+    );
+    assert.deepEqual(
+      await worker.bridgeEvaluate(`(() => {
+        try {
+          document.querySelector("oversized-result");
+          return null;
+        } catch (error) {
+          return [error instanceof RangeError, error.name];
+        }
+      })()`),
+      [true, "RangeError"],
+    );
+    assert.equal(await worker.bridgeEvaluate("document.querySelector('h1').textContent"), "bounded");
+  } finally {
+    await worker.close();
+  }
+});
+
 test(
   "real wasm-bindgen core exports ABI 1 and throws SyntaxError for invalid selectors",
   { skip: !realWasmModule },
@@ -191,9 +255,12 @@ test(
     assert.equal(namespace.abi_version(), 1);
     const core = new namespace.ObscuraCore("<!doctype html><html><body><h1>real</h1></body></html>");
     try {
+      assert.deepEqual(core.query_snapshot("h1"), ["<h1>real</h1>", "real"]);
+      assert.equal(core.query_snapshot(".missing"), undefined);
       assert.throws(() => core.query_html("["), SyntaxError);
       assert.throws(() => core.query_text(":not("), SyntaxError);
       assert.throws(() => core.query_count("["), SyntaxError);
+      assert.throws(() => core.query_snapshot("x".repeat(MAX_SELECTOR_BYTES + 1)), RangeError);
     } finally {
       core.free();
     }
@@ -289,7 +356,7 @@ test("document facade callbacks cannot expose the Worker realm", async () => {
         true,
         ["undefined", "undefined", "undefined", "undefined"],
         ["undefined", "undefined", "undefined", "undefined"],
-        "query_html returned a Promise; this operation requires a synchronous result",
+        "querySnapshot returned a Promise; this operation requires a synchronous result",
       ],
     );
 
@@ -520,7 +587,7 @@ test("termination rejects subsequent requests", async () => {
 test("a startup timeout terminates the Worker before launch rejects", async () => {
   const directory = await mkdtemp(join(tmpdir(), "obscura-wasm-harness-timeout-"));
   const stalledModule = join(directory, "stalled.mjs");
-  await writeFile(stalledModule, "await new Promise(() => {});\n");
+  await writeFile(stalledModule, "await new Promise(() => setInterval(() => {}, 1_000));\n");
 
   await assert.rejects(
     WasmV8Worker.launch(stalledModule, { readyTimeoutMs: 50 }),

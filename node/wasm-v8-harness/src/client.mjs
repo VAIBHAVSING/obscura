@@ -1,5 +1,7 @@
 import { Worker } from "node:worker_threads";
 
+import { MAX_HTML_INPUT_BYTES, requireBoundedString } from "./limits.mjs";
+
 const workerUrl = new URL("./worker.mjs", import.meta.url);
 const MAX_TIMER_MS = 2_147_483_647;
 
@@ -134,6 +136,13 @@ export class WasmV8Worker {
   }
 
   bridgeEvaluate(source, options = {}) {
+    try {
+      if (options.html !== undefined) {
+        requireBoundedString(options.html, MAX_HTML_INPUT_BYTES, "HTML input");
+      }
+    } catch (error) {
+      return Promise.reject(error);
+    }
     return this.request(
       "bridgeEvaluate",
       { source, html: options.html, timeoutMs: options.timeoutMs },
