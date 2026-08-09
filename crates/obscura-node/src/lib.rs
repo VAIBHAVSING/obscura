@@ -1,5 +1,6 @@
 use std::any::Any;
 use std::panic::{catch_unwind, AssertUnwindSafe};
+use std::sync::OnceLock;
 use std::time::Duration;
 
 use napi::{Error, Result, Status};
@@ -8,6 +9,39 @@ use obscura_js::runtime::ObscuraJsRuntime;
 
 const DEFAULT_EVALUATE_TIMEOUT_MS: u32 = 5_000;
 const MAX_EVALUATE_TIMEOUT_MS: u32 = 60_000;
+static EMBEDDED_V8_READY: OnceLock<()> = OnceLock::new();
+
+/// Initialize embedded V8 on Node's main thread before any Worker constructs
+/// an isolate. The warmup isolate initializes V8 process-global dispatch and
+/// pointer tables which platform initialization alone does not cover.
+#[napi(js_name = "initializeEmbeddedV8")]
+pub fn initialize_embedded_v8() -> Result<String> {
+    catch_unwind(AssertUnwindSafe(|| {
+        EMBEDDED_V8_READY.get_or_init(|| {
+            ObscuraJsRuntime::init_platform();
+            drop(ObscuraJsRuntime::new());
+        });
+    }))
+    .map_err(panic_error)?;
+
+    Ok(ObscuraJsRuntime::embedded_v8_version().to_string())
+}
+
+#[napi(js_name = "embeddedV8Version")]
+pub fn embedded_v8_version() -> String {
+    ObscuraJsRuntime::embedded_v8_version().to_string()
+}
+
+fn require_embedded_v8_ready() -> Result<()> {
+    if EMBEDDED_V8_READY.get().is_some() {
+        Ok(())
+    } else {
+        Err(Error::new(
+            Status::GenericFailure,
+            "initializeEmbeddedV8() must run on Node's main thread before creating an EmbeddedRuntime",
+        ))
+    }
+}
 
 /// A minimal Node-API owner for an Obscura V8 isolate.
 ///
@@ -40,6 +74,7 @@ impl Drop for NodeRuntime {
 impl NodeRuntime {
     #[napi(constructor)]
     pub fn new(base_url: Option<String>) -> Result<Self> {
+        require_embedded_v8_ready()?;
         let runtime = catch_unwind(AssertUnwindSafe(|| match base_url {
             Some(base_url) => ObscuraJsRuntime::with_base_url(&base_url),
             None => ObscuraJsRuntime::new(),
@@ -72,18 +107,14 @@ impl NodeRuntime {
                 "EmbeddedRuntime is closed".to_string(),
             )
         })?;
-        let value = catch_unwind(AssertUnwindSafe(|| {
-            runtime.evaluate_with_timeout(&expression, Duration::from_millis(u64::from(timeout_ms)))
+        catch_unwind(AssertUnwindSafe(|| {
+            runtime.evaluate_json_with_timeout(
+                &expression,
+                Duration::from_millis(u64::from(timeout_ms)),
+            )
         }))
         .map_err(panic_error)?
-        .map_err(runtime_error)?;
-
-        serde_json::to_string(&value).map_err(|error| {
-            Error::new(
-                Status::GenericFailure,
-                format!("failed to serialize evaluation result: {error}"),
-            )
-        })
+        .map_err(runtime_error)
     }
 
     /// Dispose the embedded isolate deterministically. Calling `close` more

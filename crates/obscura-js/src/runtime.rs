@@ -192,6 +192,17 @@ const SYNCHRONOUS_TASK_FLOOR_MS: u64 = 5_000;
 const WATCHDOG_SCHEDULING_MARGIN_MS: u64 = 500;
 
 impl ObscuraJsRuntime {
+    /// Initialize the process-wide V8 platform before constructing runtimes on
+    /// worker threads. Embedders should call this on their main thread.
+    pub fn init_platform() {
+        JsRuntime::init_platform(None, false);
+    }
+
+    /// Report the V8 version linked into this process.
+    pub fn embedded_v8_version() -> &'static str {
+        deno_core::v8::V8::get_version()
+    }
+
     /// Freeze the document timeline for one JavaScript task. Browser timelines
     /// update at task/rendering boundaries, not on each forced style or layout
     /// read. Keeping one sample across the task also lets repeated CSSOM reads
@@ -2111,25 +2122,48 @@ impl ObscuraJsRuntime {
         expression: &str,
         timeout: std::time::Duration,
     ) -> Result<serde_json::Value, String> {
+        let json = self.evaluate_json_with_timeout(expression, timeout)?;
+        serde_json::from_str(&json)
+            .map_err(|error| format!("failed to decode evaluation result: {}", error))
+    }
+
+    /// Evaluate an expression and return its intrinsic V8 JSON serialization.
+    /// The watchdog remains armed through serialization and UTF-8 conversion,
+    /// since getters and proxies may execute JavaScript during stringify.
+    pub fn evaluate_json_with_timeout(
+        &mut self,
+        expression: &str,
+        timeout: std::time::Duration,
+    ) -> Result<String, String> {
         if timeout.is_zero() {
-            return self.evaluate(expression);
+            self.begin_javascript_task();
+            let wrapped = Self::wrap_expression(expression);
+            let result = self
+                .runtime
+                .execute_script("<eval>", wrapped)
+                .map_err(|error| format!("JS error: {}", error))?;
+            return self.v8_to_json_text(result);
         }
         self.begin_javascript_task();
         let wrapped = Self::wrap_expression(expression);
         let token = self.arm_watchdog(timeout);
-        let result = self.runtime.execute_script("<eval>", wrapped);
-        let fired = self.disarm_watchdog(token);
-        match result {
-            Ok(v) if !fired => self.v8_to_json(v),
-            Ok(_) => Err("eval timed out".to_string()),
-            Err(e) => {
-                let msg = e.to_string();
-                if fired || msg.contains("execution terminated") {
-                    Err("eval timed out".to_string())
-                } else {
-                    Err(format!("JS error: {}", msg))
-                }
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            match self.runtime.execute_script("<eval>", wrapped) {
+                Ok(value) => self.v8_to_json_text(value),
+                Err(error) => Err(format!("JS error: {}", error)),
             }
+        }));
+        let fired = self.disarm_watchdog(token);
+        let result = match result {
+            Ok(result) => result,
+            Err(payload) => std::panic::resume_unwind(payload),
+        };
+        match result {
+            Err(error) if fired || error.contains("execution terminated") => {
+                Err("eval timed out".to_string())
+            }
+            Ok(_) if fired => Err("eval timed out".to_string()),
+            other => other,
         }
     }
 
@@ -2392,47 +2426,31 @@ impl ObscuraJsRuntime {
         &mut self,
         result: deno_core::v8::Global<deno_core::v8::Value>,
     ) -> Result<serde_json::Value, String> {
+        let json = self.v8_to_json_text(result)?;
+        serde_json::from_str(&json)
+            .map_err(|error| format!("failed to decode evaluation result: {}", error))
+    }
+
+    fn v8_to_json_text(
+        &mut self,
+        result: deno_core::v8::Global<deno_core::v8::Value>,
+    ) -> Result<String, String> {
         let scope = &mut self.runtime.handle_scope();
-        let local = deno_core::v8::Local::new(scope, result);
+        let try_catch = &mut deno_core::v8::TryCatch::new(scope);
+        let local = deno_core::v8::Local::new(try_catch, result);
 
-        if local.is_undefined() || local.is_null() {
-            return Ok(serde_json::Value::Null);
-        }
-        if local.is_boolean() {
-            return Ok(serde_json::Value::Bool(local.boolean_value(scope)));
-        }
-        if local.is_number() {
-            let n = local.number_value(scope).unwrap_or(0.0);
-            return Ok(serde_json::json!(n));
-        }
-        if local.is_string() {
-            let s = local.to_rust_string_lossy(scope);
-            return Ok(serde_json::Value::String(s));
+        // Match the historical API contract for an undefined completion value.
+        if local.is_undefined() {
+            return Ok("null".to_string());
         }
 
-        let global = scope.get_current_context().global(scope);
-        let json_obj_str = deno_core::v8::String::new(scope, "JSON").unwrap();
-        if let Some(json_obj) = global.get(scope, json_obj_str.into()) {
-            if let Some(json_obj) = json_obj.to_object(scope) {
-                let stringify_str = deno_core::v8::String::new(scope, "stringify").unwrap();
-                if let Some(stringify_fn) = json_obj.get(scope, stringify_str.into()) {
-                    if let Ok(stringify_fn) =
-                        deno_core::v8::Local::<deno_core::v8::Function>::try_from(stringify_fn)
-                    {
-                        let args = [local];
-                        if let Some(result) = stringify_fn.call(scope, json_obj.into(), &args) {
-                            let json_str = result.to_rust_string_lossy(scope);
-                            if let Ok(val) = serde_json::from_str(&json_str) {
-                                return Ok(val);
-                            }
-                        }
-                    }
-                }
+        let Some(json) = deno_core::v8::json::stringify(try_catch, local) else {
+            if try_catch.has_terminated() {
+                return Err("eval timed out".to_string());
             }
-        }
-
-        let s = local.to_rust_string_lossy(scope);
-        Ok(serde_json::Value::String(s))
+            return Err("failed to serialize evaluation result as JSON".to_string());
+        };
+        Ok(json.to_rust_string_lossy(try_catch))
     }
 
     fn info_from_json(value: &serde_json::Value) -> RemoteObjectInfo {

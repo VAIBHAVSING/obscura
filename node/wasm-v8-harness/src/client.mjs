@@ -1,9 +1,48 @@
-import { Worker } from "node:worker_threads";
+import { createRequire } from "node:module";
+import { extname } from "node:path";
+import { isMainThread, Worker } from "node:worker_threads";
 
 import { MAX_HTML_INPUT_BYTES, requireBoundedString } from "./limits.mjs";
+import { resolveModulePath } from "./module-loader.mjs";
 
 const workerUrl = new URL("./worker.mjs", import.meta.url);
 const MAX_TIMER_MS = 2_147_483_647;
+const require = createRequire(import.meta.url);
+
+function nativeInitializationError(message) {
+  const error = new Error(message);
+  error.code = "ERR_OBSCURA_NATIVE_INIT";
+  return error;
+}
+
+function preloadNativeAddon(modulePath, cwd) {
+  const resolvedPath = resolveModulePath(modulePath, cwd);
+  if (!resolvedPath || extname(resolvedPath) !== ".node") {
+    return { modulePath, cwd };
+  }
+  if (!isMainThread) {
+    throw nativeInitializationError("Obscura's native addon must be initialized from Node's main thread");
+  }
+
+  const addon = require(resolvedPath);
+  if (typeof addon.initializeEmbeddedV8 !== "function") {
+    throw nativeInitializationError("Obscura's native addon does not export initializeEmbeddedV8()");
+  }
+  if (typeof addon.embeddedV8Version !== "function") {
+    throw nativeInitializationError("Obscura's native addon does not export embeddedV8Version()");
+  }
+  const initializedVersion = addon.initializeEmbeddedV8();
+  const exportedVersion = addon.embeddedV8Version();
+  if (
+    typeof initializedVersion !== "string" ||
+    initializedVersion.length === 0 ||
+    exportedVersion !== initializedVersion
+  ) {
+    throw nativeInitializationError("Obscura's native addon reported an invalid embedded V8 version");
+  }
+
+  return { modulePath: resolvedPath, cwd };
+}
 
 function validateTimeout(timeoutMs, label) {
   if (!Number.isSafeInteger(timeoutMs) || timeoutMs < 1 || timeoutMs > MAX_TIMER_MS) {
@@ -33,11 +72,12 @@ export class WasmV8Worker {
   #readyReject;
 
   constructor(modulePath, { cwd = process.cwd() } = {}) {
+    const workerData = preloadNativeAddon(modulePath, cwd);
     this.#ready = new Promise((resolve, reject) => {
       this.#readyResolve = resolve;
       this.#readyReject = reject;
     });
-    this.#worker = new Worker(workerUrl, { workerData: { modulePath, cwd } });
+    this.#worker = new Worker(workerUrl, { workerData });
     this.#worker.on("message", (message) => this.#onMessage(message));
     this.#worker.on("error", (error) => this.#fail(error, true));
     this.#worker.on("exit", (code) => {

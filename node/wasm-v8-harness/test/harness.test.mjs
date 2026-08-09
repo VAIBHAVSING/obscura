@@ -24,6 +24,7 @@ const mockObscuraCoreMismatchedAbi = fileURLToPath(
 const mockLeakyRuntime = fileURLToPath(new URL("./fixtures/mock-leaky-runtime.cjs", import.meta.url));
 const harnessCli = fileURLToPath(new URL("../bin/run.mjs", import.meta.url));
 const realWasmModule = process.env.OBSCURA_REAL_WASM_MODULE;
+const realNativeAddon = process.env.OBSCURA_REAL_NATIVE_ADDON;
 const execFileAsync = promisify(execFile);
 
 test("loads a wasm-bindgen-shaped wrapper in a persistent worker", async () => {
@@ -94,10 +95,96 @@ test("recognizes the native EmbeddedRuntime API and decodes its JSON text", asyn
     assert.equal(inspect.capabilities.runtimeFactory, "EmbeddedRuntime");
     assert.deepEqual(await worker.request("probe", { source: "6 * 7" }), { ok: true, result: 42 });
     assert.equal(await worker.moduleEvaluate("21 * 2"), 42);
+    await assert.rejects(worker.moduleEvaluate("__timeout_error__"), /eval timed out/);
+    assert.equal(await worker.moduleEvaluate("6 * 7"), 42);
   } finally {
     await worker.close();
   }
 });
+
+test(
+  "initializes the real native addon on the main thread and reuses runtimes after V8 timeouts",
+  { skip: !realNativeAddon },
+  async () => {
+    const gateScript = String.raw`
+      const assert = require("node:assert/strict");
+      const addon = require(process.argv[1]);
+      assert.throws(() => new addon.EmbeddedRuntime(), /initializeEmbeddedV8/);
+      assert.throws(() => addon.probe(), /initializeEmbeddedV8/);
+      const version = addon.initializeEmbeddedV8();
+      assert.equal(typeof version, "string");
+      assert.ok(version.length > 0);
+      assert.equal(addon.initializeEmbeddedV8(), version);
+      assert.equal(addon.embeddedV8Version(), version);
+      process.stdout.write(version);
+    `;
+    const { stdout: embeddedVersion } = await execFileAsync(
+      process.execPath,
+      ["-e", gateScript, realNativeAddon],
+      { timeout: 30_000 },
+    );
+    assert.ok(embeddedVersion.length > 0);
+
+    const worker = await WasmV8Worker.launch(realNativeAddon, { readyTimeoutMs: 30_000 });
+    try {
+      assert.equal(await worker.moduleEvaluate("6 * 7"), 42);
+      assert.deepEqual(
+        await worker.moduleEvaluate(
+          `(function(){ JSON.stringify = () => '"spoofed"'; return { answer: 42 }; })()`,
+        ),
+        { answer: 42 },
+      );
+      await assert.rejects(
+        worker.moduleEvaluate("(function(){ while (true) {} })()", {
+          evaluateTimeoutMs: 25,
+          requestTimeoutMs: 2_000,
+        }),
+        /eval timed out/,
+      );
+      assert.equal(await worker.moduleEvaluate("40 + 2"), 42);
+      await assert.rejects(
+        worker.moduleEvaluate("({ get value(){ while (true) {} } })", {
+          evaluateTimeoutMs: 25,
+          requestTimeoutMs: 2_000,
+        }),
+        /eval timed out/,
+      );
+      assert.equal(await worker.moduleEvaluate("21 * 2"), 42);
+    } finally {
+      await worker.close();
+    }
+  },
+);
+
+test(
+  "runs concurrent and sequential real native addon Worker lifecycles",
+  { skip: !realNativeAddon },
+  async () => {
+    const launches = await Promise.allSettled(
+      Array.from({ length: 4 }, () => WasmV8Worker.launch(realNativeAddon, { readyTimeoutMs: 30_000 })),
+    );
+    const concurrent = launches.flatMap((launch) => (launch.status === "fulfilled" ? [launch.value] : []));
+    try {
+      const failedLaunch = launches.find((launch) => launch.status === "rejected");
+      if (failedLaunch) throw failedLaunch.reason;
+      assert.deepEqual(
+        await Promise.all(concurrent.map((worker) => worker.moduleEvaluate("6 * 7"))),
+        [42, 42, 42, 42],
+      );
+    } finally {
+      await Promise.all(concurrent.map((worker) => worker.close()));
+    }
+
+    for (let index = 0; index < 4; index += 1) {
+      const worker = await WasmV8Worker.launch(realNativeAddon, { readyTimeoutMs: 30_000 });
+      try {
+        assert.equal(await worker.moduleEvaluate(`${index} + 42`), index + 42);
+      } finally {
+        await worker.close();
+      }
+    }
+  },
+);
 
 test("rejects ObscuraCore modules with a missing or mismatched ABI before ready", async () => {
   await assert.rejects(WasmV8Worker.launch(mockObscuraCoreMissingAbi), {

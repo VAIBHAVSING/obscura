@@ -5,6 +5,7 @@ class EmbeddedRuntime {
 
   evaluate(expression) {
     if (this.closed) throw new Error("runtime is closed");
+    if (expression === "__timeout_error__") throw new Error("eval timed out");
     return JSON.stringify(Function(`"use strict"; return (${expression})`)());
   }
 
