@@ -1,5 +1,10 @@
 # Obscura Node and WebAssembly migration memory
 
+Verified implementation commit: `40cd6948b93a403cfb1dc1722a2790060da83103`
+(`fix: harden WASM harness verification`). The final harness and portable
+boundary gates include the fail-closed CLI and WASM-audit regression fixes in
+that commit.
+
 ## Decision
 
 V8 137.3.0 cannot be compiled to `wasm32-unknown-unknown`. Its build requests
@@ -7,55 +12,104 @@ V8 137.3.0 cannot be compiled to `wasm32-unknown-unknown`. Its build requests
 its source build has no wasm32 platform branch. V8 can execute WebAssembly, but
 the V8 engine is not itself a supported WebAssembly payload.
 
-The viable design is:
+The viable portable design remains:
 
 ```text
-Node Worker and its V8 isolate
+Node or Deno host and its V8 isolate
   page JavaScript and browser bootstrap
   host transport, timers, scheduling, and process limits
              |
              | versioned, batched ABI
              v
-obscura-wasm
+target obscura-wasm (planned full portable core)
   DOM, selectors, style, layout, portable state, and CPU paint
 ```
 
-Node is the first host. Deno can use the same ABI after Node is behaviorally
-complete. The separate `obscura-node` experiment embeds a second native V8 in
-Node and is a fidelity fallback, not the host-V8 WebAssembly design.
+Node is the implemented feasibility-harness Worker host, not yet a production
+browser host. The generated Deno bindings execute the same portable core, but
+there is not yet a Deno Worker/browser integration. The separate
+`obscura-node` experiment embeds a second, native V8 inside Node. It is a
+native-fidelity fallback and proof of coexistence, not the host-V8 WebAssembly
+architecture.
 
 ## Implemented feasibility slice
 
 - `crates/obscura-wasm` reuses Obscura's parser, DOM tree, selectors, text
-  access, and serialization through wasm-bindgen.
+  access, and serialization through wasm-bindgen. Its negotiated ABI version is
+  1. HTML input, selector input, and returned strings have explicit byte limits;
+  invalid selectors are `SyntaxError`s and oversize values are `RangeError`s.
+- The portable link sets a maximum of 4,096 WebAssembly pages, or 256 MiB. The
+  generated binary defines one memory with that maximum; it does not import
+  memory, networking, or browser objects.
 - `node/wasm-v8-harness` loads the module in a persistent Worker, evaluates
-  JavaScript with Node V8, and exposes a small read-only `document` facade
-  backed by the Rust/WASM DOM.
-- The harness tests deterministic disposal, startup failure cleanup, repeated
-  evaluation, raw WASM inspection, and forced Worker termination.
-- `tooling/wasm/audit.sh` checks the portable boundary and classifies the
-  native networking, paint, deno_core, and rusty_v8 blockers.
+  JavaScript with host Node V8, and exposes a small read-only `document` facade
+  backed by the Rust/WASM DOM. ABI negotiation, realm isolation, request and
+  evaluation limits, value serialization limits, deterministic disposal,
+  startup cleanup, repeated replacement, and forced termination are covered.
+- The harness now has an artifact-required gate. It refuses to treat a raw
+  inspection-only WASM module as a successful executable backend, and the gate
+  fails at startup if either the real wasm-bindgen wrapper or real native addon
+  was not supplied.
+- The Deno-target wasm-bindgen package was exercised directly in Deno with 176
+  assertions over ABI/probe metadata, parsing, selectors, text and HTML,
+  replacement, error types, exact and oversize limits, 100 reuse iterations,
+  exports/imports, and the 4,096-page memory maximum.
+- `tooling/wasm/audit.sh` checks the portable dependency boundary and classifies
+  the native networking, paint, deno_core, and rusty_v8 blockers.
 - `crates/obscura-node` is an experimental Node-API wrapper around the current
-  native `ObscuraJsRuntime` and its embedded V8.
+  native `ObscuraJsRuntime` and its separately initialized embedded V8.
 
-This is not a full browser, CDP endpoint, Puppeteer/Playwright replacement, or
-Deno integration.
+This is still not a full browser, CDP endpoint, Puppeteer/Playwright
+replacement, complete bootstrap/task bridge, complete rendering/resource host
+split, or production Deno integration. The passing artifacts prove the bounded
+DOM bridge and native-addon feasibility slices only.
 
 ## Build and verification commands
 
-Portable release WASM:
+Portable release WASM and Node wrapper:
 
 ```bash
 CARGO_INCREMENTAL=0 CARGO_BUILD_JOBS=1 \
   cargo build --release -p obscura-wasm --target wasm32-unknown-unknown
 
-wasm-bindgen --target nodejs \
-  --out-dir /workspaces/.obscura-wasm-pkg \
+/workspaces/.obscura-wasm-tools/wasm-bindgen-0.2.125-x86_64-unknown-linux-musl/wasm-bindgen \
+  --target nodejs \
+  --out-dir /workspaces/.obscura-wasm-pkg-final \
   target/wasm32-unknown-unknown/release/obscura_wasm.wasm
 
 node node/wasm-v8-harness/bin/run.mjs \
-  --module /workspaces/.obscura-wasm-pkg/obscura_wasm.js \
+  --module /workspaces/.obscura-wasm-pkg-final/obscura_wasm.js \
   --mode all
+```
+
+Deno wrapper and the disposable verification program used for the final audit:
+
+```bash
+/workspaces/.obscura-wasm-tools/wasm-bindgen-0.2.125-x86_64-unknown-linux-musl/wasm-bindgen \
+  --target deno \
+  --out-dir /workspaces/.obscura-wasm-deno-final \
+  target/wasm32-unknown-unknown/release/obscura_wasm.wasm
+
+deno run \
+  --allow-read=/workspaces/.obscura-wasm-deno-final \
+  /tmp/obscura-deno-audit.ts
+```
+
+The audit program is disposable evidence outside the repository, not a checked
+in test. Its result was 176/176 assertions, and the assertion source remaining
+at `/tmp/obscura-deno-audit.ts` has SHA-256
+`bad3792d05a62d1daf3f41968069f25e14a9fbea2b24beb9664ebd7aa1489003`.
+The Deno executable, version record, and command output were not retained, so
+this is prior local feasibility evidence rather than a reproducible checked-in
+gate.
+
+Artifact-required Node tests:
+
+```bash
+cd node/wasm-v8-harness
+OBSCURA_REAL_WASM_MODULE=/workspaces/.obscura-wasm-pkg-final/obscura_wasm.js \
+OBSCURA_REAL_NATIVE_ADDON=/workspaces/obscura-node.node \
+  npm run test:artifacts
 ```
 
 Portable boundary audit:
@@ -67,6 +121,10 @@ tooling/wasm/audit.sh --require-full
 
 The strict audit remains expected to fail until networking, paint resources,
 deno_core, and V8 have portable replacements.
+
+The final default audit exited 0 with all three portable checks passing. The
+strict audit exited 1 with the four expected blockers: networking, paint,
+deno_core, and V8.
 
 Native embedded-V8 experiment on Linux:
 
@@ -85,51 +143,150 @@ produces `-fPIC` objects and defines `V8_TLS_USED_IN_LIBRARY` so V8 uses a
 shared-library-safe TLS model. Keep `napi_build::setup()` because it emits
 `-Wl,-z,nodelete` on Linux.
 
-## Verified measurements
+Release-mode Rust verification:
 
-All measurements are local, network-free, and use a warm filesystem.
+```bash
+cargo nextest run --release -p obscura-wasm
+cargo nextest run --release --features render -p obscura-js
 
-| Path | Median |
-| --- | ---: |
-| Native process through `--version` | 3.72 ms |
-| Native process through a real CDP WebSocket handshake | 16.75 ms |
-| Native local HTML fetch plus `document.title` | 22.36 ms |
-| Node release-WASM first Worker ready | 88.32 ms |
-| WASM module load within that Worker | 8.30 ms |
+cargo nextest run --release --features render --no-fail-fast
 
-Final regenerated artifacts after adding the document-element serializer:
+CARGO_INCREMENTAL=0 CARGO_BUILD_JOBS=2 \
+  cargo build --release -p obscura-cli --bins --features render
+```
 
-- raw release WASM: 885,228 bytes;
-- Node-bound WASM: 849,307 bytes;
-- Node wrapper: 8,974 bytes;
-- release-mode nextest for `obscura-wasm`: 1/1 passed;
-- Node harness: 8/8 passed;
-- real host-V8 to WASM-DOM bridge: passed;
-- forced infinite-evaluation Worker termination: passed.
+## Final artifact identity and proof
 
-The spike is not a cold-start speedup. First Worker readiness is about four to
-five times the measured native startup paths. A persistent pool amortizes the
-cost. WASM should not be assumed to improve DOM, layout, or paint throughput;
-chatty JavaScript/WASM calls can be much slower. Batch operations and buffers.
-The initial warm-performance target is within 10 to 25 percent of native on
-representative end-to-end workloads, subject to interleaved measurement.
+The artifacts checked with the implementation commit identified above are:
+
+| Artifact | Bytes | SHA-256 |
+| --- | ---: | --- |
+| Raw release `obscura_wasm.wasm` | 1,320,633 | `8b7da34d472983cd7c6d0862357fcc4e1a7f1707407ba45ce08144a56f1ecbc7` |
+| Node `obscura_wasm_bg.wasm` | 864,046 | `eff4ca2473dd87d14a054a7e55c73b3e798b68d9efa4e0ecbd9cd04d8425070f` |
+| Node `obscura_wasm.js` | 10,856 | `45fd893922d906b344f3872e415720a491c89215aa381d1593a9d61acfb88d7e` |
+| Deno `obscura_wasm_bg.wasm` | 864,046 | `eff4ca2473dd87d14a054a7e55c73b3e798b68d9efa4e0ecbd9cd04d8425070f` |
+| Deno `obscura_wasm.js` | 10,464 | `27abf94ce85ce15d5411eace16c89ca2a30a4372435de04d27893cd6b745395a` |
+| Native `obscura-node.node` | 68,819,424 | `c688203098f2c8b943a34a07cee46d3ad5d1bdd43e949051826e480dc827bcec` |
+| Release CLI `obscura` | 93,518,104 | `80c47cace873713c841cffbe5c41b79a6eb6658bd3ffc14e47f915ab0589d5ed` |
+
+The Node and Deno wrappers use the same 864,046-byte WASM payload. Binary
+inspection and the Deno audit confirmed one defined memory with maximum 4,096
+pages, equal to 256 MiB.
+
+The current native addon is an x86-64 ELF shared object, dynamically linked and
+not stripped. The final ELF audit found:
+
+- the expected 25-symbol dynamic-export allowlist, including
+  `napi_register_module_v1`, with no missing or unexpected exports;
+- 38 TLS symbols, zero dynamic TLS symbols, 15 `DTPMOD64` relocations with no
+  external targets, and zero forbidden `TPOFF32` relocations;
+- zero collisions with Node or libnode exports, all 33 N-API imports resolved,
+  and no V8/rusty_v8 undefined-symbol collision with the host;
+- `BIND_NOW`, `NODELETE`, GNU RELRO, and a non-executable GNU stack, with no
+  text relocations, rpath/runpath, or external V8/Node library dependency.
+
+The sole undefined V8-pattern symbol is the weak TLS initializer
+`_ZTHN2v88internal12trap_handler21g_thread_in_wasm_codeE`; it does not collide
+with a host export.
+
+The runtime proof used Node 24.14.0 with host V8 13.6.233.17-node.41 and
+embedded rusty_v8 13.7.152.14-rusty. It confirmed that initialization is
+required on the main thread and is idempotent; intrinsic JSON serialization
+survives page overrides; infinite getters and `toJSON` hooks time out and the
+runtime remains reusable; circular results fail cleanly; four concurrent and
+ten sequential Worker lifecycles complete; one timed-out Worker does not poison
+three peers or the main runtime; and 100 close-stress iterations produce 200
+idempotent close calls plus 100 post-close rejections.
+
+Recorded verification results:
+
+- Deno portable-core audit: 176/176 assertions;
+- ordinary Node harness run: 27/30 passed, with the 3 real-artifact tests
+  skipped as expected when artifact paths are not supplied;
+- artifact-required Node harness with both real artifacts: 30/30 tests, zero
+  skipped;
+- `obscura-js` release nextest: 279/279 tests;
+- `obscura-wasm` release nextest: 1/1 test;
+- full workspace release nextest with render: 1,393/1,393 executed tests passed,
+  4 skipped, zero failed (run id
+  `93fb8f73-563c-4705-8629-ed6c215145c9`);
+- the exact release `obscura-cli` render build shown above passed.
+
+The 33/33 obstacle course was not run because the companion
+`/workspaces/obscura-benchmark` repository is not present in this workspace.
+
+## Benchmark methodology and current result
+
+`/workspaces/obscura-final-bench/final-head-with-cli.json` is the final
+network-free run on a two-logical-CPU AMD EPYC 7763 host with Node 24.14.0. Its
+SHA-256 is
+`f9d0531be623b2973fde1f29ce599e8af13075f5f75342d4dffee1689d134676`.
+The validated summary at
+`/workspaces/obscura-final-bench/final-head-with-cli-summary.json` has SHA-256
+`da0a7fe3cb29d57d54f48b418cb008b76048ddee6a7e39ef72a6327695e1066b`.
+
+The run contains 75 raw samples: 25 fresh processes for each of portable WASM,
+the native addon, and the release CLI. The three-way sequential order rotates
+each round. The filesystem was preconditioned by hashing every artifact. Each
+Node process used 20 warmups, 1,000 timed warm operations, and 25 churn
+operations. Results use R-7 percentiles without outlier removal and fix
+`TZ=UTC`, `LANG=C`, and `LC_ALL=C`. The summary validator covered both Node
+backends; a separate raw-data check confirmed 25 unique, finite, positive CLI
+samples across rounds 1 through 25.
+
+Selected p50 / p95 values are:
+
+| Measurement | Portable WASM | Native addon | Release CLI |
+| --- | ---: | ---: | ---: |
+| Process start to Worker ready | 111.221 / 342.242 ms | 115.330 / 230.549 ms | n/a |
+| Worker module load | 7.171 / 15.778 ms | 0.510 / 2.476 ms | n/a |
+| Process start to first backend result | 132.832 / 388.008 ms | 122.734 / 251.934 ms | n/a |
+| Warm persistent operation | 0.567 / 1.459 ms | 0.281 / 0.507 ms | n/a |
+| Create/replace or create/drop operation | 3.938 / 9.169 ms | 7.056 / 10.084 ms | n/a |
+| Ready RSS | 67.00 / 69.00 MiB | 79.36 / 83.13 MiB | n/a |
+| Full `data:` fetch, parse, eval, and exit | n/a | n/a | 32.967 / 116.793 ms |
+| Approximate polled peak RSS | n/a | n/a | 31.93 / 32.44 MiB |
+
+For the two Node backends, only the process-wide start-to-ready and ready-RSS
+rows have directly comparable endpoints. The CLI row is a separate
+full-process `data:` URL fetch, parse, `6 * 7` evaluation, and exit workload,
+not the same endpoint as either Node first-result row. Node RSS is measured
+directly; CLI peak RSS is Linux `/proc` `VmHWM` polled every 2 ms and can miss a
+short-lived peak.
+
+The native warm operation is a Worker round trip plus `6 * 7` in one persistent
+embedded runtime, while the portable warm operation is a Worker round trip plus
+an `h1` query in an already-loaded core and host realm. Their p50 rates were
+3,560 and 1,765 operations per second respectively, but the work differs.
+Native create/drop constructs and closes an embedded runtime; portable
+create/replace constructs a core, disposes the prior document, and queries
+`h1`. The throughput and churn rows are path measurements, not head-to-head
+speed claims. The outer fresh-process totals are diagnostic because they
+include every timed workload, shutdown, and JSON serialization.
+
+The spike has not demonstrated an end-to-end browser cold-start or throughput
+win. A persistent pool can amortize Worker/module startup, but chatty
+JavaScript/WASM calls can be much slower. Keep the ABI batched and buffer-based,
+and measure completed representative browser workloads interleaved against the
+same revision before setting a performance target.
 
 ## Migration phases and acceptance gates
 
 1. Stable host ABI and ownership
-   - Add version/capability negotiation, integer handles, stable errors, bulk
-     buffers, page reset, request/response queues, and deterministic disposal.
+   - Extend the current feasibility ABI v1 negotiation into a stable
+     full-browser ABI with integer handles, stable errors, bulk buffers, page
+     reset, request/response queues, and deterministic disposal.
    - Reject stale and cross-page handles. No panic may cross wasm-bindgen or
      Node-API boundaries.
 
 2. Host transport and profile state
    - Keep redirect, cookie, interception, proxy, and SSRF policy in portable
-     Rust where practical. Execute sockets and fetch in Node.
+     Rust where practical. Execute sockets and fetch in Node or Deno.
    - Validate initial, redirected, and rewritten URLs. Preserve private-network
      blocking unless explicitly enabled.
 
 3. DOM, bootstrap, and task bridge
-   - Run the existing browser bootstrap in Worker V8 and replace deno_core ops
+   - Run the existing browser bootstrap in host V8 and replace deno_core ops
      with a generated batched adapter.
    - Preserve mutation argument order, cycle guards, traversal limits,
      microtask/timer/network/render ordering, and forced termination.
@@ -151,5 +308,5 @@ representative end-to-end workloads, subject to interleaved measurement.
      33/33, WPT subtest comparisons, rendering fixtures, and interleaved latency
      and resource benchmarks.
 
-Migration completion requires all phases. The current successful build and DOM
-bridge prove only the feasibility slice.
+Migration completion requires all phases. The current successful artifacts and
+tests do not satisfy the full-browser acceptance gates.
