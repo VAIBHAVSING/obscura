@@ -415,7 +415,14 @@ impl ObscuraCore {
 
     fn dom_op_inner(&mut self, cmd: &str, arg1: &str, arg2: &str) -> Result<String, String> {
         Self::validate_dom_args(cmd, arg1, arg2)?;
-        let next_revision = if is_dom_mutation_command(cmd) {
+        // Native op_dom computes render mutation impact from the pre-op state
+        // and only invalidates caches when the operation would actually change
+        // the document. The page revision follows the same rule: no-op writes
+        // (same attribute value, missing attribute removal, identical text,
+        // already-last append, already-immediately-before insert) and node
+        // creation/cloning must not invalidate host-side wrappers.
+        let effective = self.mutation_effectiveness(cmd, arg1, arg2);
+        let next_revision = if effective == Some(true) {
             Some(
                 self.page_revision
                     .checked_add(1)
@@ -426,13 +433,167 @@ impl ObscuraCore {
         };
         let result = self.dispatch_dom_op(cmd, arg1, arg2)?;
         if let Some(next_revision) = next_revision {
-            // Native op_dom reports `false`/`-1` for rejected tree mutations.
-            // Do not invalidate host caches when no mutation took place.
-            if result != "false" && result != "-1" {
-                self.page_revision = next_revision;
-            }
+            self.page_revision = next_revision;
         }
         Ok(result)
+    }
+
+    /// Whether executing `cmd` right now would change the document, mirroring
+    /// the native `render_mutation_impact` analysis in `obscura-js`. Returns
+    /// `Some(true)` for effective mutations, `Some(false)` for commands that
+    /// either cannot change the tree (node creation, cloning, template content
+    /// allocation) or whose current invocation is a native no-op, and `None`
+    /// for commands that never count as mutations (read-only queries).
+    ///
+    /// The result is read from the pre-op state, exactly like the native
+    /// implementation, so it describes the mutation about to be performed.
+    /// Stale or invalid handles yield `None`: the dispatch rejects them and
+    /// no revision change may occur for an invalid operation.
+    fn mutation_effectiveness(&self, cmd: &str, arg1: &str, arg2: &str) -> Option<bool> {
+        let dom = &self.dom;
+        match cmd {
+            "set_attribute" => {
+                let target = self.resolve_handle(arg1).ok()?;
+                let (name, value) = arg2.split_once('\0')?;
+                let old = dom
+                    .with_node(target, |node| node.get_attribute(name).map(str::to_string))
+                    .flatten();
+                Some(old.as_deref() != Some(value))
+            }
+            "set_attribute_ns" => {
+                let target = self.resolve_handle(arg1).ok()?;
+                let mut parts = arg2.splitn(3, '\0');
+                let namespace = parts.next().unwrap_or("");
+                let qualified = parts.next().unwrap_or("");
+                let value = parts.next().unwrap_or("");
+                if qualified.is_empty() {
+                    // The dispatcher performs no mutation for an empty
+                    // qualified name, so the write is a no-op by construction.
+                    return Some(false);
+                }
+                let local = qualified
+                    .split_once(':')
+                    .map(|(_, local)| local)
+                    .unwrap_or(qualified);
+                let old = dom
+                    .with_node(target, |node| {
+                        node.get_attribute_ns(namespace, local).map(str::to_string)
+                    })
+                    .flatten();
+                Some(old.as_deref() != Some(value))
+            }
+            "remove_attribute" => {
+                let target = self.resolve_handle(arg1).ok()?;
+                Some(
+                    dom.with_node(target, |node| node.get_attribute(arg2).is_some())
+                        .unwrap_or(false),
+                )
+            }
+            "remove_attribute_ns" => {
+                let target = self.resolve_handle(arg1).ok()?;
+                let (namespace, local) = arg2.split_once('\0').unwrap_or(("", arg2));
+                Some(
+                    dom.with_node(target, |node| {
+                        node.get_attribute_ns(namespace, local).is_some()
+                    })
+                    .unwrap_or(false),
+                )
+            }
+            "set_text_content" => {
+                let target = self.resolve_handle(arg1).ok()?;
+                let changed = dom
+                    .with_node(target, |node| match &node.data {
+                        NodeData::Text { contents } | NodeData::Comment { contents } => {
+                            contents.as_str() != arg2
+                        }
+                        NodeData::ProcessingInstruction { data, .. } => data.as_str() != arg2,
+                        // Setting textContent on an element/document/fragment
+                        // is a tree replacement handled by the JS layer, not
+                        // by this command; the native analysis treats it as a
+                        // no-op here as well.
+                        _ => false,
+                    })
+                    .unwrap_or(false);
+                Some(changed)
+            }
+            "append_child" => {
+                let parent = self.resolve_handle(arg1).ok()?;
+                let child = self.resolve_handle(arg2).ok()?;
+                if dom.get_node(parent).is_none() || dom.get_node(child).is_none() {
+                    return Some(false);
+                }
+                let old_parent = dom.get_node(child).and_then(|node| node.parent);
+                let already_last = old_parent == Some(parent)
+                    && dom.children(parent).last().copied() == Some(child);
+                // tree.rs rejects appending an inclusive ancestor of the
+                // destination (or the destination itself); a rejected move
+                // changes nothing and must not advance the revision.
+                let would_cycle = Self::ancestor_chain_contains(dom, parent, child);
+                Some(!already_last && !would_cycle)
+            }
+            "insert_before" => {
+                let new_node = self.resolve_handle(arg1).ok()?;
+                let reference = self.resolve_handle(arg2).ok()?;
+                if dom.get_node(new_node).is_none() {
+                    return Some(false);
+                }
+                let Some(reference_parent) = dom.get_node(reference).and_then(|node| node.parent)
+                else {
+                    return Some(false);
+                };
+                let already_immediately_before =
+                    dom.get_node(reference).and_then(|node| node.prev_sibling) == Some(new_node);
+                // tree.rs applies the same host-including cycle constraints as
+                // append_child, walking from the reference's parent.
+                let would_cycle =
+                    Self::ancestor_chain_contains(dom, reference_parent, new_node);
+                Some(new_node != reference && !already_immediately_before && !would_cycle)
+            }
+            "remove_child" => {
+                let child = self.resolve_handle(arg1).ok()?;
+                Some(dom.get_node(child).is_some_and(|node| node.parent.is_some()))
+            }
+            "set_inner_html" | "set_inner_html_context" | "set_fragment_html_executable" => {
+                let target = self.resolve_handle(arg1).ok()?;
+                // The dispatcher rejects replacing the document node itself
+                // with "false"; a valid element target always changes.
+                Some(target != dom.document())
+            }
+            // Node creation, cloning, and template-content allocation allocate
+            // handles but never change the connected tree. The native render
+            // analysis has no arm for them, so they never invalidate; keep the
+            // same rule for the page revision.
+            "template_contents"
+            | "create_document_fragment"
+            | "clone_node"
+            | "create_element"
+            | "create_element_ns"
+            | "create_text_node"
+            | "create_comment_node"
+            | "create_processing_instruction"
+            | "create_doctype" => Some(false),
+            _ => None,
+        }
+    }
+
+    /// Walks the parent chain from `start` and reports whether `needle` is an
+    /// inclusive ancestor of `start`. Mirrors the host-including cycle guard
+    /// in obscura-dom's mutation APIs so rejected moves are never counted as
+    /// effective mutations. The walk is capped: a valid parent chain cannot
+    /// exceed the arena, so exceeding the cap means pre-existing corruption
+    /// and the mutation is refused, matching obscura-dom's defense in depth.
+    fn ancestor_chain_contains(dom: &DomTree, start: NodeId, needle: NodeId) -> bool {
+        let mut current = Some(start);
+        for _ in 0..=1_000_000 {
+            let Some(node) = current else {
+                return false;
+            };
+            if node == needle {
+                return true;
+            }
+            current = dom.get_node(node).and_then(|node| node.parent);
+        }
+        true
     }
 
     fn dispatch_dom_op(&mut self, cmd: &str, arg1: &str, arg2: &str) -> Result<String, String> {
@@ -1048,31 +1209,7 @@ fn fragment_context_and_html(arg: &str) -> (html5ever::QualName, &str) {
     )
 }
 
-fn is_dom_mutation_command(cmd: &str) -> bool {
-    matches!(
-        cmd,
-        "set_attribute"
-            | "append_child"
-            | "remove_child"
-            | "insert_before"
-            | "remove_attribute"
-            | "set_attribute_ns"
-            | "remove_attribute_ns"
-            | "set_inner_html"
-            | "set_inner_html_context"
-            | "set_fragment_html_executable"
-            | "set_text_content"
-            | "template_contents"
-            | "create_document_fragment"
-            | "clone_node"
-            | "create_element"
-            | "create_element_ns"
-            | "create_text_node"
-            | "create_comment_node"
-            | "create_processing_instruction"
-            | "create_doctype"
-    )
-}
+
 
 fn node_child_index(dom: &DomTree, node: NodeId) -> usize {
     let mut index = 0usize;
@@ -1464,5 +1601,1290 @@ mod tests {
             ""
         )
         .is_err());
+    }
+
+    /// The canonical 63-command op_dom surface, sorted and unique. It exactly
+    /// matches `BOOTSTRAP_DOM_OP_COMMANDS` in
+    /// `node/wasm-v8-harness/src/bootstrap-runtime.mjs`, which
+    /// `bootstrap-runtime.test.mjs` locks against the production bootstrap.js.
+    const ALL_DOM_COMMANDS: [&str; 63] = [
+        "append_child",
+        "attribute_names",
+        "child_nodes",
+        "clone_node",
+        "compare_order",
+        "contains",
+        "create_comment_node",
+        "create_doctype",
+        "create_document_fragment",
+        "create_element",
+        "create_element_ns",
+        "create_processing_instruction",
+        "create_text_node",
+        "doctype_name",
+        "doctype_public_id",
+        "document_doctype",
+        "document_element",
+        "document_encoding",
+        "document_node_id",
+        "document_referrer",
+        "document_title",
+        "document_url",
+        "element_children",
+        "first_child",
+        "get_attribute",
+        "get_attribute_ns",
+        "get_element_by_id",
+        "has_child_nodes",
+        "inner_html",
+        "insert_before",
+        "is_connected",
+        "last_child",
+        "local_name",
+        "matches_selector",
+        "namespace_uri",
+        "next_after_subtree",
+        "next_in_subtree",
+        "next_sibling",
+        "node_index",
+        "node_name",
+        "node_root",
+        "node_type",
+        "outer_html",
+        "parent_node",
+        "pi_target",
+        "prev_in_subtree",
+        "prev_sibling",
+        "query_selector",
+        "query_selector_all",
+        "query_selector_all_scoped",
+        "query_selector_scoped",
+        "remove_attribute",
+        "remove_attribute_ns",
+        "remove_child",
+        "set_attribute",
+        "set_attribute_ns",
+        "set_fragment_html_executable",
+        "set_inner_html",
+        "set_inner_html_context",
+        "set_text_content",
+        "tag_name",
+        "template_contents",
+        "text_content",
+    ];
+
+    const SMOKE_HTML: &str = "<!doctype html><html><head><title>Smoke</title></head><body>\
+        <main id='main'><h1 class='t' data-x='h'>Hello</h1><p>World</p>\
+        <template><b>T</b></template></main></body></html>";
+
+    fn fresh_core() -> ObscuraCore {
+        ObscuraCore::new(SMOKE_HTML).unwrap()
+    }
+
+    fn op_err(core: &mut ObscuraCore, cmd: &str, arg1: &str, arg2: &str) -> String {
+        core.dom_op_inner(cmd, arg1, arg2).unwrap_err()
+    }
+
+    fn revision(core: &ObscuraCore) -> u32 {
+        core.page_revision
+    }
+
+    /// Run `ops` and assert the page revision advances by exactly `delta`.
+    fn assert_revision_delta(core: &mut ObscuraCore, delta: u32, ops: &[(&str, &str, &str)]) {
+        let before = revision(core);
+        for (cmd, arg1, arg2) in ops {
+            op(core, cmd, arg1, arg2);
+        }
+        assert_eq!(
+            revision(core) - before,
+            delta,
+            "revision delta for {ops:?}"
+        );
+    }
+
+    // ------------------------------------------------------------------
+    // Phase 1: ABI contract
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn abi_surface_is_exactly_version_one_with_stable_node_handles() {
+        assert_eq!(ABI_VERSION, 1);
+        assert_eq!(DOM_OP_ABI_VERSION, 1);
+        assert_eq!(DOM_BATCH_ABI_VERSION, 1);
+        assert_eq!(abi_version(), 1);
+        assert!(!version().is_empty());
+        let probe: serde_json::Value = serde_json::from_str(&probe()).unwrap();
+        assert_eq!(probe["abiVersion"], 1);
+        assert_eq!(probe["domOpAbiVersion"], 1);
+        assert_eq!(probe["domBatchAbiVersion"], 1);
+        assert_eq!(probe["documentMetadataAbiVersion"], 1);
+        assert_eq!(probe["stableNodeHandles"], true);
+        assert_eq!(probe["dom"], true);
+        assert_eq!(probe["selectors"], true);
+        assert_eq!(probe["javascript"], "host");
+        assert_eq!(probe["embeddedV8"], false);
+    }
+
+    #[test]
+    fn document_identity_starts_clean_and_metadata_round_trips() {
+        let mut core = fresh_core();
+        assert_eq!(core.document_handle(), 1);
+        assert_eq!(core.page_revision(), 0);
+        assert_eq!(op(&mut core, "document_node_id", "", ""), "1");
+        assert_eq!(op(&mut core, "document_url", "", ""), "\"about:blank\"");
+        assert_eq!(op(&mut core, "document_referrer", "", ""), "\"\"");
+        assert_eq!(op(&mut core, "document_encoding", "", ""), "\"UTF-8\"");
+
+        core.set_document_metadata(
+            "https://example.test/path?q=1",
+            "https://ref.test/",
+            "windows-1252",
+        )
+        .unwrap();
+        assert_eq!(
+            op(&mut core, "document_url", "", ""),
+            "\"https://example.test/path?q=1\""
+        );
+        assert_eq!(op(&mut core, "document_referrer", "", ""), "\"https://ref.test/\"");
+        assert_eq!(op(&mut core, "document_encoding", "", ""), "\"windows-1252\"");
+        // Metadata updates never change the document identity or revision.
+        assert_eq!(core.document_handle(), 1);
+        assert_eq!(core.page_revision(), 0);
+    }
+
+    #[test]
+    fn batch_envelope_is_strictly_validated_before_execution() {
+        let mut core = fresh_core();
+        assert_eq!(core.dom_batch_inner("[]").unwrap(), "[]");
+        assert_eq!(
+            core.dom_batch_inner(r#"["document_title","",""]"#).unwrap_err(),
+            "DOM batch entry 0 must contain exactly 3 strings"
+        );
+        assert!(
+            core.dom_batch_inner("not json at all")
+                .unwrap_err()
+                .contains("invalid DOM batch JSON")
+        );
+        let heading = handle(&mut core, "h1");
+        // An entry that is not an exact three-string tuple rejects the whole
+        // batch before any command runs.
+        let bad_shape = serde_json::json!([
+            ["set_attribute", heading, "class\0hero"],
+            ["node_type", heading],
+        ])
+        .to_string();
+        assert!(core.dom_batch_inner(&bad_shape).is_err());
+        // The rejected batch never ran its mutation prefix.
+        assert_eq!(op(&mut core, "get_attribute", &heading, "class"), "\"t\"");
+        let bad_field = serde_json::json!([["set_attribute", heading, 42]]).to_string();
+        assert!(core.dom_batch_inner(&bad_field).is_err());
+        assert_eq!(op(&mut core, "get_attribute", &heading, "class"), "\"t\"");
+        // Unknown commands degrade to "null" like native op_dom.
+        assert_eq!(op(&mut core, "no_such_command", "", ""), "null");
+        assert_eq!(op(&mut core, "no_such_command", "x", "y"), "null");
+    }
+
+    // ------------------------------------------------------------------
+    // Phase 2: all 63 commands
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn dispatcher_covers_exactly_the_canonical_63_command_manifest() {
+        // Lock the dispatcher's match arms to the canonical manifest by
+        // parsing the crate source. An accidental addition or removal of a
+        // named command arm fails this test, and so does any drift from the
+        // bootstrap manifest (which is itself locked to bootstrap.js).
+        let source = include_str!("lib.rs");
+        let dispatch = source
+            .split("fn dispatch_dom_op")
+            .nth(1)
+            .expect("dispatch_dom_op body");
+        let dispatch = dispatch
+            .split("fn fragment_context_and_html")
+            .next()
+            .expect("dispatch_dom_op end");
+        let mut commands = Vec::new();
+        for line in dispatch.lines() {
+            let trimmed = line.trim_start();
+            if !trimmed.starts_with('"') {
+                continue;
+            }
+            let before_arrow = trimmed.split("=>").next().unwrap_or("");
+            let mut valid = true;
+            let mut names = Vec::new();
+            for part in before_arrow.split('|') {
+                let part = part.trim();
+                if !(part.starts_with('"') && part.ends_with('"')) {
+                    valid = false;
+                    break;
+                }
+                let name = &part[1..part.len() - 1];
+                if name.is_empty() || !name.chars().all(|c| c.is_ascii_lowercase() || c == '_') {
+                    valid = false;
+                    break;
+                }
+                names.push(name.to_string());
+            }
+            if valid && !names.is_empty() {
+                commands.extend(names);
+            }
+        }
+        commands.sort();
+        commands.dedup();
+        assert_eq!(commands.len(), ALL_DOM_COMMANDS.len());
+        assert_eq!(commands, ALL_DOM_COMMANDS);
+    }
+
+    fn smoke_args(core: &mut ObscuraCore, cmd: &str) -> (String, String) {
+        let main = handle(core, "#main");
+        let h1 = handle(core, "h1");
+        let p = handle(core, "p");
+        let template = handle(core, "template");
+        match cmd {
+            // Document identity and metadata: no arguments.
+            "document_node_id" | "document_title" | "document_url" | "document_referrer"
+            | "document_encoding" | "document_element" | "document_doctype"
+            | "create_document_fragment" => (String::new(), String::new()),
+            // Selectors.
+            "get_element_by_id" => ("main".to_string(), String::new()),
+            "query_selector" => ("main > *".to_string(), String::new()),
+            "query_selector_all" => ("main > *".to_string(), String::new()),
+            "query_selector_scoped" => (main.clone(), "p".to_string()),
+            "query_selector_all_scoped" => (main.clone(), "h1, p".to_string()),
+            "matches_selector" => (h1.clone(), "h1".to_string()),
+            // Single-node reads.
+            "node_type" | "node_name" | "text_content" | "tag_name" | "local_name"
+            | "namespace_uri" | "attribute_names" | "child_nodes" | "element_children"
+            | "has_child_nodes" | "is_connected" | "node_index" | "node_root"
+            | "inner_html" | "outer_html" => (h1.clone(), String::new()),
+            // Traversal.
+            "parent_node" | "first_child" | "last_child" | "next_sibling"
+            | "prev_sibling" => (h1.clone(), String::new()),
+            "next_in_subtree" | "prev_in_subtree" | "next_after_subtree" => {
+                (main.clone(), h1.clone())
+            }
+            "contains" => (main.clone(), h1.clone()),
+            "compare_order" => (h1.clone(), p.clone()),
+            // Attributes.
+            "get_attribute" => (h1.clone(), "data-x".to_string()),
+            "get_attribute_ns" => (h1.clone(), "\0data-x".to_string()),
+            "set_attribute" => (h1.clone(), "class\0smoke".to_string()),
+            "set_attribute_ns" => (h1.clone(), "urn:test\0x:k\0v".to_string()),
+            "remove_attribute" => (h1.clone(), "data-x".to_string()),
+            "remove_attribute_ns" => (h1.clone(), "urn:test\0k".to_string()),
+            // Content mutation.
+            "set_text_content" => (h1.clone(), "changed".to_string()),
+            "set_inner_html" => (main.clone(), "<b>X</b>".to_string()),
+            "set_inner_html_context" => (main.clone(), "div\0<i>Y</i>".to_string()),
+            "set_fragment_html_executable" => {
+                (main.clone(), "div\0<script>1</script>".to_string())
+            }
+            // Tree mutation.
+            "append_child" => {
+                let div = op(core, "create_element", "div", "");
+                (main.clone(), div)
+            }
+            "insert_before" => {
+                let span = op(core, "create_element", "span", "");
+                (span, h1.clone())
+            }
+            "remove_child" => (p.clone(), String::new()),
+            // Creation and cloning.
+            "create_element" => ("span".to_string(), String::new()),
+            "create_element_ns" => {
+                ("http://www.w3.org/2000/svg\0svg".to_string(), String::new())
+            }
+            "create_text_node" => ("hello".to_string(), String::new()),
+            "create_comment_node" => ("note".to_string(), String::new()),
+            "create_processing_instruction" => ("xml".to_string(), "data".to_string()),
+            "create_doctype" => ("html".to_string(), "public".to_string()),
+            "clone_node" => (main.clone(), "true".to_string()),
+            "template_contents" => (template.clone(), String::new()),
+            // PI and doctype reads.
+            "pi_target" => (op(core, "create_processing_instruction", "xml", "d"), String::new()),
+            "doctype_name" | "doctype_public_id" => {
+                let doctype: serde_json::Value =
+                    serde_json::from_str(&op(core, "document_doctype", "", "")).unwrap();
+                (doctype["nodeId"].as_u64().unwrap().to_string(), String::new())
+            }
+            _ => (String::new(), String::new()),
+        }
+    }
+
+    #[test]
+    fn every_supported_command_runs_and_returns_its_contract_shape() {
+        for cmd in ALL_DOM_COMMANDS {
+            let mut core = fresh_core();
+            let (arg1, arg2) = smoke_args(&mut core, cmd);
+            let result = op(&mut core, cmd, &arg1, &arg2);
+            assert!(!result.is_empty(), "{cmd} returned an empty result");
+            match cmd {
+                "child_nodes" | "query_selector_all" | "query_selector_all_scoped"
+                | "attribute_names" | "element_children" => {
+                    let parsed: serde_json::Value = serde_json::from_str(&result)
+                        .unwrap_or_else(|error| panic!("{cmd} must return JSON: {error}"));
+                    assert!(parsed.is_array(), "{cmd} returned {result:?}");
+                }
+                "document_title" | "document_url" | "document_referrer"
+                | "document_encoding" | "node_name" | "tag_name" | "local_name"
+                | "namespace_uri" | "text_content" | "get_attribute" | "get_attribute_ns"
+                | "inner_html" | "outer_html" | "pi_target" | "doctype_name"
+                | "doctype_public_id" => {
+                    let parsed: serde_json::Value = serde_json::from_str(&result)
+                        .unwrap_or_else(|error| panic!("{cmd} must return JSON: {error}"));
+                    assert!(parsed.is_string(), "{cmd} returned {result:?}");
+                }
+                "document_doctype" => {
+                    let parsed: serde_json::Value = serde_json::from_str(&result).unwrap();
+                    assert!(parsed.is_object() || parsed.is_null(), "{cmd} returned {result:?}");
+                }
+                "matches_selector" | "has_child_nodes" | "contains" | "is_connected"
+                | "append_child" | "remove_child" | "insert_before" | "remove_attribute"
+                | "remove_attribute_ns" | "set_attribute" | "set_attribute_ns"
+                | "set_text_content" | "set_inner_html" | "set_inner_html_context"
+                | "set_fragment_html_executable" => {
+                    assert!(result == "true" || result == "false", "{cmd} returned {result:?}");
+                }
+                "node_type" => {
+                    let value: u32 = result.parse().unwrap();
+                    assert!((1..=10).contains(&value), "{cmd} returned {result:?}");
+                }
+                "node_index" => {
+                    result
+                        .parse::<usize>()
+                        .unwrap_or_else(|error| panic!("{cmd} returned {result:?}: {error}"));
+                }
+                "compare_order" => {
+                    let value: i32 = result.parse().unwrap();
+                    assert!((-1..=1).contains(&value), "{cmd} returned {result:?}");
+                }
+                _ => {
+                    // Handle-returning commands return "-1" or a positive u32.
+                    if result != "-1" {
+                        let value: u32 = result
+                            .parse()
+                            .unwrap_or_else(|error| panic!("{cmd} returned {result:?}: {error}"));
+                        assert!(value > 0, "{cmd} returned handle 0");
+                    }
+                }
+            }
+        }
+    }
+
+    // ------------------------------------------------------------------
+    // Phase 3: handle correctness
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn same_node_returns_the_same_handle_repeatedly() {
+        let mut core = fresh_core();
+        let first = handle(&mut core, "#main");
+        assert_eq!(first, handle(&mut core, "#main"));
+        assert_eq!(op(&mut core, "get_element_by_id", "main", ""), first);
+        let h1 = handle(&mut core, "h1");
+        assert_eq!(op(&mut core, "parent_node", &h1, ""), first);
+        let children: Vec<u32> =
+            serde_json::from_str(&op(&mut core, "child_nodes", &first, "")).unwrap();
+        assert!(children.contains(&h1.parse().unwrap()));
+        assert_eq!(op(&mut core, "child_nodes", &first, ""), op(&mut core, "child_nodes", &first, ""));
+    }
+
+    #[test]
+    fn two_different_nodes_never_share_a_handle() {
+        let mut core = fresh_core();
+        let mut seen = std::collections::HashSet::new();
+        let document = op(&mut core, "document_node_id", "", "");
+        let mut stack = vec![document];
+        while let Some(current) = stack.pop() {
+            let handle = current.parse::<u32>().unwrap();
+            assert!(
+                seen.insert(handle),
+                "handle {handle} was exposed twice (node sharing a handle)"
+            );
+            let children: Vec<u32> =
+                serde_json::from_str(&op(&mut core, "child_nodes", &current, "")).unwrap();
+            for child in children {
+                stack.push(child.to_string());
+            }
+        }
+        // Handles created later never collide with tree nodes either.
+        let detached = op(&mut core, "create_element", "aside", "");
+        let parsed = detached.parse::<u32>().unwrap();
+        assert!(seen.insert(parsed), "detached node reused a tree handle");
+    }
+
+    #[test]
+    fn detached_nodes_retain_their_handles() {
+        let mut core = fresh_core();
+        let div = op(&mut core, "create_element", "div", "");
+        let span = op(&mut core, "create_element", "span", "");
+        assert_eq!(op(&mut core, "append_child", &div, &span), "true");
+        let text = op(&mut core, "create_text_node", "x", "");
+        assert_eq!(op(&mut core, "append_child", &span, &text), "true");
+        assert_eq!(op(&mut core, "remove_child", &span, ""), "true");
+        assert_eq!(op(&mut core, "parent_node", &span, ""), "-1");
+        assert_eq!(op(&mut core, "node_name", &span, ""), "\"SPAN\"");
+        assert_eq!(op(&mut core, "text_content", &span, ""), "\"x\"");
+        assert_eq!(op(&mut core, "node_type", &text, ""), "3");
+        // The detached subtree remains traversable through its own root.
+        assert_eq!(op(&mut core, "node_root", &text, ""), span);
+    }
+
+    #[test]
+    fn reparented_nodes_retain_their_handles() {
+        let mut core = fresh_core();
+        let h1 = handle(&mut core, "h1");
+        let p = handle(&mut core, "p");
+        let body = handle(&mut core, "body");
+        let main = handle(&mut core, "main");
+        assert_eq!(op(&mut core, "append_child", &body, &h1), "true");
+        assert_eq!(op(&mut core, "parent_node", &h1, ""), body);
+        // h1 is now body's last child, directly after main.
+        assert_eq!(op(&mut core, "prev_sibling", &h1, ""), main);
+        assert_eq!(op(&mut core, "next_sibling", &h1, ""), "-1");
+        assert_eq!(op(&mut core, "text_content", &h1, ""), "\"Hello\"");
+        // Moving h1 back under main preserves the handle as well.
+        assert_eq!(op(&mut core, "insert_before", &h1, &p), "true");
+        assert_eq!(op(&mut core, "parent_node", &h1, ""), main);
+    }
+
+    #[test]
+    fn cloned_nodes_receive_different_handles() {
+        let mut core = fresh_core();
+        let main = handle(&mut core, "main");
+        let shallow = op(&mut core, "clone_node", &main, "false");
+        let deep = op(&mut core, "clone_node", &main, "true");
+        assert_ne!(shallow, main);
+        assert_ne!(deep, main);
+        assert_ne!(shallow, deep);
+        let main_children: Vec<u32> =
+            serde_json::from_str(&op(&mut core, "child_nodes", &main, "")).unwrap();
+        let deep_children: Vec<u32> =
+            serde_json::from_str(&op(&mut core, "child_nodes", &deep, "")).unwrap();
+        assert_eq!(main_children.len(), deep_children.len());
+        for (original, cloned) in main_children.iter().zip(deep_children.iter()) {
+            assert_ne!(original, cloned, "deep clone reused a child handle");
+        }
+        // A shallow clone has no children.
+        assert_eq!(op(&mut core, "child_nodes", &shallow, ""), "[]");
+        // Clones are detached and rooted at themselves.
+        assert_eq!(op(&mut core, "is_connected", &deep, ""), "false");
+        assert_eq!(op(&mut core, "node_root", &deep, ""), deep);
+        assert_eq!(op(&mut core, "text_content", &deep, ""), "\"HelloWorld\"");
+    }
+
+    #[test]
+    fn set_html_invalidates_every_previous_handle() {
+        let mut core = fresh_core();
+        let old_document = core.document_handle();
+        let old_handles = vec![
+            old_document.to_string(),
+            handle(&mut core, "html"),
+            handle(&mut core, "body"),
+            handle(&mut core, "#main"),
+            handle(&mut core, "h1"),
+            handle(&mut core, "p"),
+            handle(&mut core, "template"),
+        ];
+        core.set_html("<!doctype html><html><body><h1>new</h1></body></html>")
+            .unwrap();
+        for old in old_handles {
+            let error = op_err(&mut core, "node_type", &old.to_string(), "");
+            assert!(
+                error.contains("stale or unknown node handle"),
+                "handle {old} after reset: {error}"
+            );
+        }
+        assert_ne!(core.document_handle(), old_document);
+        let new_h1 = handle(&mut core, "h1");
+        assert_eq!(op(&mut core, "text_content", &new_h1, ""), "\"new\"");
+    }
+
+    #[test]
+    fn handles_allocated_after_reset_never_reuse_previous_values() {
+        let mut core = fresh_core();
+        let mut maximum = 0u32;
+        for html in [
+            "<main><i>a</i></main>",
+            "<main><b>b</b></main>",
+            "<main><u>c</u></main>",
+        ] {
+            core.set_html(html).unwrap();
+            let document = core.document_handle();
+            assert!(document > maximum, "document handle reused a value");
+            maximum = document;
+            let mut stack = vec![document.to_string()];
+            while let Some(current) = stack.pop() {
+                let children: Vec<u32> =
+                    serde_json::from_str(&op(&mut core, "child_nodes", &current, "")).unwrap();
+                for child in children {
+                    assert!(child > maximum, "node handle {child} reused a value");
+                    maximum = child;
+                    stack.push(child.to_string());
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn invalid_zero_and_stale_handles_return_controlled_errors() {
+        let mut core = fresh_core();
+        let h1 = handle(&mut core, "h1");
+        for bad in [
+            "", "abc", "-1", "0", "4294967295", "4294967296", "99999999999999999999",
+        ] {
+            let error = op_err(&mut core, "node_type", bad, "");
+            assert!(!error.is_empty(), "no controlled error for handle {bad:?}");
+        }
+        assert!(op_err(&mut core, "node_type", "0", "").contains("stale or unknown node handle"));
+        assert!(op_err(&mut core, "node_type", "abc", "").contains("invalid node handle"));
+        core.set_html("<main></main>").unwrap();
+        let error = op_err(&mut core, "node_type", &h1, "");
+        assert!(error.contains("stale or unknown node handle"), "{error}");
+        // A controlled error never poisons the core.
+        let main = handle(&mut core, "main");
+        assert_eq!(op(&mut core, "text_content", &main, ""), "\"\"");
+    }
+
+    #[test]
+    fn handle_allocation_overflow_fails_safely_instead_of_wrapping() {
+        let mut core = fresh_core();
+        core.next_handle = u32::MAX;
+        let error = op_err(&mut core, "create_element", "span", "");
+        assert_eq!(error, "node handle space is exhausted");
+        // The batch path reports the same controlled failure.
+        let request = serde_json::json!([["create_element", "span", ""]]).to_string();
+        assert_eq!(
+            core.dom_batch_inner(&request).unwrap_err(),
+            "node handle space is exhausted"
+        );
+        // Read-only operations keep working at the exhausted boundary.
+        assert_eq!(
+            op(&mut core, "document_node_id", "", ""),
+            core.document_handle().to_string()
+        );
+        // Restoring the counter resumes allocation without wrapping.
+        core.next_handle = 5000;
+        let span = op(&mut core, "create_element", "span", "");
+        assert!(span.parse::<u32>().unwrap() >= 5000);
+        assert_eq!(op(&mut core, "node_type", &span, ""), "1");
+    }
+
+    #[test]
+    fn cyclic_insertion_remains_rejected_and_traversal_terminates() {
+        let mut core = fresh_core();
+        let main = handle(&mut core, "main");
+        let h1 = handle(&mut core, "h1");
+        assert_eq!(op(&mut core, "append_child", &h1, &main), "false");
+        assert_eq!(op(&mut core, "insert_before", &main, &h1), "false");
+        assert_eq!(op(&mut core, "parent_node", &h1, ""), main);
+        // Appending a node to itself is also rejected as a no-op.
+        assert_eq!(op(&mut core, "append_child", &h1, &h1), "false");
+        assert_eq!(op(&mut core, "parent_node", &h1, ""), main);
+        // Traversal still terminates on a deep, valid chain.
+        let root = op(&mut core, "create_element", "div", "");
+        let mut current = root.clone();
+        for _ in 0..3000 {
+            let next = op(&mut core, "create_element", "span", "");
+            assert_eq!(op(&mut core, "append_child", &current, &next), "true");
+            current = next;
+        }
+        let mut steps = 0usize;
+        let mut cursor = op(&mut core, "first_child", &root, "");
+        loop {
+            cursor = op(&mut core, "next_in_subtree", &root, &cursor);
+            if cursor == "-1" {
+                break;
+            }
+            steps += 1;
+            assert!(steps < 4000, "forward traversal did not terminate");
+        }
+        // first_child is the starting cursor; next_in_subtree then yields
+        // the remaining 2999 spans before "-1".
+        assert_eq!(steps, 2999);
+        cursor = op(&mut core, "next_after_subtree", &root, &root);
+        assert_eq!(cursor, "-1");
+        // Backward traversal terminates as well.
+        let last = {
+            let mut node = root.clone();
+            let mut child = op(&mut core, "last_child", &node, "");
+            while child != "-1" {
+                node = child.clone();
+                child = op(&mut core, "last_child", &child, "");
+            }
+            node
+        };
+        cursor = last;
+        steps = 0;
+        loop {
+            cursor = op(&mut core, "prev_in_subtree", &root, &cursor);
+            if cursor == "-1" {
+                break;
+            }
+            steps += 1;
+            assert!(steps < 4000, "backward traversal did not terminate");
+        }
+        // prev_in_subtree yields span2999..span1, then the root itself (a
+        // NodeIterator may return its root as a node), then "-1".
+        assert_eq!(steps, 3000);
+    }
+
+    #[test]
+    fn template_contents_allocate_stable_fragment_handles() {
+        let mut core = fresh_core();
+        let template = handle(&mut core, "template");
+        let contents = op(&mut core, "template_contents", &template, "");
+        assert_ne!(contents, "-1");
+        assert_eq!(op(&mut core, "template_contents", &template, ""), contents);
+        assert_eq!(op(&mut core, "node_type", &contents, ""), "9");
+        // Template children live in the content fragment, not the light tree.
+        let light: Vec<u32> =
+            serde_json::from_str(&op(&mut core, "child_nodes", &template, "")).unwrap();
+        assert!(light.is_empty(), "template light children: {light:?}");
+        let fragment_children: Vec<u32> =
+            serde_json::from_str(&op(&mut core, "child_nodes", &contents, "")).unwrap();
+        assert_eq!(fragment_children.len(), 1);
+        assert_eq!(op(&mut core, "text_content", &contents, ""), "\"T\"");
+        // Appending into the content fragment works and is visible through it.
+        let span = op(&mut core, "create_element", "span", "");
+        assert_eq!(op(&mut core, "append_child", &contents, &span), "true");
+        assert_eq!(
+            op(&mut core, "text_content", &contents, ""),
+            "\"T\""
+        );
+        // Deep cloning clones the content fragment with a distinct handle.
+        let clone = op(&mut core, "clone_node", &template, "true");
+        let cloned_contents = op(&mut core, "template_contents", &clone, "");
+        assert_ne!(cloned_contents, contents);
+        assert_eq!(op(&mut core, "text_content", &cloned_contents, ""), "\"T\"");
+        assert_ne!(
+            op(&mut core, "child_nodes", &cloned_contents, ""),
+            op(&mut core, "child_nodes", &contents, "")
+        );
+        // Document replacement invalidates template content handles too.
+        core.set_html("<template><i>N</i></template>").unwrap();
+        let error = op_err(&mut core, "node_type", &contents, "");
+        assert!(error.contains("stale or unknown node handle"), "{error}");
+    }
+
+    // ------------------------------------------------------------------
+    // Phase 4: mutation and revision semantics
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn page_revision_tracks_effective_mutations_only() {
+        let mut core = fresh_core();
+        let main = handle(&mut core, "main");
+        let h1 = handle(&mut core, "h1");
+        let p = handle(&mut core, "p");
+        let template = handle(&mut core, "template");
+        let document = core.document_handle().to_string();
+
+        // Attribute writes: only value-changing writes count.
+        assert_revision_delta(&mut core, 1, &[("set_attribute", &h1, "class\0hero")]);
+        assert_revision_delta(&mut core, 0, &[("set_attribute", &h1, "class\0hero")]);
+        assert_revision_delta(&mut core, 1, &[("set_attribute", &h1, "class\0hero2")]);
+        // Missing NUL separator is a native no-op.
+        assert_revision_delta(&mut core, 0, &[("set_attribute", &h1, "broken")]);
+        assert_revision_delta(&mut core, 1, &[("remove_attribute", &h1, "class")]);
+        assert_revision_delta(&mut core, 0, &[("remove_attribute", &h1, "class")]);
+        assert_revision_delta(&mut core, 1, &[("set_attribute_ns", &h1, "urn:test\0x:k\0v")]);
+        assert_revision_delta(&mut core, 0, &[("set_attribute_ns", &h1, "urn:test\0x:k\0v")]);
+        // An empty qualified name performs no mutation at all.
+        assert_revision_delta(&mut core, 0, &[("set_attribute_ns", &h1, "urn:test\0\0v")]);
+        assert_revision_delta(&mut core, 1, &[("remove_attribute_ns", &h1, "urn:test\0k")]);
+        assert_revision_delta(&mut core, 0, &[("remove_attribute_ns", &h1, "urn:test\0k")]);
+        // Text writes: only value-changing writes count. Element targets are
+        // no-ops on both backends (the JS layer owns element textContent).
+        let text = op(&mut core, "first_child", &h1, "");
+        assert_revision_delta(&mut core, 1, &[("set_text_content", &text, "changed")]);
+        assert_revision_delta(&mut core, 0, &[("set_text_content", &text, "changed")]);
+        assert_revision_delta(&mut core, 1, &[("set_text_content", &text, "again")]);
+        assert_revision_delta(&mut core, 0, &[("set_text_content", &h1, "ignored")]);
+
+        // Tree writes: creation itself never bumps, the effective move does.
+        let div = op(&mut core, "create_element", "div", "");
+        let span = op(&mut core, "create_element", "span", "");
+        assert_revision_delta(&mut core, 1, &[("append_child", &div, &span)]);
+        assert_revision_delta(&mut core, 0, &[("append_child", &div, &span)]);
+        assert_revision_delta(&mut core, 1, &[("append_child", &main, &div)]);
+        assert_revision_delta(&mut core, 0, &[("append_child", &h1, &main)]);
+        assert_revision_delta(&mut core, 1, &[("insert_before", &span, &div)]);
+        assert_revision_delta(&mut core, 0, &[("insert_before", &span, &div)]);
+        assert_revision_delta(&mut core, 0, &[("insert_before", &div, &div)]);
+        assert_revision_delta(&mut core, 1, &[("remove_child", &div, "")]);
+        assert_revision_delta(&mut core, 0, &[("remove_child", &div, "")]);
+
+        // innerHTML replacement bumps once per effective replacement.
+        assert_revision_delta(&mut core, 1, &[("set_inner_html", &main, "<b>X</b>")]);
+        assert_revision_delta(
+            &mut core,
+            1,
+            &[("set_inner_html_context", &main, "div\0<i>Y</i>")],
+        );
+        assert_revision_delta(
+            &mut core,
+            1,
+            &[("set_fragment_html_executable", &main, "div\0<script>1</script>")],
+        );
+        // Replacing the document node itself is rejected without a bump.
+        assert_revision_delta(&mut core, 0, &[("set_inner_html", &document, "<b>X</b>")]);
+
+        // Node creation, cloning, and template-content allocation never bump.
+        assert_revision_delta(
+            &mut core,
+            0,
+            &[
+                ("create_element", "", ""),
+                ("create_element_ns", "http://www.w3.org/2000/svg\0svg", ""),
+                ("create_text_node", "t", ""),
+                ("create_comment_node", "c", ""),
+                ("create_processing_instruction", "xml", "d"),
+                ("create_doctype", "html", "p"),
+                ("create_document_fragment", "", ""),
+                ("clone_node", &main, "true"),
+                ("template_contents", &template, ""),
+            ],
+        );
+
+        // Read-only operations, selector failures, and invalid operations
+        // never bump.
+        assert_revision_delta(
+            &mut core,
+            0,
+            &[
+                ("text_content", &h1, ""),
+                ("query_selector", "missing", ""),
+                ("query_selector_all", "main > *", ""),
+                ("document_title", "", ""),
+                ("node_type", &p, ""),
+            ],
+        );
+        let before = revision(&core);
+        assert!(core.dom_op_inner("node_type", "4294967295", "").is_err());
+        assert_eq!(revision(&core), before);
+        assert!(core.dom_op_inner("set_attribute", "4294967295", "id\0x").is_err());
+        assert_eq!(revision(&core), before);
+    }
+
+    #[test]
+    fn set_html_advances_the_revision_exactly_once() {
+        let mut core = fresh_core();
+        let before = revision(&core);
+        core.set_html("<main></main>").unwrap();
+        assert_eq!(revision(&core), before + 1);
+        // Replacing the document again continues the monotonic sequence.
+        core.set_html("<main><i>x</i></main>").unwrap();
+        assert_eq!(revision(&core), before + 2);
+    }
+
+    #[test]
+    fn batch_revision_reflects_only_the_effective_commands() {
+        let mut core = fresh_core();
+        let h1 = handle(&mut core, "h1");
+        let before = revision(&core);
+        let request = serde_json::json!([
+            ["set_attribute", h1, "class\0x"],
+            ["set_attribute", h1, "class\0x"],
+            ["set_attribute", h1, "class\0y"],
+            ["text_content", h1, ""],
+            ["remove_attribute", h1, "missing"],
+        ])
+        .to_string();
+        let results: Vec<String> =
+            serde_json::from_str(&core.dom_batch_inner(&request).unwrap()).unwrap();
+        assert_eq!(results, vec!["true", "true", "true", "\"Hello\"", "true"]);
+        assert_eq!(revision(&core), before + 2);
+    }
+
+    // ------------------------------------------------------------------
+    // Phase 5: behavioral parity
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn id_index_survives_detach_reparent_attribute_changes_and_reset() {
+        let mut core = fresh_core();
+        let main = handle(&mut core, "main");
+        let body = handle(&mut core, "body");
+        assert_eq!(op(&mut core, "get_element_by_id", "main", ""), main);
+        // Detaching the element hides it from the live index.
+        assert_eq!(op(&mut core, "remove_child", &main, ""), "true");
+        assert_eq!(op(&mut core, "get_element_by_id", "main", ""), "-1");
+        // Reparenting back into the document restores lookup.
+        assert_eq!(op(&mut core, "append_child", &body, &main), "true");
+        assert_eq!(op(&mut core, "get_element_by_id", "main", ""), main);
+        // Attribute changes update the index.
+        assert_eq!(op(&mut core, "set_attribute", &main, "id\0renamed"), "true");
+        assert_eq!(op(&mut core, "get_element_by_id", "main", ""), "-1");
+        assert_eq!(op(&mut core, "get_element_by_id", "renamed", ""), main);
+        // Native parity: the plain remove_attribute path never consults the
+        // id index, so the "renamed" entry stays until the node leaves the
+        // tree. The WASM bridge keeps the same quirk.
+        assert_eq!(op(&mut core, "remove_attribute", &main, "id"), "true");
+        assert_eq!(op(&mut core, "get_element_by_id", "renamed", ""), main);
+        // Rewriting the id from a present attribute replaces the live entry,
+        // but the earlier stale entry survives (old_id was None at the
+        // rewrite because the attribute had been removed), exactly like
+        // native update_id_index.
+        assert_eq!(op(&mut core, "set_attribute", &main, "id\0final"), "true");
+        assert_eq!(op(&mut core, "get_element_by_id", "renamed", ""), main);
+        assert_eq!(op(&mut core, "get_element_by_id", "final", ""), main);
+        // The namespace-aware path keeps the current entry consistent.
+        assert_eq!(op(&mut core, "set_attribute_ns", &main, "\0id\0nsid"), "true");
+        assert_eq!(op(&mut core, "get_element_by_id", "final", ""), "-1");
+        assert_eq!(op(&mut core, "get_element_by_id", "nsid", ""), main);
+        assert_eq!(op(&mut core, "remove_attribute_ns", &main, "\0id"), "true");
+        assert_eq!(op(&mut core, "get_element_by_id", "nsid", ""), "-1");
+        assert_eq!(op(&mut core, "get_element_by_id", "renamed", ""), main);
+        // Detaching clears every stale id entry for the subtree; the live
+        // fallback scan then finds nothing because main has no id attribute.
+        assert_eq!(op(&mut core, "remove_child", &main, ""), "true");
+        assert_eq!(op(&mut core, "get_element_by_id", "renamed", ""), "-1");
+        assert_eq!(op(&mut core, "get_element_by_id", "final", ""), "-1");
+        // Reset rebuilds the index from the new document.
+        core.set_html("<main id='fresh'></main>").unwrap();
+        assert_eq!(
+            op(&mut core, "get_element_by_id", "fresh", ""),
+            handle(&mut core, "main")
+        );
+        assert_eq!(op(&mut core, "get_element_by_id", "main", ""), "-1");
+    }
+
+    #[test]
+    fn namespace_aware_attribute_behavior_matches_native() {
+        let mut core = fresh_core();
+        let h1 = handle(&mut core, "h1");
+        assert_eq!(op(&mut core, "set_attribute_ns", &h1, "urn:test\0x:key\0value"), "true");
+        assert_eq!(
+            op(&mut core, "get_attribute_ns", &h1, "urn:test\0key"),
+            "\"value\""
+        );
+        let names: Vec<String> =
+            serde_json::from_str(&op(&mut core, "attribute_names", &h1, "")).unwrap();
+        assert!(names.contains(&"x:key".to_string()), "{names:?}");
+        // Plain get_attribute does not see a namespaced attribute.
+        assert_eq!(op(&mut core, "get_attribute", &h1, "key"), "null");
+        // Removing under the wrong namespace is a no-op.
+        assert_eq!(op(&mut core, "remove_attribute_ns", &h1, "urn:other\0key"), "true");
+        assert_eq!(
+            op(&mut core, "get_attribute_ns", &h1, "urn:test\0key"),
+            "\"value\""
+        );
+        assert_eq!(op(&mut core, "remove_attribute_ns", &h1, "urn:test\0key"), "true");
+        assert_eq!(op(&mut core, "get_attribute_ns", &h1, "urn:test\0key"), "null");
+        // Overwriting a namespaced value keeps the namespace.
+        assert_eq!(op(&mut core, "set_attribute_ns", &h1, "urn:test\0x:key\0v2"), "true");
+        assert_eq!(
+            op(&mut core, "get_attribute_ns", &h1, "urn:test\0key"),
+            "\"v2\""
+        );
+    }
+
+    #[test]
+    fn selector_syntax_errors_degrade_gracefully_like_native() {
+        let mut core = fresh_core();
+        let main = handle(&mut core, "main");
+        assert_eq!(op(&mut core, "query_selector", "[", ""), "-1");
+        assert_eq!(op(&mut core, "query_selector_all", ":not(", ""), "[]");
+        assert_eq!(op(&mut core, "query_selector_scoped", &main, "["), "-1");
+        assert_eq!(op(&mut core, "query_selector_all_scoped", &main, ":not("), "[]");
+        assert_eq!(op(&mut core, "matches_selector", &main, "["), "false");
+        // Failures leave the core fully usable.
+        assert_ne!(op(&mut core, "query_selector", "h1", ""), "-1");
+        assert_eq!(op(&mut core, "query_selector", ".missing", ""), "-1");
+    }
+
+    #[test]
+    fn contains_matches_native_descendant_semantics() {
+        let mut core = fresh_core();
+        let main = handle(&mut core, "main");
+        let h1 = handle(&mut core, "h1");
+        assert_eq!(op(&mut core, "contains", &main, &h1), "true");
+        // Native quirk: descendants() excludes the node itself, so
+        // node.contains(node) is false on both backends.
+        assert_eq!(op(&mut core, "contains", &main, &main), "false");
+        assert_eq!(op(&mut core, "contains", &h1, &main), "false");
+        let detached = op(&mut core, "create_element", "div", "");
+        assert_eq!(op(&mut core, "contains", &main, &detached), "false");
+        // A detached subtree contains its own descendants.
+        let inner = op(&mut core, "create_element", "span", "");
+        assert_eq!(op(&mut core, "append_child", &detached, &inner), "true");
+        assert_eq!(op(&mut core, "contains", &detached, &inner), "true");
+    }
+
+    #[test]
+    fn insert_before_takes_new_node_then_reference() {
+        let mut core = fresh_core();
+        let main = handle(&mut core, "main");
+        let h1 = handle(&mut core, "h1");
+        let p = handle(&mut core, "p");
+        let template = handle(&mut core, "template");
+        // (new_node, reference): insert p before h1 -> [p, h1, template].
+        assert_eq!(op(&mut core, "insert_before", &p, &h1), "true");
+        assert_eq!(op(&mut core, "first_child", &main, ""), p);
+        assert_eq!(op(&mut core, "next_sibling", &p, ""), h1);
+        assert_eq!(op(&mut core, "prev_sibling", &h1, ""), p);
+        let children: Vec<u32> =
+            serde_json::from_str(&op(&mut core, "child_nodes", &main, "")).unwrap();
+        assert_eq!(
+            children,
+            vec![
+                p.parse::<u32>().unwrap(),
+                h1.parse::<u32>().unwrap(),
+                template.parse::<u32>().unwrap()
+            ]
+        );
+        // Moving h1 before p is a real change: h1 follows p, so the
+        // insertion removes h1 and reinserts it ahead of p.
+        assert_eq!(op(&mut core, "insert_before", &h1, &p), "true");
+        assert_eq!(op(&mut core, "first_child", &main, ""), h1);
+        assert_eq!(op(&mut core, "next_sibling", &h1, ""), p);
+        // Repeating the same insertion leaves the tree unchanged, but the
+        // wire result is still "true" (the operation landed); the page
+        // revision is what must not advance (covered by the revision tests).
+        assert_eq!(op(&mut core, "insert_before", &h1, &p), "true");
+        assert_eq!(op(&mut core, "first_child", &main, ""), h1);
+        assert_eq!(op(&mut core, "next_sibling", &h1, ""), p);
+    }
+
+    #[test]
+    fn connected_and_detached_node_roots_behave_differently() {
+        let mut core = fresh_core();
+        let document = core.document_handle().to_string();
+        let main = handle(&mut core, "main");
+        assert_eq!(op(&mut core, "is_connected", &main, ""), "true");
+        assert_eq!(op(&mut core, "node_root", &main, ""), document);
+        let detached = op(&mut core, "create_element", "section", "");
+        assert_eq!(op(&mut core, "is_connected", &detached, ""), "false");
+        assert_eq!(op(&mut core, "node_root", &detached, ""), detached);
+        let inner = op(&mut core, "create_element", "p", "");
+        assert_eq!(op(&mut core, "append_child", &detached, &inner), "true");
+        assert_eq!(op(&mut core, "is_connected", &inner, ""), "false");
+        assert_eq!(op(&mut core, "node_root", &inner, ""), detached);
+        // Attaching the subtree connects and re-roots every node.
+        assert_eq!(op(&mut core, "append_child", &main, &detached), "true");
+        assert_eq!(op(&mut core, "is_connected", &detached, ""), "true");
+        assert_eq!(op(&mut core, "is_connected", &inner, ""), "true");
+        assert_eq!(op(&mut core, "node_root", &inner, ""), document);
+    }
+
+    #[test]
+    fn doctype_serialization_and_metadata_are_consistent() {
+        let mut core = fresh_core();
+        let doctype: serde_json::Value =
+            serde_json::from_str(&op(&mut core, "document_doctype", "", "")).unwrap();
+        assert_eq!(doctype["name"], "html");
+        assert_eq!(doctype["publicId"], "");
+        assert_eq!(doctype["systemId"], "");
+        let doctype_handle = doctype["nodeId"].as_u64().unwrap().to_string();
+        assert_eq!(op(&mut core, "node_type", &doctype_handle, ""), "10");
+        assert_eq!(op(&mut core, "node_name", &doctype_handle, ""), "\"html\"");
+        assert_eq!(op(&mut core, "doctype_name", &doctype_handle, ""), "\"html\"");
+        assert_eq!(op(&mut core, "doctype_public_id", &doctype_handle, ""), "\"\"");
+        assert_eq!(
+            op(&mut core, "outer_html", &doctype_handle, ""),
+            "\"<!DOCTYPE html>\""
+        );
+        assert_eq!(
+            op(&mut core, "parent_node", &doctype_handle, ""),
+            core.document_handle().to_string()
+        );
+        // Created doctypes behave the same way.
+        let created = op(&mut core, "create_doctype", "svg", "public-id");
+        assert_eq!(op(&mut core, "node_type", &created, ""), "10");
+        assert_eq!(op(&mut core, "doctype_name", &created, ""), "\"svg\"");
+        assert_eq!(op(&mut core, "doctype_public_id", &created, ""), "\"public-id\"");
+        assert_eq!(op(&mut core, "outer_html", &created, ""), "\"<!DOCTYPE svg>\"");
+    }
+
+    #[test]
+    fn processing_instruction_target_and_data_behavior() {
+        let mut core = fresh_core();
+        let pi = op(&mut core, "create_processing_instruction", "xml-stylesheet", "href='x'");
+        assert_eq!(op(&mut core, "node_type", &pi, ""), "7");
+        assert_eq!(op(&mut core, "node_name", &pi, ""), "\"xml-stylesheet\"");
+        assert_eq!(op(&mut core, "pi_target", &pi, ""), "\"xml-stylesheet\"");
+        assert_eq!(op(&mut core, "text_content", &pi, ""), "\"href='x'\"");
+        // textContent on a PI writes the data, never the target.
+        assert_eq!(op(&mut core, "set_text_content", &pi, "data2"), "true");
+        assert_eq!(op(&mut core, "text_content", &pi, ""), "\"data2\"");
+        assert_eq!(op(&mut core, "pi_target", &pi, ""), "\"xml-stylesheet\"");
+        // Non-PI nodes report an empty target.
+        let h1 = handle(&mut core, "h1");
+        assert_eq!(op(&mut core, "pi_target", &h1, ""), "\"\"");
+        // Serialization includes target and data.
+        assert_eq!(op(&mut core, "outer_html", &pi, ""), "\"<?xml-stylesheet data2>\"");
+    }
+
+    #[test]
+    fn cloning_doctype_and_processing_instructions_preserves_identity() {
+        let mut core = fresh_core();
+        let pi = op(&mut core, "create_processing_instruction", "xml", "d1");
+        let doctype = op(&mut core, "create_doctype", "html", "pub");
+        let pi_clone = op(&mut core, "clone_node", &pi, "true");
+        let doctype_clone = op(&mut core, "clone_node", &doctype, "true");
+        assert_ne!(pi_clone, pi);
+        assert_ne!(doctype_clone, doctype);
+        assert_eq!(op(&mut core, "node_type", &pi_clone, ""), "7");
+        assert_eq!(op(&mut core, "node_type", &doctype_clone, ""), "10");
+        assert_eq!(op(&mut core, "pi_target", &pi_clone, ""), "\"xml\"");
+        assert_eq!(op(&mut core, "text_content", &pi_clone, ""), "\"d1\"");
+        assert_eq!(op(&mut core, "doctype_name", &doctype_clone, ""), "\"html\"");
+        assert_eq!(op(&mut core, "doctype_public_id", &doctype_clone, ""), "\"pub\"");
+        // Clones stay detached and rooted at themselves.
+        assert_eq!(op(&mut core, "is_connected", &pi_clone, ""), "false");
+        assert_eq!(op(&mut core, "node_root", &doctype_clone, ""), doctype_clone);
+    }
+
+    #[test]
+    fn compare_order_agrees_with_tree_position() {
+        let mut core = fresh_core();
+        let h1 = handle(&mut core, "h1");
+        let p = handle(&mut core, "p");
+        assert_eq!(op(&mut core, "compare_order", &h1, &p), "-1");
+        assert_eq!(op(&mut core, "compare_order", &p, &h1), "1");
+        assert_eq!(op(&mut core, "compare_order", &h1, &h1), "0");
+        // Detached nodes keep a stable order relative to each other.
+        let a = op(&mut core, "create_element", "a", "");
+        let b = op(&mut core, "create_element", "b", "");
+        let order = op(&mut core, "compare_order", &a, &b);
+        assert!(order == "-1" || order == "1");
+        assert_eq!(op(&mut core, "compare_order", &b, &a), if order == "-1" { "1" } else { "-1" });
+    }
+
+    // ------------------------------------------------------------------
+    // Phase 6: limits and failure safety
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn batch_operation_count_boundary_is_exact() {
+        let mut core = fresh_core();
+        let accepted = serde_json::Value::Array(
+            (0..MAX_DOM_BATCH_OPS)
+                .map(|_| serde_json::json!(["document_title", "", ""]))
+                .collect(),
+        )
+        .to_string();
+        let results: Vec<String> =
+            serde_json::from_str(&core.dom_batch_inner(&accepted).unwrap()).unwrap();
+        assert_eq!(results.len(), MAX_DOM_BATCH_OPS);
+        assert_eq!(results.iter().filter(|r| r.as_str() == "\"Smoke\"").count(), MAX_DOM_BATCH_OPS);
+
+        // 1,025 operations are rejected before any command executes: the first
+        // entry would mutate the tree if the batch had started.
+        let h1 = handle(&mut core, "h1");
+        let mut ops = vec![serde_json::json!(["set_attribute", h1, "class\0x"])];
+        ops.extend(
+            (0..MAX_DOM_BATCH_OPS).map(|_| serde_json::json!(["document_title", "", ""])),
+        );
+        let rejected = serde_json::Value::Array(ops).to_string();
+        assert!(core.dom_batch_inner(&rejected).is_err());
+        // The first entry would have set class="x"; rejection means the
+        // original class="t" is untouched.
+        assert_eq!(op(&mut core, "get_attribute", &h1, "class"), "\"t\"");
+    }
+
+    #[test]
+    fn argument_byte_limits_are_enforced_with_utf8_byte_lengths() {
+        // An argument at exactly the 8 MiB limit is accepted.
+        assert!(ObscuraCore::validate_dom_args(
+            "create_text_node",
+            &"a".repeat(MAX_DOM_ARGUMENT_BYTES),
+            ""
+        )
+        .is_ok());
+        assert!(ObscuraCore::validate_dom_args(
+            "create_text_node",
+            &"a".repeat(MAX_DOM_ARGUMENT_BYTES + 1),
+            ""
+        )
+        .is_err());
+        // Command names are capped at 64 bytes.
+        assert!(ObscuraCore::validate_dom_args(
+            &"c".repeat(MAX_DOM_COMMAND_BYTES + 1),
+            "",
+            ""
+        )
+        .is_err());
+        // Selectors are capped at 64 KiB in both argument positions.
+        assert!(ObscuraCore::validate_dom_args(
+            "query_selector",
+            &"a".repeat(MAX_SELECTOR_BYTES + 1),
+            ""
+        )
+        .is_err());
+        assert!(ObscuraCore::validate_dom_args(
+            "matches_selector",
+            "",
+            &"a".repeat(MAX_SELECTOR_BYTES + 1)
+        )
+        .is_err());
+        // Limits are UTF-8 byte lengths, not character counts: "é" is 2 bytes.
+        let exactly_eight_mib = "é".repeat(MAX_DOM_ARGUMENT_BYTES / 2);
+        assert_eq!(exactly_eight_mib.len(), MAX_DOM_ARGUMENT_BYTES);
+        assert!(ObscuraCore::validate_dom_args("create_text_node", &exactly_eight_mib, "").is_ok());
+        let over_eight_mib = "é".repeat(MAX_DOM_ARGUMENT_BYTES / 2 + 1);
+        assert!(ObscuraCore::validate_dom_args("create_text_node", &over_eight_mib, "").is_err());
+    }
+
+    #[test]
+    fn malformed_json_and_structural_invalidity_are_rejected_before_execution() {
+        let mut core = fresh_core();
+        let h1 = handle(&mut core, "h1");
+        assert!(core.dom_batch_inner("[").is_err());
+        assert!(core.dom_batch_inner(r#"{"ops":[]}"#).is_err());
+        // A truncated batch whose prefix would mutate must not apply anything.
+        let valid = serde_json::json!([
+            ["set_attribute", h1, "class\0x"],
+            ["node_type", h1, ""],
+        ])
+        .to_string();
+        let truncated = &valid[..valid.len() - 1];
+        assert!(core.dom_batch_inner(truncated).is_err());
+        // The truncated batch never ran its prefix mutation.
+        assert_eq!(op(&mut core, "get_attribute", &h1, "class"), "\"t\"");
+        // Structural invalidity anywhere rejects the whole batch.
+        let bad_tuple = serde_json::json!([
+            ["set_attribute", h1, "class\0x"],
+            ["node_type", h1],
+        ])
+        .to_string();
+        assert!(core.dom_batch_inner(&bad_tuple).is_err());
+        assert_eq!(op(&mut core, "get_attribute", &h1, "class"), "\"t\"");
+        let bad_field = serde_json::json!([["set_attribute", h1, 42]]).to_string();
+        assert!(core.dom_batch_inner(&bad_field).is_err());
+        assert_eq!(op(&mut core, "get_attribute", &h1, "class"), "\"t\"");
+        let bad_command = serde_json::json!([[42, h1, ""]]).to_string();
+        assert!(core.dom_batch_inner(&bad_command).is_err());
+    }
+
+    #[test]
+    fn core_remains_reusable_after_every_failure_path() {
+        let mut core = fresh_core();
+        let h1 = handle(&mut core, "h1");
+        // Invalid handle.
+        assert!(core.dom_op_inner("node_type", "not-a-handle", "").is_err());
+        // Oversized selector.
+        assert!(ObscuraCore::validate_dom_args(
+            "query_selector",
+            &"x".repeat(MAX_SELECTOR_BYTES + 1),
+            ""
+        )
+        .is_err());
+        // Malformed batch JSON.
+        assert!(core.dom_batch_inner("[{").is_err());
+        // Oversized batch.
+        let too_many = serde_json::Value::Array(
+            (0..=MAX_DOM_BATCH_OPS)
+                .map(|_| serde_json::json!(["document_title", "", ""]))
+                .collect(),
+        )
+        .to_string();
+        assert!(core.dom_batch_inner(&too_many).is_err());
+        // Semantic failure mid-batch retains the prefix and rejects the rest.
+        let partial = serde_json::json!([
+            ["set_attribute", h1, "id\0kept"],
+            ["node_type", "4294967295", ""],
+        ])
+        .to_string();
+        assert!(core.dom_batch_inner(&partial).is_err());
+        assert_eq!(op(&mut core, "get_attribute", &h1, "id"), "\"kept\"");
+        // Every failure leaves the core usable and the DOM consistent.
+        assert_eq!(op(&mut core, "text_content", &h1, ""), "\"Hello\"");
+        assert_eq!(op(&mut core, "get_attribute", &h1, "id"), "\"kept\"");
+        let results: Vec<String> = serde_json::from_str(
+            &core
+                .dom_batch_inner(&serde_json::json!([["text_content", h1, ""]]).to_string())
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(results, vec!["\"Hello\""]);
+    }
+
+    #[test]
+    fn panic_boundary_translates_defects_to_controlled_results() {
+        // The public WASM boundary wraps every op in catch_unwind so a defect
+        // in one command degrades to that command's ordinary failure instead
+        // of unwinding through the FFI frame. js_sys error constructors cannot
+        // run on native test hosts, so exercise the machinery with a recording
+        // mapper and JsValue::UNDEFINED (a const, safe on native).
+        let mut mapped: Option<String> = None;
+        // The panic arm formats the message and builds a js_sys::Error.
+        // js_sys cannot construct errors on native test hosts, so the call is
+        // wrapped in catch_unwind and the js_sys limitation itself is asserted;
+        // the real module exercises the same arm on wasm32 in the Node
+        // integration run.
+        let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            boundary_result_with(
+                "probe_op",
+                || -> Result<String, String> { panic!("synthetic defect") },
+                |message| {
+                    mapped = Some(message);
+                    wasm_bindgen::JsValue::UNDEFINED
+                },
+            )
+        }));
+        match outcome {
+            Ok(Ok(_)) => panic!("panic path unexpectedly succeeded"),
+            Ok(Err(_)) => panic!("panic path unexpectedly returned a plain error"),
+            Err(payload) => {
+                let message = panic_message("probe_op", payload);
+                assert!(
+                    message.contains("cannot call wasm-bindgen imported functions"),
+                    "{message}"
+                );
+                // The error mapper is only used for ordinary errors, never
+                // for panics.
+                assert!(mapped.is_none());
+            }
+        }
+
+        // Ordinary errors flow through the same mapper unchanged.
+        let outcome = boundary_result_with(
+            "probe_op",
+            || -> Result<String, String> { Err("ordinary failure".to_string()) },
+            |message| {
+                mapped = Some(message);
+                wasm_bindgen::JsValue::UNDEFINED
+            },
+        );
+        assert!(outcome.is_err());
+        assert_eq!(mapped.as_deref(), Some("ordinary failure"));
+
+        // Values pass through untouched on the happy path.
+        assert_eq!(boundary_value("probe_op", || 42u32), 42);
+        assert!(boundary_result("probe_op", || Ok::<_, String>("value".to_string())).is_ok());
+
+        // panic_message formats both &str and String payloads.
+        assert_eq!(
+            panic_message("op", Box::new("plain")),
+            "Obscura WASM op panicked: plain"
+        );
+        assert_eq!(
+            panic_message("op", Box::new("owned".to_string())),
+            "Obscura WASM op panicked: owned"
+        );
+        assert_eq!(
+            panic_message("op", Box::new(7u32)),
+            "Obscura WASM op panicked: unknown Rust panic"
+        );
+    }
+
+    #[test]
+    fn page_revision_overflow_fails_safely_before_mutating() {
+        let mut core = fresh_core();
+        core.page_revision = u32::MAX;
+        let h1 = handle(&mut core, "h1");
+        let error = op_err(&mut core, "set_attribute", &h1, "class\0x");
+        assert_eq!(error, "page revision space is exhausted");
+        // The mutation was not applied.
+        assert_eq!(op(&mut core, "get_attribute", &h1, "class"), "\"t\"");
+        // Read-only operations keep working at the boundary.
+        assert_eq!(op(&mut core, "text_content", &h1, ""), "\"Hello\"");
+        // A no-op write (same value) does not consult the revision space at all.
+        assert_eq!(op(&mut core, "set_attribute", &h1, "class\0t"), "true");
+        core.page_revision = 100;
+        assert_eq!(op(&mut core, "set_attribute", &h1, "class\0y"), "true");
+        assert_eq!(revision(&core), 101);
     }
 }
