@@ -15,6 +15,7 @@ class EmbeddedRuntime {
 }
 
 module.exports = {
+  __obscuraNativeJsonText: true,
   probe(expression = "1 + 1") {
     return JSON.stringify({ ok: true, result: Function(`"use strict"; return (${expression})`)() });
   },

@@ -11,7 +11,7 @@ PROBE_V8=1
 
 usage() {
     sed -n '2,5p' "$0"
-    echo "Usage: $0 [--target <rust-target>] [--require-full] [--skip-v8-probe]"
+    echo "Usage: $0 [--target wasm32-unknown-unknown] [--require-full] [--skip-v8-probe]"
 }
 
 while [[ $# -gt 0 ]]; do
@@ -40,6 +40,11 @@ while [[ $# -gt 0 ]]; do
             ;;
     esac
 done
+
+if [[ "$TARGET" != "wasm32-unknown-unknown" ]]; then
+    echo "error: this audit only supports target 'wasm32-unknown-unknown' (got '$TARGET')" >&2
+    exit 2
+fi
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
@@ -129,6 +134,28 @@ run_native_layer_probe() {
     fi
 }
 
+is_v8_archive_network_failure() {
+    local log="$1"
+
+    grep -Eq '(librusty_v8_|static lib URL:).*wasm32' "$log" \
+        && grep -Eiq \
+            'HTTP Error (4[0-9]{2}|5[0-9]{2})|URLError|Too Many Requests|rate.?limit|Temporary failure in name resolution|Name or service not known|Could not resolve (host|proxy)|Network is unreachable|Connection (timed out|refused|reset)|timed out|TLS|SSL|certificate verify failed|proxy|Tunnel connection failed|Remote end closed connection|Bad Gateway|Service Unavailable|Gateway Timeout' \
+            "$log"
+}
+
+run_sanitized_v8_cargo() {
+    (
+        if ! unset CCACHE CLANG_BASE_PATH DENO_TRYBUILD DISABLE_CLANG DOCS_RS \
+                EXTRA_GN_ARGS GN GN_ARGS NINJA PRINT_GN_ARGS PYTHON \
+                RUSTY_V8_ARCHIVE RUSTY_V8_MIRROR RUSTY_V8_SRC_BINDING_PATH \
+                SCCACHE V8_FORCE_DEBUG V8_FROM_SOURCE; then
+            echo "error: could not sanitize the rusty_v8 build environment" >&2
+            return 1
+        fi
+        cargo "$@"
+    )
+}
+
 probe_rusty_v8_directly() {
     local metadata_log="$RUN_DIR/metadata.log"
     local manifest
@@ -150,7 +177,7 @@ probe_rusty_v8_directly() {
     fi
 
     echo "  Resolved: $(jq -r 'first(.packages[] | select(.name == "v8") | "v8 " + .version) // "unknown"' "$RUN_DIR/metadata.json")"
-    if cargo check --locked --manifest-path "$manifest" --target "$TARGET" >"$log" 2>&1; then
+    if run_sanitized_v8_cargo check --locked --manifest-path "$manifest" --target "$TARGET" >"$log" 2>&1; then
         echo "  PASS: rusty_v8 now supplies a working $TARGET build; reassess the host-V8 architecture"
         return
     fi
@@ -160,6 +187,15 @@ probe_rusty_v8_directly() {
         grep -m 4 -E 'static lib URL:|HTTP Error 404|Not Found' "$log" | sed 's/^/    /'
         echo "  BLOCKED: the current rusty_v8 release does not publish a WASM static archive."
         echo "  Its build.rs also has no wasm32 cross-compilation branch; V8_FROM_SOURCE is not a supported fallback."
+        if [[ "$REQUIRE_FULL" -eq 1 ]]; then
+            failures=$((failures + 1))
+        fi
+    elif is_v8_archive_network_failure "$log"; then
+        grep -m 8 -Ei \
+            'static lib URL:|HTTP Error|URLError|Too Many Requests|rate.?limit|name resolution|Name or service not known|Could not resolve|Network is unreachable|Connection (timed out|refused|reset)|timed out|TLS|SSL|certificate|proxy|Tunnel connection failed|Bad Gateway|Service Unavailable|Gateway Timeout' \
+            "$log" | sed 's/^/    /'
+        echo "  INCONCLUSIVE: network conditions prevented confirmation of the rusty_v8 WASM archive."
+        echo "  The portable-core gate remains valid; --require-full still treats this native-layer probe as failed."
         if [[ "$REQUIRE_FULL" -eq 1 ]]; then
             failures=$((failures + 1))
         fi
@@ -209,7 +245,7 @@ echo
 
 run_native_layer_probe "obscura-net" cargo check --locked --target "$TARGET" -p obscura-net
 run_native_layer_probe "obscura-render paint" cargo check --locked --target "$TARGET" -p obscura-render --features paint
-run_native_layer_probe "obscura-js (deno_core + networking + V8)" cargo check --locked --target "$TARGET" -p obscura-js
+run_native_layer_probe "obscura-js (deno_core + networking + V8)" run_sanitized_v8_cargo check --locked --target "$TARGET" -p obscura-js
 echo
 
 if [[ "$PROBE_V8" -eq 1 ]]; then

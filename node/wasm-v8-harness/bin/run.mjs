@@ -105,22 +105,26 @@ function reportReplacer() {
   };
 }
 
+function requireObscuraCapability(inspect) {
+  const hasObscuraCapability = Boolean(
+    inspect.capabilities.probe ||
+      inspect.capabilities.moduleEvaluate ||
+      inspect.capabilities.runtimeFactory ||
+      inspect.capabilities.obscuraCore,
+  );
+  if (!hasObscuraCapability) {
+    throw new Error(
+      "Selected module exposes no executable Obscura capability; pass a wasm-bindgen wrapper or native addon",
+    );
+  }
+}
+
 async function smoke(modulePath, options) {
   const startedAt = performance.now();
   const worker = await WasmV8Worker.launch(modulePath, { readyTimeoutMs: options.timeoutMs });
   try {
     const inspect = await worker.inspect();
-    const hasObscuraCapability = Boolean(
-      inspect.capabilities.probe ||
-        inspect.capabilities.moduleEvaluate ||
-        inspect.capabilities.runtimeFactory ||
-        inspect.capabilities.obscuraCore,
-    );
-    if (!hasObscuraCapability) {
-      throw new Error(
-        "Selected module exposes no executable Obscura capability; pass a wasm-bindgen wrapper or native addon",
-      );
-    }
+    requireObscuraCapability(inspect);
     const results = {
       startupMs: performance.now() - startedAt,
       inspect,
@@ -161,6 +165,7 @@ async function smoke(modulePath, options) {
 async function bridge(modulePath, options) {
   const worker = await WasmV8Worker.launch(modulePath, { readyTimeoutMs: options.timeoutMs });
   try {
+    requireObscuraCapability(await worker.inspect());
     const result = await worker.bridgeEvaluate(options.bridgeSource, {
       html: options.html,
       timeoutMs: Math.min(options.timeoutMs, 5_000),
@@ -176,6 +181,7 @@ async function stress(modulePath, options) {
   const worker = await WasmV8Worker.launch(modulePath, { readyTimeoutMs: options.timeoutMs });
   try {
     const inspect = await worker.inspect();
+    requireObscuraCapability(inspect);
     const results = {
       hostV8: await worker.request(
         "hostStress",
@@ -207,6 +213,12 @@ async function stress(modulePath, options) {
 
 async function termination(modulePath, options) {
   const worker = await WasmV8Worker.launch(modulePath, { readyTimeoutMs: options.timeoutMs });
+  try {
+    requireObscuraCapability(await worker.inspect());
+  } catch (error) {
+    await worker.terminate();
+    throw error;
+  }
   const startedAt = performance.now();
   const inFlight = worker
     .hostEvaluate("while (true) {}", {

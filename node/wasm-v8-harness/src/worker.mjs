@@ -350,7 +350,7 @@ function moduleResult(value) {
   // The migration's Node-API fallback deliberately crosses the isolate
   // boundary as JSON text. Ordinary JS/WASM APIs return structured values and
   // must not have legitimate strings such as "42" silently retyped.
-  if (metadata?.kind === "native-addon" || typeof target?.EmbeddedRuntime === "function") {
+  if (metadata?.kind === "native-addon" || target?.__obscuraNativeJsonText === true) {
     return decodeJsonText(value);
   }
   return value;
@@ -922,7 +922,12 @@ async function hostStress({ iterations = 10_000, source = "1 + 1", timeoutMs = 1
   };
 }
 
-async function bridgeStress({ iterations = 10_000, html, source, timeoutMs = 1_000 } = {}) {
+async function bridgeStress({
+  iterations = 10_000,
+  html,
+  source = "document.querySelector('h1').textContent",
+  timeoutMs = 1_000,
+} = {}) {
   if (!Number.isSafeInteger(iterations) || iterations < 1) {
     throw new RangeError("iterations must be a positive safe integer");
   }

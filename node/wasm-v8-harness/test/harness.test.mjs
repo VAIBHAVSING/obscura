@@ -107,6 +107,24 @@ test("recognizes the native EmbeddedRuntime API and decodes its JSON text", asyn
   }
 });
 
+test("does not infer the native JSON-text ABI from an EmbeddedRuntime class name", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "obscura-structured-runtime-"));
+  const modulePath = join(directory, "structured.cjs");
+  await writeFile(
+    modulePath,
+    `module.exports = { EmbeddedRuntime: class EmbeddedRuntime {
+      evaluate() { return "42"; }
+      close() {}
+    } };`,
+  );
+  const worker = await WasmV8Worker.launch(modulePath);
+  try {
+    assert.equal(await worker.moduleEvaluate("ignored"), "42");
+  } finally {
+    await worker.close();
+  }
+});
+
 test(
   "initializes the real native addon on the main thread and reuses runtimes after V8 timeouts",
   { skip: !realNativeAddon },
@@ -294,6 +312,7 @@ test("stress executes the ObscuraCore bridge instead of measuring only host V8",
     assert.equal(result.iterations, 25);
     assert.equal(result.lastResult, "bridge stress");
     assert.ok(result.operationsPerSecond > 0);
+    assert.equal((await worker.bridgeStress(1)).lastResult, "bridge stress");
   } finally {
     await worker.close();
   }
@@ -744,7 +763,7 @@ test("inspects imported raw WASM and directs callers to its JavaScript wrapper",
   }
 });
 
-test("CLI rejects inspection-only raw WASM as a successful smoke run", async () => {
+test("CLI rejects inspection-only raw WASM for artifact-facing modes", async () => {
   const directory = await mkdtemp(join(tmpdir(), "obscura-wasm-harness-cli-import-"));
   const wasmPath = join(directory, "imported.wasm");
   const bytes = Buffer.from(
@@ -753,17 +772,30 @@ test("CLI rejects inspection-only raw WASM as a successful smoke run", async () 
   );
   await writeFile(wasmPath, bytes);
 
-  await assert.rejects(
-    execFileAsync(
-      process.execPath,
-      [harnessCli, "--module", wasmPath, "--mode", "smoke", "--json"],
-      { timeout: 10_000 },
-    ),
-    (error) => {
-      assert.match(error.stderr, /no executable Obscura capability/);
-      return true;
-    },
-  );
+  for (const mode of ["smoke", "bridge", "stress", "terminate"]) {
+    await assert.rejects(
+      execFileAsync(
+        process.execPath,
+        [
+          harnessCli,
+          "--module",
+          wasmPath,
+          "--mode",
+          mode,
+          "--iterations",
+          "1",
+          "--timeout-ms",
+          "1000",
+          "--json",
+        ],
+        { timeout: 10_000 },
+      ),
+      (error) => {
+        assert.match(error.stderr, /no executable Obscura capability/);
+        return true;
+      },
+    );
+  }
 });
 
 test("CLI emits valid JSON for circular evaluation results", async () => {
