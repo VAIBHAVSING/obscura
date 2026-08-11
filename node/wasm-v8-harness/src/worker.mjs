@@ -922,6 +922,31 @@ async function hostStress({ iterations = 10_000, source = "1 + 1", timeoutMs = 1
   };
 }
 
+async function bridgeStress({ iterations = 10_000, html, source, timeoutMs = 1_000 } = {}) {
+  if (!Number.isSafeInteger(iterations) || iterations < 1) {
+    throw new RangeError("iterations must be a positive safe integer");
+  }
+  if (html !== undefined) await replaceBridgeCore(html);
+  requireBridgeCore();
+  installDocumentFacade();
+
+  const script = boundedEvaluateScript(source, "obscura-bridge-stress.js");
+  const context = getHostContext();
+  timeoutMs = vmTimeout(timeoutMs);
+  const startedAt = performance.now();
+  let lastResult;
+  for (let index = 0; index < iterations; index += 1) {
+    lastResult = runBoundedEvaluate(script, context, timeoutMs, "bridgeStress evaluation");
+  }
+  const elapsedMs = performance.now() - startedAt;
+  return {
+    iterations,
+    elapsedMs,
+    operationsPerSecond: iterations / (elapsedMs / 1_000),
+    lastResult,
+  };
+}
+
 async function shutdown() {
   shuttingDown = true;
   const errors = [];
@@ -975,6 +1000,8 @@ async function dispatch(operation, payload) {
       return await createDrop(payload);
     case "hostStress":
       return hostStress(payload);
+    case "bridgeStress":
+      return await bridgeStress(payload);
     case "shutdown":
       return await shutdown();
     default:

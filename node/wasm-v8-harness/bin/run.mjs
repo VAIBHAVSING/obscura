@@ -74,7 +74,6 @@ async function inferModulePath(input) {
   const candidates = [
     "crates/obscura-wasm/pkg/obscura_wasm.js",
     "crates/obscura-wasm/pkg/obscura_wasm.cjs",
-    "target/wasm32-unknown-unknown/release/obscura_wasm.wasm",
     "target/release/obscura_node.node",
     "target/debug/obscura_node.node",
   ];
@@ -111,6 +110,17 @@ async function smoke(modulePath, options) {
   const worker = await WasmV8Worker.launch(modulePath, { readyTimeoutMs: options.timeoutMs });
   try {
     const inspect = await worker.inspect();
+    const hasObscuraCapability = Boolean(
+      inspect.capabilities.probe ||
+        inspect.capabilities.moduleEvaluate ||
+        inspect.capabilities.runtimeFactory ||
+        inspect.capabilities.obscuraCore,
+    );
+    if (!hasObscuraCapability) {
+      throw new Error(
+        "Selected module exposes no executable Obscura capability; pass a wasm-bindgen wrapper or native addon",
+      );
+    }
     const results = {
       startupMs: performance.now() - startedAt,
       inspect,
@@ -165,7 +175,8 @@ async function bridge(modulePath, options) {
 async function stress(modulePath, options) {
   const worker = await WasmV8Worker.launch(modulePath, { readyTimeoutMs: options.timeoutMs });
   try {
-    return {
+    const inspect = await worker.inspect();
+    const results = {
       hostV8: await worker.request(
         "hostStress",
         { iterations: options.iterations, source: options.source, timeoutMs: Math.min(options.timeoutMs, 5_000) },
@@ -177,6 +188,18 @@ async function stress(modulePath, options) {
         requestTimeoutMs: options.timeoutMs,
       }),
     };
+    results.bridge = inspect.capabilities.obscuraCore
+      ? await worker.bridgeStress(options.iterations, {
+          html: options.html,
+          source: options.bridgeSource,
+          timeoutMs: Math.min(options.timeoutMs, 5_000),
+          requestTimeoutMs: options.timeoutMs,
+        })
+      : { skipped: true, reason: "module exposes no ObscuraCore constructor", iterations: 0 };
+    if (results.createDrop.skipped && results.bridge.skipped) {
+      throw new Error("Selected module exposes no Obscura-backed stress capability");
+    }
+    return results;
   } finally {
     await worker.close();
   }

@@ -27,6 +27,11 @@ const realWasmModule = process.env.OBSCURA_REAL_WASM_MODULE;
 const realNativeAddon = process.env.OBSCURA_REAL_NATIVE_ADDON;
 const execFileAsync = promisify(execFile);
 
+if (process.env.OBSCURA_REQUIRE_REAL_ARTIFACTS === "1") {
+  assert.ok(realWasmModule, "OBSCURA_REAL_WASM_MODULE is required by the artifact test gate");
+  assert.ok(realNativeAddon, "OBSCURA_REAL_NATIVE_ADDON is required by the artifact test gate");
+}
+
 test("loads a wasm-bindgen-shaped wrapper in a persistent worker", async () => {
   const worker = await WasmV8Worker.launch(mockModule);
   try {
@@ -274,6 +279,21 @@ test("bridges ObscuraCore queries into the persistent host V8 document facade", 
     assert.equal(released.disposed, 2);
     assert.equal(await worker.hostEvaluate("typeof document"), "undefined");
     await assert.rejects(worker.bridgeEvaluate("document.documentElement.outerHTML"), /No ObscuraCore is loaded/);
+  } finally {
+    await worker.close();
+  }
+});
+
+test("stress executes the ObscuraCore bridge instead of measuring only host V8", async () => {
+  const worker = await WasmV8Worker.launch(mockObscuraCore);
+  try {
+    const result = await worker.bridgeStress(25, {
+      html: "<html><body><h1>bridge stress</h1></body></html>",
+      source: "document.querySelector('h1').textContent",
+    });
+    assert.equal(result.iterations, 25);
+    assert.equal(result.lastResult, "bridge stress");
+    assert.ok(result.operationsPerSecond > 0);
   } finally {
     await worker.close();
   }
@@ -722,6 +742,28 @@ test("inspects imported raw WASM and directs callers to its JavaScript wrapper",
   } finally {
     await worker.close();
   }
+});
+
+test("CLI rejects inspection-only raw WASM as a successful smoke run", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "obscura-wasm-harness-cli-import-"));
+  const wasmPath = join(directory, "imported.wasm");
+  const bytes = Buffer.from(
+    "0061736d010000000105016000017f02090103656e7601610000030201000708010463616c6c00010a0601040010000b",
+    "hex",
+  );
+  await writeFile(wasmPath, bytes);
+
+  await assert.rejects(
+    execFileAsync(
+      process.execPath,
+      [harnessCli, "--module", wasmPath, "--mode", "smoke", "--json"],
+      { timeout: 10_000 },
+    ),
+    (error) => {
+      assert.match(error.stderr, /no executable Obscura capability/);
+      return true;
+    },
+  );
 });
 
 test("CLI emits valid JSON for circular evaluation results", async () => {

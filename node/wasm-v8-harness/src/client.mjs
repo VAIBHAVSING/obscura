@@ -194,6 +194,26 @@ export class WasmV8Worker {
     return this.request("bridgeStatus");
   }
 
+  bridgeStress(iterations, options = {}) {
+    try {
+      if (options.html !== undefined) {
+        requireBoundedString(options.html, MAX_HTML_INPUT_BYTES, "HTML input");
+      }
+    } catch (error) {
+      return Promise.reject(error);
+    }
+    return this.request(
+      "bridgeStress",
+      {
+        iterations,
+        html: options.html,
+        source: options.source,
+        timeoutMs: options.timeoutMs,
+      },
+      options.requestTimeoutMs,
+    );
+  }
+
   releaseBridge() {
     return this.request("bridgeRelease");
   }

@@ -11,7 +11,8 @@
   "scripts": {
     "smoke": "node ./bin/run.mjs --mode smoke",
     "stress": "node ./bin/run.mjs --mode stress",
-    "test": "node --test ./test/*.test.mjs"
+    "test": "node --test ./test/*.test.mjs",
+    "test:artifacts": "OBSCURA_REQUIRE_REAL_ARTIFACTS=1 node --test ./test/*.test.mjs"
   },
   "engines": {
     "node": ">=20"
