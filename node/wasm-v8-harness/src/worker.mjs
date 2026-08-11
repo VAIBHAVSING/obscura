@@ -3,7 +3,10 @@ import { readFile } from "node:fs/promises";
 import { fileURLToPath } from "node:url";
 import { parentPort, workerData, threadId } from "node:worker_threads";
 
-import { compileBootstrapRuntime } from "./bootstrap-runtime.mjs";
+import {
+  BOOTSTRAP_PLATFORM_OP_COMMANDS,
+  compileBootstrapRuntime,
+} from "./bootstrap-runtime.mjs";
 import { loadModule } from "./module-loader.mjs";
 import {
   MAX_DOCUMENT_METADATA_BYTES,
@@ -12,6 +15,13 @@ import {
   MAX_DOM_BATCH_OPERATIONS,
   MAX_DOM_COMMAND_BYTES,
   MAX_HTML_INPUT_BYTES,
+  MAX_PLATFORM_COMMAND_BYTES,
+  MAX_PLATFORM_BINARY_BYTES,
+  MAX_PLATFORM_KDF_OUTPUT_BYTES,
+  MAX_PLATFORM_PBKDF2_ITERATIONS,
+  MAX_PLATFORM_RANDOM_BYTES,
+  MAX_PLATFORM_REQUEST_BYTES,
+  MAX_PLATFORM_RESPONSE_BYTES,
   MAX_RETURNED_STRING_BYTES,
   MAX_SELECTOR_BYTES,
   requireBoundedString,
@@ -44,10 +54,34 @@ const DOM_BATCH_NAMES = ["dom_batch", "domBatch"];
 const PAGE_REVISION_NAMES = ["page_revision", "pageRevision"];
 const DOCUMENT_HANDLE_NAMES = ["document_handle", "documentHandle"];
 const SET_DOCUMENT_METADATA_NAMES = ["set_document_metadata", "setDocumentMetadata"];
+const PLATFORM_OP_ABI_VERSION_NAME = "platformOpAbiVersion";
+const PLATFORM_OP_NAME = "platformOp";
 const REQUIRED_CORE_ABI_VERSION = 1;
 const REQUIRED_DOM_OP_ABI_VERSION = 1;
 const REQUIRED_DOM_BATCH_ABI_VERSION = 1;
 const REQUIRED_DOCUMENT_METADATA_ABI_VERSION = 1;
+const REQUIRED_PLATFORM_OP_ABI_VERSION = 1;
+const PLATFORM_OP_COMMAND_SET = new Set(BOOTSTRAP_PLATFORM_OP_COMMANDS);
+const PLATFORM_BYTE_FIELDS = Object.freeze({
+  op_text_decode: ["bytes"],
+  op_subtle_digest: ["data"],
+  op_subtle_hmac: ["key", "data"],
+  op_subtle_aes_gcm: ["key", "iv", "aad", "data"],
+  op_subtle_aes_cbc: ["key", "iv", "data"],
+  op_subtle_aes_ctr: ["key", "counter", "data"],
+  op_subtle_pbkdf2: ["password", "salt"],
+  op_subtle_hkdf: ["ikm", "salt", "info"],
+});
+const PLATFORM_BYTE_RESULT_COMMANDS = new Set([
+  "op_random_bytes",
+  "op_subtle_digest",
+  "op_subtle_hmac",
+  "op_subtle_aes_gcm",
+  "op_subtle_aes_cbc",
+  "op_subtle_aes_ctr",
+  "op_subtle_pbkdf2",
+  "op_subtle_hkdf",
+]);
 const MAX_VM_TIMEOUT_MS = 4_294_967_295;
 const QUERY_BINDING = "__obscuraHostQueryElement__";
 const DOCUMENT_HTML_BINDING = "__obscuraHostDocumentHtml__";
@@ -330,6 +364,7 @@ let bridgeDocumentHandle = null;
 let bridgePageRevision = null;
 let compiledBootstrapRuntime;
 let bridgeCapabilityProbePromise;
+let portablePlatformOp;
 let shuttingDown = false;
 
 function propertyNames(value) {
@@ -565,6 +600,8 @@ function describeApi() {
       runtimeFactory: factory?.name ?? constructor?.name ?? null,
       moduleEvaluate: evaluate?.name ?? null,
       obscuraCore: member(target, ["ObscuraCore"])?.name ?? null,
+      platformOpAbiVersion: member(target, [PLATFORM_OP_ABI_VERSION_NAME])?.name ?? null,
+      platformOp: member(target, [PLATFORM_OP_NAME])?.name ?? null,
     },
   };
 }
@@ -708,6 +745,123 @@ function bridgeAbiError(message) {
   const error = new Error(message);
   error.code = "ERR_OBSCURA_WASM_DOM_ABI";
   return error;
+}
+
+function platformAbiError(message) {
+  const error = new Error(message);
+  error.code = "ERR_OBSCURA_WASM_PLATFORM_ABI";
+  return error;
+}
+
+function requirePortablePlatformCompatibility() {
+  if (portablePlatformOp) return portablePlatformOp;
+  const version = member(target, [PLATFORM_OP_ABI_VERSION_NAME]);
+  if (!version) {
+    throw platformAbiError(
+      `Portable bootstrap requires ${PLATFORM_OP_ABI_VERSION_NAME}() ABI version ${REQUIRED_PLATFORM_OP_ABI_VERSION}`,
+    );
+  }
+  const actual = syncCall(version);
+  if (!Number.isSafeInteger(actual) || actual !== REQUIRED_PLATFORM_OP_ABI_VERSION) {
+    throw platformAbiError(
+      `Portable bootstrap platform_op requires ABI version ${REQUIRED_PLATFORM_OP_ABI_VERSION}, but the module exposes ${String(actual)}`,
+    );
+  }
+  const operation = member(target, [PLATFORM_OP_NAME]);
+  if (!operation) {
+    throw platformAbiError(`Portable bootstrap requires a synchronous ${PLATFORM_OP_NAME}() export`);
+  }
+  portablePlatformOp = operation;
+  return operation;
+}
+
+function decodedBase64Length(value, label) {
+  if (typeof value !== "string" || value.length % 4 !== 0) {
+    throw new TypeError(`${label} must be standard base64`);
+  }
+  const padding = value.endsWith("==") ? 2 : (value.endsWith("=") ? 1 : 0);
+  const bodyLength = value.length - padding;
+  for (let index = 0; index < bodyLength; index++) {
+    const code = value.charCodeAt(index);
+    const valid = (code >= 0x41 && code <= 0x5a) || (code >= 0x61 && code <= 0x7a) ||
+      (code >= 0x30 && code <= 0x39) || code === 0x2b || code === 0x2f;
+    if (!valid) throw new TypeError(`${label} must be standard base64`);
+  }
+  for (let index = bodyLength; index < value.length; index++) {
+    if (value.charCodeAt(index) !== 0x3d) throw new TypeError(`${label} must be standard base64`);
+  }
+  if ((padding === 1 && bodyLength % 4 !== 3) || (padding === 2 && bodyLength % 4 !== 2)) {
+    throw new TypeError(`${label} must be standard base64`);
+  }
+  return (value.length / 4) * 3 - padding;
+}
+
+function validatePlatformRequest(command, requestJson) {
+  const byteFields = PLATFORM_BYTE_FIELDS[command] ?? [];
+  const needsNumericValidation = command === "op_random_bytes" ||
+    command === "op_subtle_pbkdf2" || command === "op_subtle_hkdf";
+  // URL/domain/label operations are latency-sensitive and contain no binary
+  // allocation controls. Their exact schema is validated once by WASM.
+  if (byteFields.length === 0 && !needsNumericValidation) return;
+  let request;
+  try {
+    request = JSON.parse(requestJson);
+  } catch {
+    throw new TypeError("platform request must be valid JSON");
+  }
+  if (request === null || typeof request !== "object" || Array.isArray(request)) {
+    throw new TypeError("platform request must be an object");
+  }
+  let aggregateBinaryBytes = 0;
+  for (const field of byteFields) {
+    aggregateBinaryBytes += decodedBase64Length(request[field], `platform request ${field}`);
+    if (aggregateBinaryBytes > MAX_PLATFORM_BINARY_BYTES) {
+      throw new RangeError(
+        `platform request binary payload exceeds the ${MAX_PLATFORM_BINARY_BYTES}-byte ABI limit`,
+      );
+    }
+  }
+  if (command === "op_random_bytes") {
+    if (!Number.isSafeInteger(request.length) || request.length < 0 || request.length > MAX_PLATFORM_RANDOM_BYTES) {
+      throw new RangeError(
+        `platform random length must be an integer between 0 and ${MAX_PLATFORM_RANDOM_BYTES} bytes`,
+      );
+    }
+  }
+  if (command === "op_subtle_pbkdf2") {
+    if (!Number.isSafeInteger(request.iterations) ||
+        request.iterations < 1 || request.iterations > MAX_PLATFORM_PBKDF2_ITERATIONS) {
+      throw new RangeError(
+        `platform PBKDF2 iterations must be an integer between 1 and ${MAX_PLATFORM_PBKDF2_ITERATIONS}`,
+      );
+    }
+  }
+  if (command === "op_subtle_pbkdf2" || command === "op_subtle_hkdf") {
+    if (!Number.isSafeInteger(request.length) ||
+        request.length < 0 || request.length > MAX_PLATFORM_KDF_OUTPUT_BYTES) {
+      throw new RangeError(
+        `platform KDF output must be an integer between 0 and ${MAX_PLATFORM_KDF_OUTPUT_BYTES} bytes`,
+      );
+    }
+  }
+}
+
+function platformOperation(command, requestJson) {
+  requireBoundedString(command, MAX_PLATFORM_COMMAND_BYTES, "platform command");
+  if (!PLATFORM_OP_COMMAND_SET.has(command)) {
+    throw new TypeError(`Unsupported portable platform command ${JSON.stringify(command)}`);
+  }
+  requireBoundedString(requestJson, MAX_PLATFORM_REQUEST_BYTES, "platform request");
+  validatePlatformRequest(command, requestJson);
+  const value = syncCall(requirePortablePlatformCompatibility(), command, requestJson);
+  requireBoundedString(value, MAX_PLATFORM_RESPONSE_BYTES, "platform response");
+  if (PLATFORM_BYTE_RESULT_COMMANDS.has(command) &&
+      decodedBase64Length(value, "platform response") > MAX_PLATFORM_BINARY_BYTES) {
+    throw new RangeError(
+      `platform response binary payload exceeds the ${MAX_PLATFORM_BINARY_BYTES}-byte ABI limit`,
+    );
+  }
+  return value;
 }
 
 async function getBridgeCapabilityProbe() {
@@ -1215,6 +1369,9 @@ async function installBootstrapRealm(timeoutMs = 5_000) {
   requireBridgeCore();
   statefulBridgeApi();
   if (bridgeRealmKind === "bootstrap") return getHostContext();
+  // Reject an absent or incompatible portable platform contract before
+  // discarding an existing host/legacy realm or installing any page globals.
+  requirePortablePlatformCompatibility();
 
   // Bootstrap defines the browser global surface and therefore owns a fresh
   // realm. Discard an uninitialized host/legacy context instead of merging
@@ -1230,6 +1387,7 @@ async function installBootstrapRealm(timeoutMs = 5_000) {
       timeoutMs: vmTimeout(timeoutMs, 5_000),
       opDom: (command, arg1, arg2) =>
         domOperation(command, arg1, arg2, generation, documentHandle),
+      opPlatform: platformOperation,
     });
     bridgeRealmKind = "bootstrap";
     return context;
@@ -1247,6 +1405,9 @@ async function bootstrapEvaluate({
   bootstrapTimeoutMs = 5_000,
   documentMetadata,
 } = {}) {
+  // Capability negotiation is independent of page state. Do it before a
+  // requested replacement can dispose the current core or its host realm.
+  requirePortablePlatformCompatibility();
   if (html !== undefined) await replaceBridgeCore(html, documentMetadata);
   else if (documentMetadata !== undefined) await applyDocumentMetadata(requireBridgeCore(), documentMetadata);
   await installBootstrapRealm(bootstrapTimeoutMs);

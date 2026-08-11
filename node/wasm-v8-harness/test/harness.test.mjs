@@ -13,6 +13,12 @@ import {
   MAX_DOCUMENT_METADATA_BYTES,
   MAX_DOM_BATCH_OPERATIONS,
   MAX_HTML_INPUT_BYTES,
+  MAX_PLATFORM_BINARY_BYTES,
+  MAX_PLATFORM_KDF_OUTPUT_BYTES,
+  MAX_PLATFORM_PBKDF2_ITERATIONS,
+  MAX_PLATFORM_RANDOM_BYTES,
+  MAX_PLATFORM_REQUEST_BYTES,
+  MAX_PLATFORM_RESPONSE_BYTES,
   MAX_SELECTOR_BYTES,
 } from "../src/limits.mjs";
 
@@ -543,6 +549,54 @@ test("keeps the current page when a replacement exposes an invalid document iden
   }
 });
 
+test("negotiates the portable platform ABI before replacing an existing host realm", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "obscura-platform-abi-"));
+  const variants = [
+    {
+      name: "missing-version",
+      override: "delete module.exports.platformOpAbiVersion;",
+      message: /requires platformOpAbiVersion\(\) ABI version 1/,
+    },
+    {
+      name: "mismatched-version",
+      override: "module.exports.platformOpAbiVersion = () => 2;",
+      message: /platform_op requires ABI version 1, but the module exposes 2/,
+    },
+    {
+      name: "missing-operation",
+      override: "delete module.exports.platformOp;",
+      message: /requires a synchronous platformOp\(\) export/,
+    },
+  ];
+
+  for (const variant of variants) {
+    const modulePath = join(directory, `${variant.name}.cjs`);
+    await writeFile(
+      modulePath,
+      `module.exports = { ...require(${JSON.stringify(mockStatefulCore)}) };\n${variant.override}\n`,
+    );
+    const worker = await WasmV8Worker.launch(modulePath);
+    try {
+      await worker.bridgeDomBatch([], { html: "<html><body></body></html>" });
+      assert.equal(await worker.hostEvaluate("globalThis.__hostRealmKept = 42"), 42);
+      await assert.rejects(
+        worker.bootstrapEvaluate("1", { html: "<html><body><h1>must not replace</h1></body></html>" }),
+        { code: "ERR_OBSCURA_WASM_PLATFORM_ABI", message: variant.message },
+      );
+      assert.deepEqual(
+        await worker.hostEvaluate("[__hostRealmKept, typeof Deno, typeof document]"),
+        [42, "undefined", "undefined"],
+      );
+      const status = await worker.bridgeStatus();
+      assert.equal(status.realm, null);
+      assert.equal(status.generation, 1);
+      assert.equal(status.disposed, 0);
+    } finally {
+      await worker.close();
+    }
+  }
+});
+
 test("runs the production bootstrap against the stateful op_dom bridge", async () => {
   const worker = await WasmV8Worker.launch(mockStatefulCore);
   try {
@@ -619,6 +673,270 @@ test("runs the production bootstrap against the stateful op_dom bridge", async (
     assert.equal(status.realm, "bootstrap");
   } finally {
     await worker.close();
+  }
+});
+
+test("portable bootstrap platform ops preserve URL, encoding, random, and crypto behavior", async () => {
+  const worker = await WasmV8Worker.launch(mockStatefulCore);
+  try {
+    const platformCommands = [
+      "op_document_domain_candidate", "op_encoding_for_label", "op_random_bytes",
+      "op_subtle_aes_cbc", "op_subtle_aes_ctr", "op_subtle_aes_gcm",
+      "op_subtle_digest", "op_subtle_hkdf", "op_subtle_hmac", "op_subtle_pbkdf2",
+      "op_text_decode", "op_url_encode_query", "op_url_parse", "op_url_resolve",
+      "op_url_set",
+    ];
+    const result = await worker.bootstrapEvaluate(
+      `(() => {
+        const hex = (value) => Array.from(value, (byte) =>
+          byte.toString(16).padStart(2, "0")).join("");
+        const captureName = (callback) => {
+          try { callback(); return null; } catch (error) { return error.name; }
+        };
+
+        const url = new URL("../x/../c?x=1#h", "https://user:pw@mañana.test:443/a/b/");
+        const parsed = [url.href, url.hostname, url.port, URL.canParse("/x", "https://e.test/")];
+        url.username = "next";
+        url.password = "secret";
+        url.port = "8443";
+        url.pathname = "/z z";
+        url.search = "?a=b c";
+        url.searchParams.append("e", "€");
+        url.hash = "frag ment";
+
+        const initialDomain = document.domain;
+        document.domain = "ASSETS.EXAMPLE.CO.UK";
+        document.domain = "example.co.uk";
+        const publicSuffixError = captureName(() => { document.domain = "co.uk"; });
+
+        const encoderBytes = Array.from(new TextEncoder().encode("A€"));
+        const decoder = new TextDecoder("windows-1252");
+        const decoded = decoder.decode(new Uint8Array([0x80]));
+        const fatalError = captureName(() =>
+          new TextDecoder("utf-8", { fatal: true }).decode(new Uint8Array([0xff])));
+        const bom = new Uint8Array([0xef, 0xbb, 0xbf, 0x41]);
+
+        const random = new Uint8Array(32);
+        const sameRandomObject = crypto.getRandomValues(random) === random;
+        const secondRandom = crypto.getRandomValues(new Uint8Array(32));
+        const uuid = crypto.randomUUID();
+
+        const text = new TextEncoder();
+        const digest = Deno.core.ops.op_subtle_digest("SHA-256", text.encode("abc"));
+        const hmac = Deno.core.ops.op_subtle_hmac(
+          "SHA-256", text.encode("key"), text.encode("The quick brown fox jumps over the lazy dog"));
+        const key = new Uint8Array(16).map((_, index) => index);
+        const iv = new Uint8Array(16).map((_, index) => 15 - index);
+        const nonce = iv.subarray(0, 12);
+        const plaintext = text.encode("portable crypto");
+        const cbc = Deno.core.ops.op_subtle_aes_cbc(true, key, iv, plaintext);
+        const cbcPlain = Deno.core.ops.op_subtle_aes_cbc(false, key, iv, cbc);
+        const ctr = Deno.core.ops.op_subtle_aes_ctr(key, iv, 128, plaintext);
+        const ctrPlain = Deno.core.ops.op_subtle_aes_ctr(key, iv, 128, ctr);
+        const gcm = Deno.core.ops.op_subtle_aes_gcm(true, key, nonce, new Uint8Array([1, 2]), plaintext);
+        const gcmPlain = Deno.core.ops.op_subtle_aes_gcm(false, key, nonce, new Uint8Array([1, 2]), gcm);
+        const pbkdf2 = Deno.core.ops.op_subtle_pbkdf2(
+          "SHA-256", text.encode("password"), text.encode("salt"), 1, 32);
+        const hkdf = Deno.core.ops.op_subtle_hkdf(
+          "SHA-256", new Uint8Array(22).fill(0x0b),
+          new Uint8Array([0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12]),
+          new Uint8Array([0xf0, 0xf1, 0xf2, 0xf3, 0xf4, 0xf5, 0xf6, 0xf7, 0xf8, 0xf9]), 42);
+
+        const opConstructorsStayInRealm = ${JSON.stringify(platformCommands)}.every((name) =>
+          Deno.core.ops[name].constructor("return typeof process")() === "undefined");
+        const returnedBytesStayInRealm = digest instanceof Uint8Array &&
+          digest.constructor.constructor("return typeof process")() === "undefined";
+
+        return {
+          parsed,
+          mutatedUrl: url.href,
+          anchorHref: document.querySelector("a").href,
+          domains: [initialDomain, document.domain, publicSuffixError],
+          params: new URLSearchParams("x=a+b&bad=%zz&u=€").toString(),
+          encoding: [encoderBytes, decoder.encoding, decoded, fatalError,
+            new TextDecoder("utf-8").decode(bom),
+            new TextDecoder("utf-8", { ignoreBOM: true }).decode(bom)],
+          random: [sameRandomObject, random.length, hex(random) !== hex(secondRandom),
+            /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/.test(uuid)],
+          digest: hex(digest),
+          hmac: hex(hmac),
+          aes: [hex(cbcPlain), hex(ctrPlain), hex(gcmPlain)],
+          pbkdf2: hex(pbkdf2),
+          hkdf: hex(hkdf),
+          hiddenBindings: [typeof globalThis.__obscuraHostDomOpBridge__,
+            typeof globalThis.__obscuraHostPlatformOpBridge__],
+          opConstructorsStayInRealm,
+          returnedBytesStayInRealm,
+        };
+      })()`,
+      {
+        html: "<html><body><a href='../asset?q=1'>asset</a></body></html>",
+        bootstrapTimeoutMs: 10_000,
+        requestTimeoutMs: 20_000,
+        documentMetadata: {
+          url: "https://assets.example.co.uk/base/page",
+          encoding: "UTF-8",
+        },
+      },
+    );
+
+    assert.deepEqual(result, {
+      parsed: [
+        "https://user:pw@xn--maana-pta.test/a/c?x=1#h",
+        "xn--maana-pta.test",
+        "",
+        true,
+      ],
+      mutatedUrl: "https://next:secret@xn--maana-pta.test:8443/z%20z?a=b+c&e=%E2%82%AC#frag%20ment",
+      anchorHref: "https://assets.example.co.uk/asset?q=1",
+      domains: ["assets.example.co.uk", "example.co.uk", "SecurityError"],
+      params: "x=a+b&bad=%25zz&u=%E2%82%AC",
+      encoding: [[65, 226, 130, 172], "windows-1252", "€", "TypeError", "A", "﻿A"],
+      random: [true, 32, true, true],
+      digest: "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad",
+      hmac: "f7bc83f430538424b13298e6aa6fb143ef4d59a14946175997479dbc2d1a3cd8",
+      aes: Array(3).fill("706f727461626c652063727970746f"),
+      pbkdf2: "120fb6cffcf8b32c43e7225256c4f837a86548c92ccc35480805987cb70be17b",
+      hkdf: "3cb25f25faacd57a90434f64d0362f2a2d2d0a90cf1a5a4c5db02d56ecc4c5bf34007208d5b887185865",
+      hiddenBindings: ["undefined", "undefined"],
+      opConstructorsStayInRealm: true,
+      returnedBytesStayInRealm: true,
+    });
+
+    assert.equal(
+      await worker.bootstrapEvaluate(`(() => {
+        const endsWith = String.prototype.endsWith;
+        const indexOf = String.prototype.indexOf;
+        const charCodeAt = String.prototype.charCodeAt;
+        const test = RegExp.prototype.test;
+        try {
+          String.prototype.endsWith = () => { throw new Error("poisoned endsWith"); };
+          String.prototype.indexOf = () => { throw new Error("poisoned indexOf"); };
+          String.prototype.charCodeAt = () => { throw new Error("poisoned charCodeAt"); };
+          RegExp.prototype.test = () => { throw new Error("poisoned test"); };
+          return Deno.core.ops.op_random_bytes(4).length;
+        } finally {
+          String.prototype.endsWith = endsWith;
+          String.prototype.indexOf = indexOf;
+          String.prototype.charCodeAt = charCodeAt;
+          RegExp.prototype.test = test;
+        }
+      })()`),
+      4,
+    );
+
+    assert.equal(
+      await worker.bootstrapEvaluate(`(() => {
+        const hex = (value) => Array.from(new Uint8Array(value), (byte) =>
+          byte.toString(16).padStart(2, "0")).join("");
+        crypto.subtle.digest("SHA-256", new TextEncoder().encode("abc"))
+          .then((value) => { globalThis.__portableSubtleDigest = hex(value); });
+        return "scheduled";
+      })()`),
+      "scheduled",
+    );
+    assert.equal(
+      await worker.bootstrapEvaluate("globalThis.__portableSubtleDigest"),
+      "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad",
+    );
+
+    assert.equal(
+      await worker.bootstrapEvaluate("document.querySelector('a').href", {
+        html: "<html><body><a href='?q=脈'>legacy</a></body></html>",
+        bootstrapTimeoutMs: 10_000,
+        requestTimeoutMs: 20_000,
+        documentMetadata: {
+          url: "https://example.test/path",
+          encoding: "EUC-JP",
+        },
+      }),
+      "https://example.test/path?q=%CC%AE",
+    );
+  } finally {
+    await worker.close();
+  }
+});
+
+test("bounds portable platform requests and responses without poisoning the realm", async () => {
+  const worker = await WasmV8Worker.launch(mockStatefulCore);
+  try {
+    await worker.bootstrapEvaluate("1", {
+      html: "<html><body></body></html>",
+      bootstrapTimeoutMs: 10_000,
+      requestTimeoutMs: 20_000,
+    });
+    await assert.rejects(
+      worker.bootstrapEvaluate(
+        `Deno.core.ops.op_url_parse("x".repeat(${MAX_PLATFORM_REQUEST_BYTES + 1}), "")`,
+        { timeoutMs: 5_000, requestTimeoutMs: 20_000 },
+      ),
+      { name: "RangeError", message: /platform request exceeds/ },
+    );
+    await assert.rejects(
+      worker.bootstrapEvaluate(`Deno.core.ops.op_random_bytes(${MAX_PLATFORM_RANDOM_BYTES + 1})`),
+      { name: "RangeError", message: /platform random length/ },
+    );
+    await assert.rejects(
+      worker.bootstrapEvaluate(
+        `Deno.core.ops.op_subtle_pbkdf2("SHA-256", new Uint8Array(), new Uint8Array(), ` +
+          `${MAX_PLATFORM_PBKDF2_ITERATIONS + 1}, 32)`,
+      ),
+      { name: "RangeError", message: /platform PBKDF2 iterations/ },
+    );
+    await assert.rejects(
+      worker.bootstrapEvaluate(
+        `Deno.core.ops.op_subtle_hkdf("SHA-256", new Uint8Array(), new Uint8Array(), ` +
+          `new Uint8Array(), ${MAX_PLATFORM_KDF_OUTPUT_BYTES + 1})`,
+      ),
+      { name: "RangeError", message: /platform KDF output/ },
+    );
+    await assert.rejects(
+      worker.bootstrapEvaluate(
+        `Deno.core.ops.op_subtle_hmac("SHA-256", ` +
+          `new Uint8Array(${MAX_PLATFORM_BINARY_BYTES / 2 + 1}), ` +
+          `new Uint8Array(${MAX_PLATFORM_BINARY_BYTES / 2}))`,
+        { timeoutMs: 20_000, requestTimeoutMs: 30_000 },
+      ),
+      { name: "RangeError", message: /platform binary payload exceeds/ },
+    );
+    assert.equal(await worker.bootstrapEvaluate("new URL('https://example.test/').hostname"), "example.test");
+  } finally {
+    await worker.close();
+  }
+
+  const directory = await mkdtemp(join(tmpdir(), "obscura-platform-response-bound-"));
+  const modulePath = join(directory, "oversized-platform-response.cjs");
+  await writeFile(
+    modulePath,
+    `const base = require(${JSON.stringify(mockStatefulCore)});\n` +
+      `module.exports = { ...base, platformOp(command) {\n` +
+      `  if (command === "op_random_bytes") return Buffer.alloc(${MAX_PLATFORM_BINARY_BYTES + 1}).toString("base64");\n` +
+      `  return "x".repeat(${MAX_PLATFORM_RESPONSE_BYTES + 1});\n` +
+      `} };\n`,
+  );
+  const oversized = await WasmV8Worker.launch(modulePath);
+  try {
+    await oversized.bootstrapEvaluate("1", {
+      html: "<html><body></body></html>",
+      bootstrapTimeoutMs: 10_000,
+      requestTimeoutMs: 20_000,
+    });
+    await assert.rejects(
+      oversized.bootstrapEvaluate("Deno.core.ops.op_encoding_for_label('utf-8')", {
+        timeoutMs: 5_000,
+        requestTimeoutMs: 20_000,
+      }),
+      { name: "RangeError", message: /platform response exceeds/ },
+    );
+    await assert.rejects(
+      oversized.bootstrapEvaluate("Deno.core.ops.op_random_bytes(1)", {
+        timeoutMs: 5_000,
+        requestTimeoutMs: 20_000,
+      }),
+      { name: "RangeError", message: /platform response binary payload exceeds/ },
+    );
+  } finally {
+    await oversized.close();
   }
 });
 
@@ -710,6 +1028,18 @@ test(
   async () => {
     const { namespace } = await loadModule(realWasmModule);
     assert.equal(namespace.abi_version(), 1);
+    assert.equal(namespace.platformOpAbiVersion(), 1);
+    assert.equal(
+      namespace.platformOp(
+        "op_url_resolve",
+        JSON.stringify({ href: "../asset", base: "https://example.test/path/page" }),
+      ),
+      "https://example.test/asset",
+    );
+    assert.equal(
+      Buffer.from(namespace.platformOp("op_random_bytes", JSON.stringify({ length: 16 })), "base64").length,
+      16,
+    );
     const core = new namespace.ObscuraCore("<!doctype html><html><body><h1>real</h1></body></html>");
     try {
       assert.deepEqual(core.query_snapshot("h1"), ["<h1>real</h1>", "real"]);

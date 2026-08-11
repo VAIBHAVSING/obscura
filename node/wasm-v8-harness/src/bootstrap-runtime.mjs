@@ -1,6 +1,7 @@
 import vm from "node:vm";
 
 const HOST_DOM_OP_BINDING = "__obscuraHostDomOpBridge__";
+const HOST_PLATFORM_OP_BINDING = "__obscuraHostPlatformOpBridge__";
 const DEFAULT_INSTALL_TIMEOUT_MS = 5_000;
 const MAX_VM_TIMEOUT_MS = 4_294_967_295;
 
@@ -74,11 +75,38 @@ export const BOOTSTRAP_DOM_OP_COMMANDS = Object.freeze([
   "text_content",
 ]);
 
+// Synchronous, non-network, non-rendering primitives used by bootstrap.js.
+// Keep the native op names as the wire commands so the portable host and the
+// deno_core runtime share one exact contract.
+export const BOOTSTRAP_PLATFORM_OP_COMMANDS = Object.freeze([
+  "op_document_domain_candidate",
+  "op_encoding_for_label",
+  "op_random_bytes",
+  "op_subtle_aes_cbc",
+  "op_subtle_aes_ctr",
+  "op_subtle_aes_gcm",
+  "op_subtle_digest",
+  "op_subtle_hkdf",
+  "op_subtle_hmac",
+  "op_subtle_pbkdf2",
+  "op_text_decode",
+  "op_url_encode_query",
+  "op_url_parse",
+  "op_url_resolve",
+  "op_url_set",
+]);
+
 const installDomBridgeScript = new vm.Script(
   `(() => {
     "use strict";
     const hostDomOp = globalThis.${HOST_DOM_OP_BINDING};
+    const hostPlatformOp = globalThis.${HOST_PLATFORM_OP_BINDING};
     const safeApply = Reflect.apply;
+    const safeJsonStringify = JSON.stringify;
+    const safeArrayBufferIsView = ArrayBuffer.isView;
+    const safeArrayJoin = Array.prototype.join;
+    const safeStringCharCodeAt = String.prototype.charCodeAt;
+    const safeStringEndsWith = String.prototype.endsWith;
     const ContextError = Error;
     const ContextTypeError = TypeError;
     const ContextRangeError = RangeError;
@@ -87,6 +115,10 @@ const installDomBridgeScript = new vm.Script(
     const ContextEvalError = EvalError;
     const ContextURIError = URIError;
     const ContextString = String;
+    const ContextNumber = Number;
+    const ContextUint8Array = Uint8Array;
+    const BASE64 = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    const MAX_PLATFORM_BINARY_BYTES = 8 * 1024 * 1024;
 
     const translatedError = (record) => {
       const name = typeof record?.name === "string" ? record.name : "Error";
@@ -128,6 +160,194 @@ const installDomBridgeScript = new vm.Script(
     };
     Object.freeze(opDom);
 
+    const callPlatform = (command, request) => {
+      const requestJson = safeApply(safeJsonStringify, undefined, [request]);
+      const response = safeApply(hostPlatformOp, undefined, [command, requestJson]);
+      if (response === null || typeof response !== "object") {
+        throw new ContextTypeError("Obscura platform bridge returned an invalid response");
+      }
+      if (response.ok === true) {
+        if (typeof response.value !== "string") {
+          throw new ContextTypeError("Obscura platform bridge returned a non-string value");
+        }
+        return response.value;
+      }
+      if (response.ok === false) throw translatedError(response.error);
+      throw new ContextTypeError("Obscura platform bridge returned an invalid response");
+    };
+
+    const byteView = (input) => {
+      if (safeApply(safeArrayBufferIsView, undefined, [input])) {
+        return new ContextUint8Array(input.buffer, input.byteOffset, input.byteLength);
+      }
+      return new ContextUint8Array(input);
+    };
+
+    const requireBinaryBudget = (...inputs) => {
+      let total = 0;
+      for (let index = 0; index < inputs.length; index++) {
+        total += byteView(inputs[index]).byteLength;
+        if (total > MAX_PLATFORM_BINARY_BYTES) {
+          throw new ContextRangeError(
+            "Obscura platform binary payload exceeds the 8388608-byte ABI limit",
+          );
+        }
+      }
+    };
+
+    const bytesToBase64 = (input) => {
+      const bytes = byteView(input);
+      const chunks = [];
+      let quartets = [];
+      for (let index = 0; index < bytes.length; index += 3) {
+        const a = bytes[index];
+        const b = index + 1 < bytes.length ? bytes[index + 1] : 0;
+        const c = index + 2 < bytes.length ? bytes[index + 2] : 0;
+        quartets[quartets.length] =
+          BASE64[a >>> 2] +
+          BASE64[((a & 3) << 4) | (b >>> 4)] +
+          (index + 1 < bytes.length ? BASE64[((b & 15) << 2) | (c >>> 6)] : "=") +
+          (index + 2 < bytes.length ? BASE64[c & 63] : "=");
+        // Bound rope depth before JSON serialization flattens a large digest
+        // input. Millions of four-character concatenations can otherwise hit
+        // V8's call-stack limit while flattening the string.
+        if (quartets.length >= 4_096) {
+          chunks[chunks.length] = safeApply(safeArrayJoin, quartets, [""]);
+          quartets = [];
+        }
+      }
+      if (quartets.length > 0) {
+        chunks[chunks.length] = safeApply(safeArrayJoin, quartets, [""]);
+      }
+      return safeApply(safeArrayJoin, chunks, [""]);
+    };
+
+    const base64Value = (input, index) => {
+      const code = safeApply(safeStringCharCodeAt, input, [index]);
+      if (code >= 0x41 && code <= 0x5a) return code - 0x41;
+      if (code >= 0x61 && code <= 0x7a) return code - 0x61 + 26;
+      if (code >= 0x30 && code <= 0x39) return code - 0x30 + 52;
+      if (code === 0x2b) return 62;
+      if (code === 0x2f) return 63;
+      return -1;
+    };
+
+    const base64ToBytes = (input) => {
+      if (typeof input !== "string" || input.length % 4 !== 0) {
+        throw new ContextTypeError("Obscura platform bridge returned invalid base64");
+      }
+      const padding = safeApply(safeStringEndsWith, input, ["=="])
+        ? 2
+        : (safeApply(safeStringEndsWith, input, ["="]) ? 1 : 0);
+      const output = new ContextUint8Array((input.length / 4) * 3 - padding);
+      let offset = 0;
+      for (let index = 0; index < input.length; index += 4) {
+        const a = base64Value(input, index);
+        const b = base64Value(input, index + 1);
+        const finalQuartet = index + 4 === input.length;
+        const cPadded = finalQuartet && padding === 2;
+        const dPadded = finalQuartet && padding >= 1;
+        const c = cPadded ? 0 : base64Value(input, index + 2);
+        const d = dPadded ? 0 : base64Value(input, index + 3);
+        if (a < 0 || b < 0 || c < 0 || d < 0) {
+          throw new ContextTypeError("Obscura platform bridge returned invalid base64");
+        }
+        if (offset < output.length) output[offset++] = (a << 2) | (b >>> 4);
+        if (offset < output.length) output[offset++] = ((b & 15) << 4) | (c >>> 2);
+        if (offset < output.length) output[offset++] = ((c & 3) << 6) | d;
+      }
+      return output;
+    };
+
+    const stringValue = (value) => safeApply(ContextString, undefined, [value]);
+    const numberValue = (value) => safeApply(ContextNumber, undefined, [value]);
+    const byteResult = (command, request) => base64ToBytes(callPlatform(command, request));
+
+    const opUrlParse = function op_url_parse(href, base) {
+      return callPlatform("op_url_parse", { href: stringValue(href), base: stringValue(base) });
+    };
+    const opUrlSet = function op_url_set(href, part, value) {
+      return callPlatform("op_url_set", {
+        href: stringValue(href), part: stringValue(part), value: stringValue(value),
+      });
+    };
+    const opUrlResolve = function op_url_resolve(href, base) {
+      return callPlatform("op_url_resolve", { href: stringValue(href), base: stringValue(base) });
+    };
+    const opDocumentDomainCandidate = function op_document_domain_candidate(current, input) {
+      return callPlatform("op_document_domain_candidate", {
+        current: stringValue(current), input: stringValue(input),
+      });
+    };
+    const opUrlEncodeQuery = function op_url_encode_query(query, label, special) {
+      return callPlatform("op_url_encode_query", {
+        query: stringValue(query), label: stringValue(label), special: !!special,
+      });
+    };
+    const opEncodingForLabel = function op_encoding_for_label(label) {
+      return callPlatform("op_encoding_for_label", { label: stringValue(label) });
+    };
+    const opTextDecode = function op_text_decode(label, bytes, fatal, ignoreBom) {
+      requireBinaryBudget(bytes);
+      return callPlatform("op_text_decode", {
+        label: stringValue(label), bytes: bytesToBase64(bytes), fatal: !!fatal, ignoreBom: !!ignoreBom,
+      });
+    };
+    const opRandomBytes = function op_random_bytes(length) {
+      return byteResult("op_random_bytes", { length: numberValue(length) });
+    };
+    const opSubtleDigest = function op_subtle_digest(algorithm, data) {
+      requireBinaryBudget(data);
+      return byteResult("op_subtle_digest", {
+        algorithm: stringValue(algorithm), data: bytesToBase64(data),
+      });
+    };
+    const opSubtleHmac = function op_subtle_hmac(hash, key, data) {
+      requireBinaryBudget(key, data);
+      return byteResult("op_subtle_hmac", {
+        hash: stringValue(hash), key: bytesToBase64(key), data: bytesToBase64(data),
+      });
+    };
+    const opSubtleAesGcm = function op_subtle_aes_gcm(encrypt, key, iv, aad, data) {
+      requireBinaryBudget(key, iv, aad, data);
+      return byteResult("op_subtle_aes_gcm", {
+        encrypt: !!encrypt, key: bytesToBase64(key), iv: bytesToBase64(iv),
+        aad: bytesToBase64(aad), data: bytesToBase64(data),
+      });
+    };
+    const opSubtleAesCbc = function op_subtle_aes_cbc(encrypt, key, iv, data) {
+      requireBinaryBudget(key, iv, data);
+      return byteResult("op_subtle_aes_cbc", {
+        encrypt: !!encrypt, key: bytesToBase64(key), iv: bytesToBase64(iv),
+        data: bytesToBase64(data),
+      });
+    };
+    const opSubtleAesCtr = function op_subtle_aes_ctr(key, counter, counterLength, data) {
+      requireBinaryBudget(key, counter, data);
+      return byteResult("op_subtle_aes_ctr", {
+        key: bytesToBase64(key), counter: bytesToBase64(counter),
+        counterLength: numberValue(counterLength), data: bytesToBase64(data),
+      });
+    };
+    const opSubtlePbkdf2 = function op_subtle_pbkdf2(hash, password, salt, iterations, length) {
+      requireBinaryBudget(password, salt);
+      return byteResult("op_subtle_pbkdf2", {
+        hash: stringValue(hash), password: bytesToBase64(password), salt: bytesToBase64(salt),
+        iterations: numberValue(iterations), length: numberValue(length),
+      });
+    };
+    const opSubtleHkdf = function op_subtle_hkdf(hash, ikm, salt, info, length) {
+      requireBinaryBudget(ikm, salt, info);
+      return byteResult("op_subtle_hkdf", {
+        hash: stringValue(hash), ikm: bytesToBase64(ikm), salt: bytesToBase64(salt),
+        info: bytesToBase64(info), length: numberValue(length),
+      });
+    };
+    [opUrlParse, opUrlSet, opUrlResolve, opDocumentDomainCandidate, opUrlEncodeQuery,
+      opEncodingForLabel, opTextDecode, opRandomBytes, opSubtleDigest, opSubtleHmac,
+      opSubtleAesGcm, opSubtleAesCbc, opSubtleAesCtr, opSubtlePbkdf2, opSubtleHkdf]
+      .forEach(Object.freeze);
+
     // The first portable bootstrap slice is deliberately synchronous. False
     // makes bootstrap.js leave timers and posted tasks pending instead of
     // manufacturing microtask semantics for browser tasks.
@@ -145,6 +365,21 @@ const installDomBridgeScript = new vm.Script(
     Object.defineProperties(ops, {
       op_dom: { value: opDom, enumerable: true },
       op_async_runtime_available: { value: asyncRuntimeAvailable, enumerable: true },
+      op_url_parse: { value: opUrlParse, enumerable: true },
+      op_url_set: { value: opUrlSet, enumerable: true },
+      op_url_resolve: { value: opUrlResolve, enumerable: true },
+      op_document_domain_candidate: { value: opDocumentDomainCandidate, enumerable: true },
+      op_url_encode_query: { value: opUrlEncodeQuery, enumerable: true },
+      op_encoding_for_label: { value: opEncodingForLabel, enumerable: true },
+      op_text_decode: { value: opTextDecode, enumerable: true },
+      op_random_bytes: { value: opRandomBytes, enumerable: true },
+      op_subtle_digest: { value: opSubtleDigest, enumerable: true },
+      op_subtle_hmac: { value: opSubtleHmac, enumerable: true },
+      op_subtle_aes_gcm: { value: opSubtleAesGcm, enumerable: true },
+      op_subtle_aes_cbc: { value: opSubtleAesCbc, enumerable: true },
+      op_subtle_aes_ctr: { value: opSubtleAesCtr, enumerable: true },
+      op_subtle_pbkdf2: { value: opSubtlePbkdf2, enumerable: true },
+      op_subtle_hkdf: { value: opSubtleHkdf, enumerable: true },
     });
     Object.freeze(ops);
 
@@ -190,9 +425,9 @@ function vmTimeout(value) {
   return timeoutMs;
 }
 
-function safeErrorRecord(error) {
+function safeErrorRecord(error, fallbackMessage) {
   let name = "Error";
-  let message = "Obscura DOM bridge operation failed";
+  let message = fallbackMessage;
   try {
     if (typeof error?.name === "string") name = error.name;
   } catch {
@@ -212,12 +447,12 @@ function safeErrorRecord(error) {
   return Object.freeze(record);
 }
 
-function hostResponse(opDom, command, arg1, arg2) {
+function hostResponse(call, fallbackMessage, ...args) {
   const response = Object.create(null);
   try {
-    const value = opDom(command, arg1, arg2);
+    const value = call(...args);
     if (typeof value !== "string") {
-      throw new TypeError("Portable dom_op must return a string");
+      throw new TypeError("Portable bootstrap operation must return a string");
     }
     Object.defineProperties(response, {
       ok: { enumerable: true, value: true },
@@ -226,7 +461,7 @@ function hostResponse(opDom, command, arg1, arg2) {
   } catch (error) {
     Object.defineProperties(response, {
       ok: { enumerable: true, value: false },
-      error: { enumerable: true, value: safeErrorRecord(error) },
+      error: { enumerable: true, value: safeErrorRecord(error, fallbackMessage) },
     });
   }
   return Object.freeze(response);
@@ -242,12 +477,15 @@ export function compileBootstrapRuntime(source, { filename = "<obscura:bootstrap
 
   const bootstrapScript = new vm.Script(source, { filename });
   return Object.freeze({
-    install(context, { opDom, timeoutMs } = {}) {
+    install(context, { opDom, opPlatform, timeoutMs } = {}) {
       if (!vm.isContext(context)) {
         throw new TypeError("Obscura bootstrap requires a Node vm context");
       }
       if (typeof opDom !== "function") {
         throw new TypeError("Obscura bootstrap requires a synchronous dom_op callback");
+      }
+      if (typeof opPlatform !== "function") {
+        throw new TypeError("Obscura bootstrap requires a synchronous platform_op callback");
       }
       timeoutMs = vmTimeout(timeoutMs);
       if (Object.hasOwn(context, "Deno") || Object.hasOwn(context, "document")) {
@@ -255,13 +493,29 @@ export function compileBootstrapRuntime(source, { filename = "<obscura:bootstrap
       }
 
       Object.defineProperty(context, HOST_DOM_OP_BINDING, {
-        value: (command, arg1, arg2) => hostResponse(opDom, command, arg1, arg2),
+        value: (command, arg1, arg2) => hostResponse(
+          opDom,
+          "Obscura DOM bridge operation failed",
+          command,
+          arg1,
+          arg2,
+        ),
+        configurable: true,
+      });
+      Object.defineProperty(context, HOST_PLATFORM_OP_BINDING, {
+        value: (command, requestJson) => hostResponse(
+          opPlatform,
+          "Obscura platform bridge operation failed",
+          command,
+          requestJson,
+        ),
         configurable: true,
       });
       try {
         installDomBridgeScript.runInContext(context, { timeout: timeoutMs });
       } finally {
         Reflect.deleteProperty(context, HOST_DOM_OP_BINDING);
+        Reflect.deleteProperty(context, HOST_PLATFORM_OP_BINDING);
       }
 
       bootstrapScript.runInContext(context, { timeout: timeoutMs });

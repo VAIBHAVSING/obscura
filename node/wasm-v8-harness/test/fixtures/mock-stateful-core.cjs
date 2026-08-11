@@ -1,4 +1,5 @@
 const MAX_BATCH_OPERATIONS = 1_024;
+const platform = require("./mock-platform-ops.cjs");
 
 function attributes(source) {
   const result = Object.create(null);
@@ -292,6 +293,7 @@ class ObscuraCore {
 }
 
 module.exports = {
+  ...platform,
   abi_version: 1,
   probe() {
     return JSON.stringify({
