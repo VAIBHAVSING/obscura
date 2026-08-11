@@ -2122,9 +2122,30 @@ impl ObscuraJsRuntime {
         expression: &str,
         timeout: std::time::Duration,
     ) -> Result<serde_json::Value, String> {
-        let json = self.evaluate_json_with_timeout(expression, timeout)?;
-        serde_json::from_str(&json)
-            .map_err(|error| format!("failed to decode evaluation result: {}", error))
+        if timeout.is_zero() {
+            return self.evaluate(expression);
+        }
+        self.begin_javascript_task();
+        let wrapped = Self::wrap_expression(expression);
+        let token = self.arm_watchdog(timeout);
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            match self.runtime.execute_script("<eval>", wrapped) {
+                Ok(value) => self.v8_to_json(value),
+                Err(error) => Err(format!("JS error: {}", error)),
+            }
+        }));
+        let fired = self.disarm_watchdog(token);
+        let result = match result {
+            Ok(result) => result,
+            Err(payload) => std::panic::resume_unwind(payload),
+        };
+        match result {
+            Err(error) if fired || error.contains("execution terminated") => {
+                Err("eval timed out".to_string())
+            }
+            Ok(_) if fired => Err("eval timed out".to_string()),
+            other => other,
+        }
     }
 
     /// Evaluate an expression and return its intrinsic V8 JSON serialization.
@@ -2426,8 +2447,33 @@ impl ObscuraJsRuntime {
         &mut self,
         result: deno_core::v8::Global<deno_core::v8::Value>,
     ) -> Result<serde_json::Value, String> {
-        let json = self.v8_to_json_text(result)?;
-        serde_json::from_str(&json)
+        let scope = &mut self.runtime.handle_scope();
+        let try_catch = &mut deno_core::v8::TryCatch::new(scope);
+        let local = deno_core::v8::Local::new(try_catch, result);
+
+        if local.is_undefined() || local.is_null() {
+            return Ok(serde_json::Value::Null);
+        }
+        if local.is_boolean() {
+            return Ok(serde_json::Value::Bool(local.boolean_value(try_catch)));
+        }
+        if local.is_number() {
+            let number = local.number_value(try_catch).unwrap_or(0.0);
+            return Ok(serde_json::json!(number));
+        }
+        if local.is_string() {
+            return Ok(serde_json::Value::String(
+                local.to_rust_string_lossy(try_catch),
+            ));
+        }
+
+        let Some(json) = deno_core::v8::json::stringify(try_catch, local) else {
+            if try_catch.has_terminated() {
+                return Err("eval timed out".to_string());
+            }
+            return Err("failed to serialize evaluation result as JSON".to_string());
+        };
+        serde_json::from_str(&json.to_rust_string_lossy(try_catch))
             .map_err(|error| format!("failed to decode evaluation result: {}", error))
     }
 
@@ -2565,6 +2611,49 @@ mod tests {
         rt.set_title("Test Page");
         rt.run_page_init();
         rt
+    }
+
+    #[test]
+    fn bounded_evaluation_preserves_primitives_and_uses_intrinsic_json() {
+        let mut rt = setup_runtime("<html><body></body></html>");
+        let timeout = std::time::Duration::from_millis(100);
+
+        assert_eq!(
+            rt.evaluate_with_timeout("0", timeout).unwrap(),
+            serde_json::json!(0.0)
+        );
+        rt.evaluate("(JSON.stringify = () => '\"spoofed\"', null)")
+            .unwrap();
+        assert_eq!(
+            rt.evaluate_with_timeout("({ answer: 6 * 7 })", timeout)
+                .unwrap(),
+            serde_json::json!({ "answer": 42 })
+        );
+        assert_eq!(
+            rt.evaluate_json_with_timeout("({ answer: 6 * 7 })", timeout)
+                .unwrap(),
+            r#"{"answer":42}"#
+        );
+    }
+
+    #[test]
+    fn bounded_json_serialization_timeout_leaves_runtime_reusable() {
+        let mut rt = setup_runtime("<html><body></body></html>");
+        let started_at = std::time::Instant::now();
+        let error = rt
+            .evaluate_json_with_timeout(
+                "({ get value() { while (true) {} } })",
+                std::time::Duration::from_millis(25),
+            )
+            .unwrap_err();
+
+        assert_eq!(error, "eval timed out");
+        assert!(started_at.elapsed() < std::time::Duration::from_secs(2));
+        assert_eq!(
+            rt.evaluate_json_with_timeout("6 * 7", std::time::Duration::from_secs(1))
+                .unwrap(),
+            "42"
+        );
     }
 
     #[test]
