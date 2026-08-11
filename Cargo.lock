@@ -2032,8 +2032,10 @@ dependencies = [
 name = "obscura-wasm"
 version = "0.1.0"
 dependencies = [
+ "html5ever",
  "js-sys",
  "obscura-dom",
+ "serde_json",
  "wasm-bindgen",
 ]
 

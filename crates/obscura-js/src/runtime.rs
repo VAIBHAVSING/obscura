@@ -3633,6 +3633,33 @@ mod tests {
         assert_eq!(v, serde_json::json!(null));
     }
 
+    #[cfg(feature = "render")]
+    #[test]
+    fn namespace_attribute_mutations_invalidate_computed_style_snapshots() {
+        let mut rt = setup_runtime("<html><body></body></html>");
+        let calls = rt
+            .evaluate(
+                r#"(function(){
+                    const element = document.createElement('div');
+                    const nativeComputedStyle = Deno.core.ops.op_computed_style;
+                    let calls = 0;
+                    Deno.core.ops.op_computed_style = (...args) => {
+                        calls++;
+                        return nativeComputedStyle(...args);
+                    };
+                    void getComputedStyle(element).display;
+                    void getComputedStyle(element).display;
+                    element.setAttributeNS(null, 'data-state', 'set');
+                    void getComputedStyle(element).display;
+                    element.removeAttributeNS(null, 'data-state');
+                    void getComputedStyle(element).display;
+                    return calls;
+                })()"#,
+            )
+            .unwrap();
+        assert_eq!(calls.as_f64(), Some(3.0));
+    }
+
     #[test]
     fn get_attribute_ns_reads_plain_attributes_with_null_namespace() {
         // Backward-compat: getAttributeNS(null, name) still reads a plain attr.
@@ -13689,6 +13716,96 @@ mod tests {
 
         let node_type = rt.evaluate("document.doctype.nodeType").unwrap();
         assert_eq!(node_type.as_f64().unwrap() as i64, 10);
+    }
+
+    #[test]
+    fn processing_instruction_uses_native_node_data_and_wrapping() {
+        let mut rt = setup_runtime("<html><body></body></html>");
+        let result = rt
+            .evaluate(
+                r#"(function(){
+                    const pi = document.createProcessingInstruction('xml-stylesheet', 'href="a.css"');
+                    const clone = pi.cloneNode();
+                    const nativeCloneId = +Deno.core.ops.op_dom('clone_node', String(pi._nid), 'false');
+                    const wrapped = globalThis._wrap(nativeCloneId);
+                    pi.nodeValue = 'href="b.css"';
+                    return [
+                        pi.nodeType,
+                        Deno.core.ops.op_dom('node_type', String(pi._nid), ''),
+                        JSON.parse(Deno.core.ops.op_dom('pi_target', String(pi._nid), '')),
+                        pi.target,
+                        pi.data,
+                        clone.nodeType,
+                        clone.target,
+                        clone.data,
+                        wrapped instanceof ProcessingInstruction,
+                        wrapped.target,
+                        wrapped.data,
+                    ];
+                })()"#,
+            )
+            .unwrap();
+        assert_eq!(
+            result,
+            serde_json::json!([
+                7,
+                "7",
+                "xml-stylesheet",
+                "xml-stylesheet",
+                "href=\"b.css\"",
+                7,
+                "xml-stylesheet",
+                "href=\"a.css\"",
+                true,
+                "xml-stylesheet",
+                "href=\"a.css\""
+            ])
+        );
+    }
+
+    #[test]
+    fn created_document_type_uses_native_node_data_and_wrapping() {
+        let mut rt = setup_runtime("<html><body></body></html>");
+        let result = rt
+            .evaluate(
+                r#"(function(){
+                    const doctype = document.implementation.createDocumentType(
+                        'svg', '-//W3C//DTD SVG 1.1//EN', 'svg11.dtd'
+                    );
+                    const nativeCloneId = +Deno.core.ops.op_dom(
+                        'clone_node', String(doctype._nid), 'false'
+                    );
+                    const wrapped = globalThis._wrap(nativeCloneId);
+                    return [
+                        doctype.nodeType,
+                        Deno.core.ops.op_dom('node_type', String(doctype._nid), ''),
+                        JSON.parse(Deno.core.ops.op_dom('doctype_name', String(doctype._nid), '')),
+                        JSON.parse(Deno.core.ops.op_dom('doctype_public_id', String(doctype._nid), '')),
+                        doctype.name,
+                        doctype.publicId,
+                        doctype.systemId,
+                        wrapped instanceof DocumentType,
+                        wrapped.name,
+                        wrapped.publicId,
+                    ];
+                })()"#,
+            )
+            .unwrap();
+        assert_eq!(
+            result,
+            serde_json::json!([
+                10,
+                "10",
+                "svg",
+                "-//W3C//DTD SVG 1.1//EN",
+                "svg",
+                "-//W3C//DTD SVG 1.1//EN",
+                "svg11.dtd",
+                true,
+                "svg",
+                "-//W3C//DTD SVG 1.1//EN"
+            ])
+        );
     }
 
     #[test]

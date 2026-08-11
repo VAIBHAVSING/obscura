@@ -2,7 +2,15 @@ import { createRequire } from "node:module";
 import { extname } from "node:path";
 import { isMainThread, Worker } from "node:worker_threads";
 
-import { MAX_HTML_INPUT_BYTES, requireBoundedString } from "./limits.mjs";
+import {
+  MAX_DOCUMENT_METADATA_BYTES,
+  MAX_DOM_ARGUMENT_BYTES,
+  MAX_DOM_BATCH_BYTES,
+  MAX_DOM_BATCH_OPERATIONS,
+  MAX_DOM_COMMAND_BYTES,
+  MAX_HTML_INPUT_BYTES,
+  requireBoundedString,
+} from "./limits.mjs";
 import { resolveModulePath } from "./module-loader.mjs";
 
 const workerUrl = new URL("./worker.mjs", import.meta.url);
@@ -15,10 +23,14 @@ function nativeInitializationError(message) {
   return error;
 }
 
-function preloadNativeAddon(modulePath, cwd) {
+function preloadNativeAddon(modulePath, cwd, bootstrapPath) {
   const resolvedPath = resolveModulePath(modulePath, cwd);
   if (!resolvedPath || extname(resolvedPath) !== ".node") {
-    return { modulePath, cwd };
+    return {
+      modulePath,
+      cwd,
+      bootstrapPath: bootstrapPath === undefined ? undefined : resolveModulePath(bootstrapPath, cwd),
+    };
   }
   if (!isMainThread) {
     throw nativeInitializationError("Obscura's native addon must be initialized from Node's main thread");
@@ -41,7 +53,71 @@ function preloadNativeAddon(modulePath, cwd) {
     throw nativeInitializationError("Obscura's native addon reported an invalid embedded V8 version");
   }
 
-  return { modulePath: resolvedPath, cwd };
+  return {
+    modulePath: resolvedPath,
+    cwd,
+    bootstrapPath: bootstrapPath === undefined ? undefined : resolveModulePath(bootstrapPath, cwd),
+  };
+}
+
+function boundedDocumentMetadata(value) {
+  if (value === undefined) return undefined;
+  if (value === null || typeof value !== "object" || Array.isArray(value)) {
+    throw new TypeError("documentMetadata must be an object");
+  }
+  const metadata = {
+    url: value.url ?? "about:blank",
+    referrer: value.referrer ?? "",
+    encoding: value.encoding ?? "UTF-8",
+  };
+  requireBoundedString(metadata.url, MAX_DOCUMENT_METADATA_BYTES, "document URL");
+  requireBoundedString(metadata.referrer, MAX_DOCUMENT_METADATA_BYTES, "document referrer");
+  requireBoundedString(metadata.encoding, MAX_DOCUMENT_METADATA_BYTES, "document encoding");
+  return metadata;
+}
+
+function boundedDomOperations(operations) {
+  if (!Array.isArray(operations)) throw new TypeError("DOM batch operations must be an array");
+  if (operations.length > MAX_DOM_BATCH_OPERATIONS) {
+    throw new RangeError(`DOM batch exceeds the ${MAX_DOM_BATCH_OPERATIONS}-operation ABI limit`);
+  }
+  const normalized = operations.map((operation, index) => {
+    if (!Array.isArray(operation) || operation.length !== 3) {
+      throw new TypeError(`DOM batch operation ${index} must be an exact three-string tuple`);
+    }
+    const [command, arg1, arg2] = operation;
+    requireBoundedString(command, MAX_DOM_COMMAND_BYTES, `DOM batch operation ${index} command`);
+    requireBoundedString(arg1, MAX_DOM_ARGUMENT_BYTES, `DOM batch operation ${index} arg1`);
+    requireBoundedString(arg2, MAX_DOM_ARGUMENT_BYTES, `DOM batch operation ${index} arg2`);
+    return [command, arg1, arg2];
+  });
+  requireBoundedString(JSON.stringify(normalized), MAX_DOM_BATCH_BYTES, "DOM batch request");
+  return normalized;
+}
+
+function boundedPageExpectation(options) {
+  const expectation = {
+    generation: options.expectedGeneration,
+    documentHandle: options.expectedDocumentHandle,
+    revision: options.expectedRevision,
+  };
+  if (expectation.generation !== undefined) {
+    if (!Number.isSafeInteger(expectation.generation) || expectation.generation < 0) {
+      throw new TypeError("expectedGeneration must be a non-negative safe integer");
+    }
+  }
+  for (const [name, value] of [
+    ["expectedDocumentHandle", expectation.documentHandle],
+    ["expectedRevision", expectation.revision],
+  ]) {
+    if (value !== undefined && (!Number.isSafeInteger(value) || value < 0 || value > 0xffff_ffff)) {
+      throw new TypeError(`${name} must be an unsigned 32-bit integer`);
+    }
+  }
+  if (expectation.documentHandle === 0) {
+    throw new TypeError("expectedDocumentHandle must be non-zero");
+  }
+  return Object.values(expectation).some((value) => value !== undefined) ? expectation : undefined;
 }
 
 function validateTimeout(timeoutMs, label) {
@@ -71,8 +147,11 @@ export class WasmV8Worker {
   #readyResolve;
   #readyReject;
 
-  constructor(modulePath, { cwd = process.cwd() } = {}) {
-    const workerData = preloadNativeAddon(modulePath, cwd);
+  constructor(modulePath, { cwd = process.cwd(), bootstrapPath } = {}) {
+    if (bootstrapPath !== undefined && (typeof bootstrapPath !== "string" || bootstrapPath.length === 0)) {
+      throw new TypeError("bootstrapPath must be a non-empty string");
+    }
+    const workerData = preloadNativeAddon(modulePath, cwd, bootstrapPath);
     this.#ready = new Promise((resolve, reject) => {
       this.#readyResolve = resolve;
       this.#readyReject = reject;
@@ -180,14 +259,78 @@ export class WasmV8Worker {
       if (options.html !== undefined) {
         requireBoundedString(options.html, MAX_HTML_INPUT_BYTES, "HTML input");
       }
+      boundedDocumentMetadata(options.documentMetadata);
     } catch (error) {
       return Promise.reject(error);
     }
     return this.request(
       "bridgeEvaluate",
-      { source, html: options.html, timeoutMs: options.timeoutMs },
+      {
+        source,
+        html: options.html,
+        timeoutMs: options.timeoutMs,
+        documentMetadata: boundedDocumentMetadata(options.documentMetadata),
+      },
       options.requestTimeoutMs,
     );
+  }
+
+  bridgeDomBatch(operations, options = {}) {
+    try {
+      if (options.html !== undefined) {
+        requireBoundedString(options.html, MAX_HTML_INPUT_BYTES, "HTML input");
+      }
+      operations = boundedDomOperations(operations);
+      const documentMetadata = boundedDocumentMetadata(options.documentMetadata);
+      const expectedPage = boundedPageExpectation(options);
+      return this.request(
+        "bridgeDomBatch",
+        { operations, html: options.html, documentMetadata, expectedPage },
+        options.requestTimeoutMs,
+      );
+    } catch (error) {
+      return Promise.reject(error);
+    }
+  }
+
+  bridgeDomOp(command, arg1 = "", arg2 = "", options = {}) {
+    try {
+      [[command, arg1, arg2]] = boundedDomOperations([[command, arg1, arg2]]);
+      if (options.html !== undefined) {
+        requireBoundedString(options.html, MAX_HTML_INPUT_BYTES, "HTML input");
+      }
+      const documentMetadata = boundedDocumentMetadata(options.documentMetadata);
+      const expectedPage = boundedPageExpectation(options);
+      return this.request(
+        "bridgeDomOperation",
+        { command, arg1, arg2, html: options.html, documentMetadata, expectedPage },
+        options.requestTimeoutMs,
+      );
+    } catch (error) {
+      return Promise.reject(error);
+    }
+  }
+
+  bootstrapEvaluate(source, options = {}) {
+    try {
+      if (options.html !== undefined) {
+        requireBoundedString(options.html, MAX_HTML_INPUT_BYTES, "HTML input");
+      }
+      const documentMetadata = boundedDocumentMetadata(options.documentMetadata);
+      return this.request(
+        "bootstrapEvaluate",
+        {
+          source,
+          html: options.html,
+          timeoutMs: options.timeoutMs,
+          bootstrapTimeoutMs: options.bootstrapTimeoutMs,
+          documentMetadata,
+        },
+        options.requestTimeoutMs,
+      );
+    } catch (error) {
+      return Promise.reject(error);
+    }
   }
 
   bridgeStatus() {

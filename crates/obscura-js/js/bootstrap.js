@@ -93,7 +93,7 @@ let _domMutationEpoch = 0;
 let _treeMutationEpoch = 0;
 const _DOM_MUTATION_COMMANDS = new Set([
   "append_child", "insert_before", "remove_child",
-  "set_attribute", "remove_attribute",
+  "set_attribute", "remove_attribute", "set_attribute_ns", "remove_attribute_ns",
   "set_text_content", "set_inner_html", "set_inner_html_context",
   "set_fragment_html_executable",
 ]);
@@ -2348,17 +2348,21 @@ class CDATASection extends Text {
   cloneNode() { return new CDATASection(+_dom("create_text_node", this.data)); }
 }
 
-// ProcessingInstruction: nodeType 7, nodeName === target. Extends CharacterData
-// and carries a separate target. Backed by a text node so data/nodeValue/
-// textContent/length work without native PI support.
+// ProcessingInstruction: nodeType 7, nodeName === target. The immutable target
+// is stored in the native node; wrappers created by traversal recover it lazily.
 class ProcessingInstruction extends CharacterData {
   constructor(nid, target) { super(nid); this._target = target; }
-  get target() { return this._target; }
-  get nodeName() { return this._target; }
+  get target() {
+    if (this._target === undefined) {
+      this._target = _domParse("pi_target", this._nid) ?? "";
+    }
+    return this._target;
+  }
+  get nodeName() { return this.target; }
   get nodeType() { return 7; }
   get nodeValue() { return this.data; }
   set nodeValue(v) { this.data = v; }
-  cloneNode() { return new ProcessingInstruction(+_dom("create_text_node", this.data), this._target); }
+  cloneNode() { return document.createProcessingInstruction(this.target, this.data); }
 }
 
 // Document character encoding (WHATWG canonical name, e.g. "UTF-8", "EUC-JP").
@@ -4872,7 +4876,7 @@ class Document extends Node {
     if (str.indexOf("?>") !== -1) {
       throw new DOMException("Processing instruction data must not contain '?>'", "InvalidCharacterError");
     }
-    const nid = +_dom("create_text_node", str);
+    const nid = +_dom("create_processing_instruction", tgt, str);
     const n = new ProcessingInstruction(nid, tgt);
     _seedDetachedTreeState(n);
     _cache.set(nid, n);
@@ -5183,13 +5187,18 @@ class Document extends Node {
         if (name === "" || /[\t\n\f\r >]/.test(name)) {
           throw new DOMException("The qualified name '" + name + "' contains an invalid character", "InvalidCharacterError");
         }
+        const publicIdValue = publicId === undefined ? "" : String(publicId);
+        const systemIdValue = systemId === undefined ? "" : String(systemId);
+        const nid = +_dom("create_doctype", name, publicIdValue);
         const dt = new DocumentType(
-          +_dom("create_comment_node", ""),
+          nid,
           name,
-          publicId === undefined ? "" : String(publicId),
-          systemId === undefined ? "" : String(systemId)
+          publicIdValue,
+          systemIdValue
         );
         dt._ownerDocument = ownerDoc;
+        _seedDetachedTreeState(dt);
+        _cache.set(nid, dt);
         return dt;
       },
       hasFeature() { return true; },
@@ -5293,10 +5302,20 @@ class DocumentType extends Node {
     this._systemId = systemId;
   }
   get nodeType() { return 10; }
-  get nodeName() { return this._name; }
-  get name() { return this._name; }
-  get publicId() { return this._publicId; }
-  get systemId() { return this._systemId; }
+  get nodeName() { return this.name; }
+  get name() {
+    if (this._name === undefined) {
+      this._name = _domParse("doctype_name", this._nid) ?? "";
+    }
+    return this._name;
+  }
+  get publicId() {
+    if (this._publicId === undefined) {
+      this._publicId = _domParse("doctype_public_id", this._nid) ?? "";
+    }
+    return this._publicId;
+  }
+  get systemId() { return this._systemId ?? ""; }
   get nodeValue() { return null; }
   set nodeValue(v) {}
   get ownerDocument() { return this._ownerDocument || globalThis.document; }
@@ -5884,8 +5903,10 @@ function _wrap(nid) {
   let n;
   if (t === 1) { const C = _elementClassFor(nid); n = new C(nid); }
   else if (t === 3) n = new Text(nid);
+  else if (t === 7) n = new ProcessingInstruction(nid);
   else if (t === 8) n = new Comment(nid);
   else if (t === 9) n = new Document(nid);
+  else if (t === 10) n = new DocumentType(nid);
   else n = new Node(nid);
   _cache.set(nid, n);
   return n;
@@ -9657,7 +9678,11 @@ globalThis.DOMParser = class DOMParser {
         const t = String(target), s = String(data);
         if (!_isValidPITarget(t)) throw new DOMException("Invalid processing instruction target", "InvalidCharacterError");
         if (s.indexOf("?>") !== -1) throw new DOMException("Processing instruction data must not contain '?>'", "InvalidCharacterError");
-        return new ProcessingInstruction(+_dom("create_text_node", s), t);
+        const nid = +_dom("create_processing_instruction", t, s);
+        const n = new ProcessingInstruction(nid, t);
+        _seedDetachedTreeState(n);
+        _cache.set(nid, n);
+        return n;
       },
       adoptNode: (n) => n,
       importNode: (n) => n,

@@ -9,11 +9,17 @@ import { promisify } from "node:util";
 
 import { WasmV8Worker } from "../src/client.mjs";
 import { loadModule } from "../src/module-loader.mjs";
-import { MAX_HTML_INPUT_BYTES, MAX_SELECTOR_BYTES } from "../src/limits.mjs";
+import {
+  MAX_DOCUMENT_METADATA_BYTES,
+  MAX_DOM_BATCH_OPERATIONS,
+  MAX_HTML_INPUT_BYTES,
+  MAX_SELECTOR_BYTES,
+} from "../src/limits.mjs";
 
 const mockModule = fileURLToPath(new URL("./fixtures/mock-wasm-bindgen.cjs", import.meta.url));
 const mockNativeAddon = fileURLToPath(new URL("./fixtures/mock-native-addon.cjs", import.meta.url));
 const mockObscuraCore = fileURLToPath(new URL("./fixtures/mock-obscura-core.cjs", import.meta.url));
+const mockStatefulCore = fileURLToPath(new URL("./fixtures/mock-stateful-core.cjs", import.meta.url));
 const mockObscuraCoreLegacy = fileURLToPath(new URL("./fixtures/mock-obscura-core-legacy.cjs", import.meta.url));
 const mockObscuraCoreMissingAbi = fileURLToPath(
   new URL("./fixtures/mock-obscura-core-missing-abi.cjs", import.meta.url),
@@ -244,12 +250,27 @@ test("bridges ObscuraCore queries into the persistent host V8 document facade", 
       loaded: true,
       generation: 1,
       disposed: 0,
+      realm: "legacy",
       api: {
         querySnapshot: "querySnapshot",
         queryText: "queryText",
         queryHtml: "query_html",
         documentElementHtml: "documentElementHtml",
+        domOp: null,
+        domBatch: null,
+        pageRevision: null,
+        documentHandle: null,
+        setDocumentMetadata: null,
         dispose: "free",
+      },
+      page: { revision: null, documentHandle: null },
+      bootstrap: {
+        host: "node-vm",
+        domTransport: "synchronous-op-dom",
+        source: "checkout-default",
+        compiled: false,
+        fullBrowser: false,
+        denoIntegration: false,
       },
     });
     assert.equal(
@@ -330,6 +351,316 @@ test("retains the legacy two-call query bridge fallback", async () => {
     assert.equal((await worker.bridgeStatus()).api.querySnapshot, null);
   } finally {
     await worker.close();
+  }
+});
+
+test("executes bounded stateful DOM batches with synchronized page identity", async () => {
+  const worker = await WasmV8Worker.launch(mockStatefulCore);
+  try {
+    const html = "<!doctype html><html><body><main id='app'><h1>before</h1></main></body></html>";
+    const opened = await worker.bridgeDomBatch(
+      [
+        ["document_url", "", ""],
+        ["document_referrer", "", ""],
+        ["document_encoding", "", ""],
+        ["document_node_id", "", ""],
+        ["query_selector", "h1", ""],
+      ],
+      {
+        html,
+        documentMetadata: {
+          url: "https://example.test/page",
+          referrer: "https://referrer.test/",
+          encoding: "windows-1252",
+        },
+      },
+    );
+    assert.equal(opened.generation, 1);
+    assert.equal(opened.revision, 0);
+    assert.ok(opened.documentHandle > 0);
+    assert.deepEqual(opened.results.slice(0, 3), [
+      '"https://example.test/page"',
+      '"https://referrer.test/"',
+      '"windows-1252"',
+    ]);
+    assert.equal(opened.results[3], String(opened.documentHandle));
+    const headingHandle = opened.results[4];
+    assert.ok(Number(headingHandle) > 0);
+
+    const mutation = await worker.bridgeDomBatch(
+      [
+        ["text_content", headingHandle, ""],
+        ["set_text_content", headingHandle, "after"],
+        ["text_content", headingHandle, ""],
+        ["outer_html", headingHandle, ""],
+      ],
+      {
+        expectedGeneration: opened.generation,
+        expectedDocumentHandle: opened.documentHandle,
+        expectedRevision: opened.revision,
+      },
+    );
+    assert.deepEqual(mutation.results, ['"before"', "null", '"after"', '"<h1>after</h1>"']);
+    assert.ok(mutation.revision > opened.revision);
+    assert.equal(mutation.documentHandle, opened.documentHandle);
+
+    await assert.rejects(
+      worker.bridgeDomOp("text_content", headingHandle, "", {
+        expectedGeneration: opened.generation,
+        expectedDocumentHandle: opened.documentHandle,
+        expectedRevision: opened.revision,
+      }),
+      { code: "ERR_OBSCURA_STALE_PAGE", message: /Expected Obscura page revision/ },
+    );
+    const single = await worker.bridgeDomOp("text_content", headingHandle, "", {
+      expectedGeneration: mutation.generation,
+      expectedDocumentHandle: mutation.documentHandle,
+      expectedRevision: mutation.revision,
+    });
+    assert.equal(single.result, '"after"');
+    assert.equal(single.revision, mutation.revision);
+    const status = await worker.bridgeStatus();
+    assert.equal(status.realm, null);
+    assert.equal(status.page.revision, mutation.revision);
+    assert.equal(status.page.documentHandle, opened.documentHandle);
+    assert.equal(status.api.domOp, "domOp");
+    assert.equal(status.api.domBatch, "domBatch");
+    assert.equal(status.api.setDocumentMetadata, "setDocumentMetadata");
+
+    const replaced = await worker.bridgeDomBatch([["query_selector", "h1", ""]], {
+      html: "<html><body><h1>replacement</h1></body></html>",
+    });
+    assert.equal(replaced.generation, 2);
+    assert.equal((await worker.bridgeStatus()).disposed, 1);
+  } finally {
+    await worker.close();
+  }
+});
+
+test("enforces the stateful bridge batch and metadata bounds before dispatch", async () => {
+  const worker = await WasmV8Worker.launch(mockStatefulCore);
+  try {
+    await assert.rejects(
+      worker.bridgeDomBatch(Array.from({ length: MAX_DOM_BATCH_OPERATIONS + 1 }, () => ["document_url", "", ""])),
+      /operation ABI limit/,
+    );
+    await assert.rejects(worker.bridgeDomBatch([["document_url", ""]]), /exact three-string tuple/);
+    await assert.rejects(worker.bridgeDomBatch([["document_url", 1, ""]]), /arg1 must be a string/);
+    await assert.rejects(
+      worker.bridgeDomOp("document_url", "", "", { expectedDocumentHandle: 0 }),
+      /expectedDocumentHandle must be non-zero/,
+    );
+    await assert.rejects(
+      worker.bridgeDomBatch([["document_url", "", ""]], {
+        html: "<html><body></body></html>",
+        documentMetadata: { url: "x".repeat(MAX_DOCUMENT_METADATA_BYTES + 1) },
+      }),
+      /document URL exceeds/,
+    );
+    const result = await worker.bridgeDomBatch([], { html: "<html><body></body></html>" });
+    assert.deepEqual(result.results, []);
+  } finally {
+    await worker.close();
+  }
+});
+
+test("negotiates stateful bridge sub-ABIs before accepting their wire contracts", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "obscura-stateful-abi-"));
+  const variants = [
+    ["stable-handles", { stableNodeHandles: false }, /stableNodeHandles=true/],
+    ["dom-op", { domOpAbiVersion: 2 }, /dom_op\/domOp requires ABI version 1/],
+    ["dom-batch", { domBatchAbiVersion: 2 }, /dom_batch\/domBatch requires ABI version 1/],
+  ];
+  for (const [name, override, expected] of variants) {
+    const modulePath = join(directory, `${name}.cjs`);
+    await writeFile(
+      modulePath,
+      `const base = require(${JSON.stringify(mockStatefulCore)});\n` +
+        `module.exports = { ...base, probe() { return JSON.stringify({ ...JSON.parse(base.probe()), ...${JSON.stringify(override)} }); } };\n`,
+    );
+    const worker = await WasmV8Worker.launch(modulePath);
+    try {
+      await assert.rejects(
+        worker.bridgeDomBatch([], { html: "<html><body></body></html>" }),
+        { code: "ERR_OBSCURA_WASM_DOM_ABI", message: expected },
+      );
+      assert.equal((await worker.bridgeStatus()).loaded, false);
+    } finally {
+      await worker.close();
+    }
+  }
+
+  const metadataModule = join(directory, "metadata.cjs");
+  await writeFile(
+    metadataModule,
+    `const base = require(${JSON.stringify(mockStatefulCore)});\n` +
+      `module.exports = { ...base, probe() { return JSON.stringify({ ...JSON.parse(base.probe()), documentMetadataAbiVersion: 2 }); } };\n`,
+  );
+  const metadataWorker = await WasmV8Worker.launch(metadataModule);
+  try {
+    await assert.rejects(
+      metadataWorker.bridgeDomBatch([], {
+        html: "<html><body></body></html>",
+        documentMetadata: { url: "https://example.test/" },
+      }),
+      { code: "ERR_OBSCURA_WASM_DOM_ABI", message: /document metadata requires ABI version 1/ },
+    );
+    assert.equal((await metadataWorker.bridgeStatus()).loaded, false);
+  } finally {
+    await metadataWorker.close();
+  }
+});
+
+test("keeps the current page when a replacement exposes an invalid document identity", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "obscura-invalid-identity-"));
+  const modulePath = join(directory, "invalid-second-document.cjs");
+  await writeFile(
+    modulePath,
+    `const base = require(${JSON.stringify(mockStatefulCore)});\n` +
+      `let constructions = 0;\n` +
+      `class InvalidSecondDocument extends base.ObscuraCore {\n` +
+      `  constructor(html) { super(html); this.invalidIdentity = ++constructions === 2; }\n` +
+      `  documentHandle() { return this.invalidIdentity ? 0 : super.documentHandle(); }\n` +
+      `}\n` +
+      `module.exports = { ...base, ObscuraCore: InvalidSecondDocument };\n`,
+  );
+  const worker = await WasmV8Worker.launch(modulePath);
+  try {
+    const opened = await worker.bridgeDomBatch([["query_selector", "h1", ""]], {
+      html: "<html><body><h1>kept</h1></body></html>",
+    });
+    await assert.rejects(
+      worker.bridgeDomBatch([], { html: "<html><body><h1>invalid</h1></body></html>" }),
+      /document handle must be non-zero/,
+    );
+    const status = await worker.bridgeStatus();
+    assert.equal(status.generation, opened.generation);
+    assert.equal(status.disposed, 0);
+    assert.equal(status.page.documentHandle, opened.documentHandle);
+    assert.equal((await worker.bridgeDomOp("text_content", opened.results[0], "")).result, '"kept"');
+  } finally {
+    await worker.close();
+  }
+});
+
+test("runs the production bootstrap against the stateful op_dom bridge", async () => {
+  const worker = await WasmV8Worker.launch(mockStatefulCore);
+  try {
+    const html = "<!doctype html><html><body><main id='app'><h1>before</h1></main></body></html>";
+    assert.deepEqual(
+      await worker.bootstrapEvaluate(
+        `(() => {
+          const first = document.querySelector("h1");
+          const second = document.querySelector("h1");
+          first.textContent = "after";
+          return {
+            sameWrapper: first === second,
+            text: first.textContent,
+            html: first.outerHTML,
+            url: document.URL,
+            referrer: document.referrer,
+            encoding: document.characterSet,
+            hiddenBinding: typeof globalThis.__obscuraHostDomOpBridge__,
+            hostEscape: Deno.core.ops.op_dom.constructor("return typeof process")(),
+            optionalLayout: typeof Deno.core.ops.op_layout_geometry,
+            asyncRuntime: Deno.core.ops.op_async_runtime_available(),
+          };
+        })()`,
+        {
+          html,
+          bootstrapTimeoutMs: 10_000,
+          requestTimeoutMs: 20_000,
+          documentMetadata: {
+            url: "https://example.test/bootstrap",
+            referrer: "https://referrer.test/",
+            encoding: "UTF-8",
+          },
+        },
+      ),
+      {
+        sameWrapper: true,
+        text: "after",
+        html: "<h1>after</h1>",
+        url: "https://example.test/bootstrap",
+        referrer: "https://referrer.test/",
+        encoding: "UTF-8",
+        hiddenBinding: "undefined",
+        hostEscape: "undefined",
+        optionalLayout: "undefined",
+        asyncRuntime: false,
+      },
+    );
+    assert.match(
+      await worker.bootstrapEvaluate("document.documentElement.outerHTML"),
+      /<h1>after<\/h1>/,
+    );
+    assert.equal((await worker.bridgeStatus()).realm, "bootstrap");
+
+    await assert.rejects(
+      worker.bootstrapEvaluate("document.querySelector({ toString() { while (true) {} } })", {
+        timeoutMs: 20,
+        requestTimeoutMs: 2_000,
+      }),
+      /timed out/,
+    );
+    assert.equal(await worker.bootstrapEvaluate("document.querySelector('h1').textContent"), "after");
+
+    assert.equal(
+      await worker.bootstrapEvaluate("document.querySelector('h1').textContent", {
+        html: "<html><body><h1>next page</h1></body></html>",
+        bootstrapTimeoutMs: 10_000,
+        requestTimeoutMs: 20_000,
+      }),
+      "next page",
+    );
+    const status = await worker.bridgeStatus();
+    assert.equal(status.generation, 2);
+    assert.equal(status.disposed, 1);
+    assert.equal(status.realm, "bootstrap");
+  } finally {
+    await worker.close();
+  }
+});
+
+test("bootstrap initialization failures discard the partial realm deterministically", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "obscura-invalid-bootstrap-"));
+  const invalidBootstrap = join(directory, "invalid-bootstrap.js");
+  await writeFile(invalidBootstrap, "globalThis.partialBootstrapState = 42;\n");
+  const worker = await WasmV8Worker.launch(mockStatefulCore, { bootstrapPath: invalidBootstrap });
+  try {
+    const options = {
+      html: "<html><body><h1>failure</h1></body></html>",
+      bootstrapTimeoutMs: 1_000,
+      requestTimeoutMs: 5_000,
+    };
+    await assert.rejects(worker.bootstrapEvaluate("1", options), /did not install __obscura_init/);
+    assert.equal((await worker.bridgeStatus()).realm, null);
+    assert.deepEqual(await worker.hostEvaluate("[typeof Deno, typeof document, typeof partialBootstrapState]"), [
+      "undefined",
+      "undefined",
+      "undefined",
+    ]);
+    await assert.rejects(worker.bootstrapEvaluate("1", { bootstrapTimeoutMs: 1_000 }), /did not install __obscura_init/);
+    assert.equal((await worker.bridgeStatus()).realm, null);
+  } finally {
+    await worker.close();
+  }
+
+  const missing = await WasmV8Worker.launch(mockStatefulCore, {
+    bootstrapPath: join(directory, "missing-bootstrap.js"),
+  });
+  try {
+    await assert.rejects(
+      missing.bootstrapEvaluate("1", {
+        html: "<html><body></body></html>",
+        bootstrapTimeoutMs: 1_000,
+        requestTimeoutMs: 5_000,
+      }),
+      { code: "ENOENT", message: /Unable to load Obscura bootstrap source/ },
+    );
+    assert.equal((await missing.bridgeStatus()).realm, null);
+  } finally {
+    await missing.close();
   }
 });
 

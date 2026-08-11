@@ -1,8 +1,16 @@
 import vm from "node:vm";
+import { readFile } from "node:fs/promises";
+import { fileURLToPath } from "node:url";
 import { parentPort, workerData, threadId } from "node:worker_threads";
 
+import { compileBootstrapRuntime } from "./bootstrap-runtime.mjs";
 import { loadModule } from "./module-loader.mjs";
 import {
+  MAX_DOCUMENT_METADATA_BYTES,
+  MAX_DOM_ARGUMENT_BYTES,
+  MAX_DOM_BATCH_BYTES,
+  MAX_DOM_BATCH_OPERATIONS,
+  MAX_DOM_COMMAND_BYTES,
   MAX_HTML_INPUT_BYTES,
   MAX_RETURNED_STRING_BYTES,
   MAX_SELECTOR_BYTES,
@@ -31,7 +39,15 @@ const QUERY_TEXT_NAMES = ["query_text", "queryText"];
 const QUERY_HTML_NAMES = ["query_html", "queryHtml"];
 const QUERY_SNAPSHOT_NAMES = ["query_snapshot", "querySnapshot"];
 const DOCUMENT_ELEMENT_HTML_NAMES = ["document_element_html", "documentElementHtml"];
+const DOM_OP_NAMES = ["dom_op", "domOp"];
+const DOM_BATCH_NAMES = ["dom_batch", "domBatch"];
+const PAGE_REVISION_NAMES = ["page_revision", "pageRevision"];
+const DOCUMENT_HANDLE_NAMES = ["document_handle", "documentHandle"];
+const SET_DOCUMENT_METADATA_NAMES = ["set_document_metadata", "setDocumentMetadata"];
 const REQUIRED_CORE_ABI_VERSION = 1;
+const REQUIRED_DOM_OP_ABI_VERSION = 1;
+const REQUIRED_DOM_BATCH_ABI_VERSION = 1;
+const REQUIRED_DOCUMENT_METADATA_ABI_VERSION = 1;
 const MAX_VM_TIMEOUT_MS = 4_294_967_295;
 const QUERY_BINDING = "__obscuraHostQueryElement__";
 const DOCUMENT_HTML_BINDING = "__obscuraHostDocumentHtml__";
@@ -41,6 +57,9 @@ const MAX_BOUNDED_GRAPH_NODES = 50_000;
 const MAX_BOUNDED_GRAPH_PROPERTIES = 100_000;
 const MAX_BOUNDED_GRAPH_DEPTH = 256;
 const MAX_BOUNDED_ARRAY_LENGTH = 100_000;
+const DEFAULT_BOOTSTRAP_PATH = fileURLToPath(
+  new URL("../../../crates/obscura-js/js/bootstrap.js", import.meta.url),
+);
 const installBoundedEvaluateScript = new vm.Script(
   `(() => {
     "use strict";
@@ -303,9 +322,14 @@ let target;
 let metadata;
 let persistentRuntime;
 let hostContext;
+let bridgeRealmKind = null;
 let bridgeCore;
 let bridgeGeneration = 0;
 let bridgeDisposed = 0;
+let bridgeDocumentHandle = null;
+let bridgePageRevision = null;
+let compiledBootstrapRuntime;
+let bridgeCapabilityProbePromise;
 let shuttingDown = false;
 
 function propertyNames(value) {
@@ -636,6 +660,25 @@ function getHostContext() {
   return hostContext;
 }
 
+async function getCompiledBootstrapRuntime() {
+  if (compiledBootstrapRuntime) return compiledBootstrapRuntime;
+  const bootstrapPath = workerData.bootstrapPath ?? DEFAULT_BOOTSTRAP_PATH;
+  let source;
+  try {
+    source = await readFile(bootstrapPath, "utf8");
+  } catch (cause) {
+    const origin = workerData.bootstrapPath ? "configured bootstrapPath" : "checkout-default bootstrap path";
+    const error = new Error(
+      `Unable to load Obscura bootstrap source from ${origin} ${bootstrapPath}; pass bootstrapPath when the harness is packaged outside the repository checkout`,
+      { cause },
+    );
+    error.code = cause?.code ?? "ERR_OBSCURA_BOOTSTRAP_SOURCE";
+    throw error;
+  }
+  compiledBootstrapRuntime = compileBootstrapRuntime(source, { filename: bootstrapPath });
+  return compiledBootstrapRuntime;
+}
+
 function hostEvaluate(source, timeoutMs = 1_000) {
   const script = boundedEvaluateScript(source, "obscura-evaluate.js");
   return runBoundedEvaluate(script, getHostContext(), timeoutMs, "hostEvaluate");
@@ -652,8 +695,224 @@ function bridgeApi(core = bridgeCore) {
     queryText: member(core, QUERY_TEXT_NAMES),
     queryHtml: member(core, QUERY_HTML_NAMES),
     documentElementHtml: member(core, DOCUMENT_ELEMENT_HTML_NAMES),
+    domOp: member(core, DOM_OP_NAMES),
+    domBatch: member(core, DOM_BATCH_NAMES),
+    pageRevision: member(core, PAGE_REVISION_NAMES),
+    documentHandle: member(core, DOCUMENT_HANDLE_NAMES),
+    setDocumentMetadata: member(core, SET_DOCUMENT_METADATA_NAMES),
     dispose: member(core, DISPOSE_NAMES),
   };
+}
+
+function bridgeAbiError(message) {
+  const error = new Error(message);
+  error.code = "ERR_OBSCURA_WASM_DOM_ABI";
+  return error;
+}
+
+async function getBridgeCapabilityProbe() {
+  if (bridgeCapabilityProbePromise) return bridgeCapabilityProbePromise;
+  bridgeCapabilityProbePromise = (async () => {
+    const probe = member(target, PROBE_NAMES);
+    if (!probe) return null;
+    const serialized = await probe.fn();
+    let capabilities = serialized;
+    if (typeof serialized === "string") {
+      try {
+        capabilities = JSON.parse(serialized);
+      } catch {
+        throw bridgeAbiError("ObscuraCore stateful bridge probe returned malformed JSON");
+      }
+    }
+    if (capabilities === null || typeof capabilities !== "object" || Array.isArray(capabilities)) {
+      throw bridgeAbiError("ObscuraCore stateful bridge probe must return an object");
+    }
+    return capabilities;
+  })();
+  return bridgeCapabilityProbePromise;
+}
+
+async function requireStatefulBridgeCompatibility(api) {
+  const capabilities = await getBridgeCapabilityProbe();
+  if (!capabilities) {
+    throw bridgeAbiError("ObscuraCore stateful bridge requires a machine-readable capability probe");
+  }
+  if (capabilities.stableNodeHandles !== true) {
+    throw bridgeAbiError("ObscuraCore stateful bridge requires stableNodeHandles=true");
+  }
+  if (api.domOp && capabilities.domOpAbiVersion !== REQUIRED_DOM_OP_ABI_VERSION) {
+    throw bridgeAbiError(
+      `ObscuraCore dom_op/domOp requires ABI version ${REQUIRED_DOM_OP_ABI_VERSION}, but the probe exposes ${String(capabilities.domOpAbiVersion)}`,
+    );
+  }
+  if (api.domBatch && capabilities.domBatchAbiVersion !== REQUIRED_DOM_BATCH_ABI_VERSION) {
+    throw bridgeAbiError(
+      `ObscuraCore dom_batch/domBatch requires ABI version ${REQUIRED_DOM_BATCH_ABI_VERSION}, but the probe exposes ${String(capabilities.domBatchAbiVersion)}`,
+    );
+  }
+}
+
+async function requireDocumentMetadataCompatibility(api) {
+  const capabilities = await getBridgeCapabilityProbe();
+  if (capabilities?.documentMetadataAbiVersion !== REQUIRED_DOCUMENT_METADATA_ABI_VERSION) {
+    throw bridgeAbiError(
+      `ObscuraCore document metadata requires ABI version ${REQUIRED_DOCUMENT_METADATA_ABI_VERSION}, but the probe exposes ${String(capabilities?.documentMetadataAbiVersion)}`,
+    );
+  }
+  if (!api.setDocumentMetadata) {
+    throw bridgeAbiError("ObscuraCore does not expose set_document_metadata/setDocumentMetadata");
+  }
+}
+
+function requireUnsignedU32(value, label) {
+  if (!Number.isSafeInteger(value) || value < 0 || value > 0xffff_ffff) {
+    throw new TypeError(`${label} must return an unsigned 32-bit integer`);
+  }
+  return value;
+}
+
+function statefulBridgeApi(core = requireBridgeCore()) {
+  const api = bridgeApi(core);
+  if ((!api.domOp && !api.domBatch) || !api.pageRevision || !api.documentHandle) {
+    throw new Error(
+      "ObscuraCore stateful bridge requires dom_op/domOp or dom_batch/domBatch, plus page_revision/pageRevision and document_handle/documentHandle",
+    );
+  }
+  return api;
+}
+
+function readBridgeIdentity(core = requireBridgeCore(), api = statefulBridgeApi(core)) {
+  const revision = requireUnsignedU32(syncCall(api.pageRevision), "ObscuraCore page revision");
+  const documentHandle = requireUnsignedU32(syncCall(api.documentHandle), "ObscuraCore document handle");
+  if (documentHandle === 0) throw new TypeError("ObscuraCore document handle must be non-zero");
+  return { revision, documentHandle };
+}
+
+function synchronizeBridgeIdentity(expectedGeneration = bridgeGeneration, expectedDocumentHandle = bridgeDocumentHandle) {
+  if (!bridgeCore || expectedGeneration !== bridgeGeneration) {
+    throw new Error("Stale Obscura document bridge");
+  }
+  const identity = readBridgeIdentity();
+  if (expectedDocumentHandle !== null && identity.documentHandle !== expectedDocumentHandle) {
+    throw new Error("Stale Obscura document handle");
+  }
+  bridgePageRevision = identity.revision;
+  bridgeDocumentHandle = identity.documentHandle;
+  return identity;
+}
+
+function stalePageError(message) {
+  const error = new Error(message);
+  error.code = "ERR_OBSCURA_STALE_PAGE";
+  return error;
+}
+
+function requireExpectedPage(value) {
+  if (value === undefined) return;
+  if (value === null || typeof value !== "object" || Array.isArray(value)) {
+    throw new TypeError("expectedPage must be an object");
+  }
+  const { generation, documentHandle, revision } = value;
+  if (generation !== undefined && (!Number.isSafeInteger(generation) || generation < 0)) {
+    throw new TypeError("expectedPage generation must be a non-negative safe integer");
+  }
+  if (documentHandle !== undefined) {
+    requireUnsignedU32(documentHandle, "expectedPage document handle");
+    if (documentHandle === 0) throw new TypeError("expectedPage document handle must be non-zero");
+  }
+  if (revision !== undefined) requireUnsignedU32(revision, "expectedPage revision");
+  if (generation !== undefined && generation !== bridgeGeneration) {
+    throw stalePageError(`Expected Obscura bridge generation ${generation}, but the current generation is ${bridgeGeneration}`);
+  }
+  const identity = synchronizeBridgeIdentity();
+  if (documentHandle !== undefined && documentHandle !== identity.documentHandle) {
+    throw stalePageError(
+      `Expected Obscura document handle ${documentHandle}, but the current handle is ${identity.documentHandle}`,
+    );
+  }
+  if (revision !== undefined && revision !== identity.revision) {
+    throw stalePageError(`Expected Obscura page revision ${revision}, but the current revision is ${identity.revision}`);
+  }
+}
+
+function requireDomOperation(operation, index) {
+  if (!Array.isArray(operation) || operation.length !== 3) {
+    throw new TypeError(`DOM batch operation ${index} must be an exact three-string tuple`);
+  }
+  const [command, arg1, arg2] = operation;
+  requireBoundedString(command, MAX_DOM_COMMAND_BYTES, `DOM batch operation ${index} command`);
+  requireBoundedString(arg1, MAX_DOM_ARGUMENT_BYTES, `DOM batch operation ${index} arg1`);
+  requireBoundedString(arg2, MAX_DOM_ARGUMENT_BYTES, `DOM batch operation ${index} arg2`);
+  return [command, arg1, arg2];
+}
+
+function encodeDomBatchRequest(operations) {
+  if (!Array.isArray(operations)) throw new TypeError("DOM batch operations must be an array");
+  if (operations.length > MAX_DOM_BATCH_OPERATIONS) {
+    throw new RangeError(`DOM batch exceeds the ${MAX_DOM_BATCH_OPERATIONS}-operation ABI limit`);
+  }
+  const normalized = operations.map(requireDomOperation);
+  const request = JSON.stringify(normalized);
+  requireBoundedString(request, MAX_DOM_BATCH_BYTES, "DOM batch request");
+  return { normalized, request };
+}
+
+function decodeDomBatchResponse(serialized, expectedLength) {
+  requireBoundedString(serialized, MAX_RETURNED_STRING_BYTES, "DOM batch response");
+  let results;
+  try {
+    results = JSON.parse(serialized);
+  } catch {
+    throw new TypeError("ObscuraCore dom_batch/domBatch returned malformed JSON");
+  }
+  if (!Array.isArray(results) || results.length !== expectedLength) {
+    throw new TypeError("ObscuraCore dom_batch/domBatch returned the wrong number of results");
+  }
+  for (let index = 0; index < results.length; index += 1) {
+    requireBoundedString(results[index], MAX_RETURNED_STRING_BYTES, `DOM batch result ${index}`);
+  }
+  return results;
+}
+
+function domBatch(operations, expectedGeneration = bridgeGeneration, expectedDocumentHandle = bridgeDocumentHandle) {
+  const { normalized, request } = encodeDomBatchRequest(operations);
+  synchronizeBridgeIdentity(expectedGeneration, expectedDocumentHandle);
+  const api = statefulBridgeApi();
+  let results;
+  if (api.domBatch) {
+    results = decodeDomBatchResponse(syncCall(api.domBatch, request), normalized.length);
+  } else {
+    results = normalized.map(([command, arg1, arg2], index) => {
+      const value = syncCall(api.domOp, command, arg1, arg2);
+      return requireBoundedString(value, MAX_RETURNED_STRING_BYTES, `DOM operation result ${index}`);
+    });
+  }
+  const identity = synchronizeBridgeIdentity(expectedGeneration, expectedDocumentHandle);
+  return { results, ...identity };
+}
+
+function domOperation(command, arg1, arg2, expectedGeneration = bridgeGeneration, expectedDocumentHandle = bridgeDocumentHandle) {
+  [command, arg1, arg2] = requireDomOperation([command, arg1, arg2], 0);
+  // Prefer the single-operation entry point for bootstrap's synchronous hot
+  // path. A batch-only core remains compatible through an exact one-record
+  // request without changing the native op_dom string contract.
+  synchronizeBridgeIdentity(expectedGeneration, expectedDocumentHandle);
+  const api = statefulBridgeApi();
+  let result;
+  if (api.domOp) {
+    result = requireBoundedString(
+      syncCall(api.domOp, command, arg1, arg2),
+      MAX_RETURNED_STRING_BYTES,
+      "DOM operation result",
+    );
+  } else {
+    [result] = decodeDomBatchResponse(
+      syncCall(api.domBatch, encodeDomBatchRequest([[command, arg1, arg2]]).request),
+      1,
+    );
+  }
+  synchronizeBridgeIdentity(expectedGeneration, expectedDocumentHandle);
+  return result;
 }
 
 function requireBridgeCore() {
@@ -749,8 +1008,14 @@ function bridgeResponse(generation, call) {
 }
 
 function installDocumentFacade() {
+  if (bridgeRealmKind === "bootstrap") {
+    throw new Error("The bootstrap page realm cannot install the legacy document facade");
+  }
   const context = getHostContext();
-  if (Object.hasOwn(context, "document")) return;
+  if (Object.hasOwn(context, "document")) {
+    bridgeRealmKind = "legacy";
+    return;
+  }
   const generation = bridgeGeneration;
   Object.defineProperties(context, {
     [QUERY_BINDING]: {
@@ -766,19 +1031,24 @@ function installDocumentFacade() {
     installDocumentFacadeScript.runInContext(context, { timeout: 1_000 });
   } catch (error) {
     hostContext = null;
+    bridgeRealmKind = null;
     throw error;
   } finally {
     Reflect.deleteProperty(context, QUERY_BINDING);
     Reflect.deleteProperty(context, DOCUMENT_HTML_BINDING);
   }
+  bridgeRealmKind = "legacy";
 }
 
 async function disposeBridgeCore() {
   const core = bridgeCore;
   bridgeCore = null;
+  bridgeDocumentHandle = null;
+  bridgePageRevision = null;
   // Loading or releasing a document is a page boundary. Discard the old V8
   // realm so globals and queued microtask state cannot leak into the next page.
   hostContext = null;
+  bridgeRealmKind = null;
   if (!core) return null;
   const dispose = member(core, DISPOSE_NAMES);
   if (!dispose) return null;
@@ -787,7 +1057,32 @@ async function disposeBridgeCore() {
   return dispose.name;
 }
 
-async function replaceBridgeCore(html) {
+function normalizeDocumentMetadata(value) {
+  if (value === undefined) return null;
+  if (value === null || typeof value !== "object" || Array.isArray(value)) {
+    throw new TypeError("documentMetadata must be an object");
+  }
+  const metadata = {
+    url: value.url ?? "about:blank",
+    referrer: value.referrer ?? "",
+    encoding: value.encoding ?? "UTF-8",
+  };
+  requireBoundedString(metadata.url, MAX_DOCUMENT_METADATA_BYTES, "document URL");
+  requireBoundedString(metadata.referrer, MAX_DOCUMENT_METADATA_BYTES, "document referrer");
+  requireBoundedString(metadata.encoding, MAX_DOCUMENT_METADATA_BYTES, "document encoding");
+  return metadata;
+}
+
+async function applyDocumentMetadata(core, metadata) {
+  metadata = normalizeDocumentMetadata(metadata);
+  if (!metadata) return false;
+  const api = bridgeApi(core);
+  await requireDocumentMetadataCompatibility(api);
+  syncCall(api.setDocumentMetadata, metadata.url, metadata.referrer, metadata.encoding);
+  return true;
+}
+
+async function replaceBridgeCore(html, documentMetadata) {
   const constructor = member(target, ["ObscuraCore"]);
   if (!constructor) {
     throw new Error("Module has no ObscuraCore constructor");
@@ -796,11 +1091,37 @@ async function replaceBridgeCore(html) {
   const next = new constructor.fn(html);
   const nextApi = bridgeApi(next);
   const hasQueryApi = nextApi.querySnapshot || (nextApi.queryText && nextApi.queryHtml);
-  if (!hasQueryApi || !nextApi.documentElementHtml || !nextApi.dispose) {
+  const hasAnyStatefulApi = Boolean(
+    nextApi.domOp || nextApi.domBatch || nextApi.pageRevision || nextApi.documentHandle,
+  );
+  const hasStatefulApi = Boolean(
+    (nextApi.domOp || nextApi.domBatch) && nextApi.pageRevision && nextApi.documentHandle,
+  );
+  if (
+    (!hasQueryApi && !hasStatefulApi) ||
+    (hasQueryApi && !nextApi.documentElementHtml) ||
+    (hasAnyStatefulApi && !hasStatefulApi) ||
+    !nextApi.dispose
+  ) {
     await disposeRuntime(next);
     throw new Error(
-      "ObscuraCore must expose query_snapshot/querySnapshot or the query_text/queryText and query_html/queryHtml pair, plus document_element_html/documentElementHtml and free/dispose",
+      "ObscuraCore must expose a complete legacy query bridge or a complete stateful dom_op/dom_batch bridge, plus free/dispose",
     );
+  }
+  let nextIdentity = null;
+  try {
+    if (hasStatefulApi) {
+      await requireStatefulBridgeCompatibility(nextApi);
+    }
+    await applyDocumentMetadata(next, documentMetadata);
+    if (hasStatefulApi) nextIdentity = readBridgeIdentity(next, nextApi);
+  } catch (error) {
+    try {
+      await disposeRuntime(next);
+    } catch (cleanupError) {
+      throw new AggregateError([error, cleanupError], "Invalid document metadata cleanup failed");
+    }
+    throw error;
   }
   try {
     await disposeBridgeCore();
@@ -814,29 +1135,121 @@ async function replaceBridgeCore(html) {
   }
   bridgeCore = next;
   bridgeGeneration += 1;
-  installDocumentFacade();
+  if (nextIdentity) {
+    bridgeDocumentHandle = nextIdentity.documentHandle;
+    bridgePageRevision = nextIdentity.revision;
+  }
 }
 
 function bridgeStatus() {
   const api = bridgeCore ? bridgeApi() : {};
+  if (bridgeCore && (api.domOp || api.domBatch)) synchronizeBridgeIdentity();
   return {
     loaded: Boolean(bridgeCore),
     generation: bridgeGeneration,
     disposed: bridgeDisposed,
+    realm: bridgeRealmKind,
     api: {
       querySnapshot: api.querySnapshot?.name ?? null,
       queryText: api.queryText?.name ?? null,
       queryHtml: api.queryHtml?.name ?? null,
       documentElementHtml: api.documentElementHtml?.name ?? null,
+      domOp: api.domOp?.name ?? null,
+      domBatch: api.domBatch?.name ?? null,
+      pageRevision: api.pageRevision?.name ?? null,
+      documentHandle: api.documentHandle?.name ?? null,
+      setDocumentMetadata: api.setDocumentMetadata?.name ?? null,
       dispose: api.dispose?.name ?? null,
+    },
+    page: {
+      revision: bridgePageRevision,
+      documentHandle: bridgeDocumentHandle,
+    },
+    bootstrap: {
+      host: "node-vm",
+      domTransport: "synchronous-op-dom",
+      source: workerData.bootstrapPath ? "explicit-bootstrapPath" : "checkout-default",
+      compiled: Boolean(compiledBootstrapRuntime),
+      fullBrowser: false,
+      denoIntegration: false,
     },
   };
 }
 
-async function bridgeEvaluate({ html, source, timeoutMs = 1_000 } = {}) {
-  if (html !== undefined) await replaceBridgeCore(html);
+async function bridgeEvaluate({ html, source, timeoutMs = 1_000, documentMetadata } = {}) {
+  if (html !== undefined) await replaceBridgeCore(html, documentMetadata);
+  else if (documentMetadata !== undefined) await applyDocumentMetadata(requireBridgeCore(), documentMetadata);
   requireBridgeCore();
   installDocumentFacade();
+  return hostEvaluate(source, timeoutMs);
+}
+
+async function bridgeDomBatch({ html, operations, documentMetadata, expectedPage } = {}) {
+  requireExpectedPage(expectedPage);
+  if (html !== undefined) await replaceBridgeCore(html, documentMetadata);
+  else if (documentMetadata !== undefined) await applyDocumentMetadata(requireBridgeCore(), documentMetadata);
+  requireBridgeCore();
+  const generation = bridgeGeneration;
+  const documentHandle = bridgeDocumentHandle;
+  const result = domBatch(operations, generation, documentHandle);
+  return { generation, documentHandle: result.documentHandle, revision: result.revision, results: result.results };
+}
+
+async function bridgeDomOperation({ html, command, arg1, arg2, documentMetadata, expectedPage } = {}) {
+  requireExpectedPage(expectedPage);
+  if (html !== undefined) await replaceBridgeCore(html, documentMetadata);
+  else if (documentMetadata !== undefined) await applyDocumentMetadata(requireBridgeCore(), documentMetadata);
+  requireBridgeCore();
+  const generation = bridgeGeneration;
+  const documentHandle = bridgeDocumentHandle;
+  const result = domOperation(command, arg1, arg2, generation, documentHandle);
+  return {
+    generation,
+    documentHandle: bridgeDocumentHandle,
+    revision: bridgePageRevision,
+    result,
+  };
+}
+
+async function installBootstrapRealm(timeoutMs = 5_000) {
+  requireBridgeCore();
+  statefulBridgeApi();
+  if (bridgeRealmKind === "bootstrap") return getHostContext();
+
+  // Bootstrap defines the browser global surface and therefore owns a fresh
+  // realm. Discard an uninitialized host/legacy context instead of merging
+  // globals with a page whose native wrappers belong to another lifecycle.
+  hostContext = null;
+  bridgeRealmKind = null;
+  const context = getHostContext();
+  const generation = bridgeGeneration;
+  const documentHandle = bridgeDocumentHandle;
+  try {
+    const runtime = await getCompiledBootstrapRuntime();
+    runtime.install(context, {
+      timeoutMs: vmTimeout(timeoutMs, 5_000),
+      opDom: (command, arg1, arg2) =>
+        domOperation(command, arg1, arg2, generation, documentHandle),
+    });
+    bridgeRealmKind = "bootstrap";
+    return context;
+  } catch (error) {
+    hostContext = null;
+    bridgeRealmKind = null;
+    throw error;
+  }
+}
+
+async function bootstrapEvaluate({
+  html,
+  source,
+  timeoutMs = 1_000,
+  bootstrapTimeoutMs = 5_000,
+  documentMetadata,
+} = {}) {
+  if (html !== undefined) await replaceBridgeCore(html, documentMetadata);
+  else if (documentMetadata !== undefined) await applyDocumentMetadata(requireBridgeCore(), documentMetadata);
+  await installBootstrapRealm(bootstrapTimeoutMs);
   return hostEvaluate(source, timeoutMs);
 }
 
@@ -968,6 +1381,7 @@ async function shutdown() {
     errors.push(error);
   }
   hostContext = null;
+  bridgeRealmKind = null;
   if (errors.length > 0) throw new AggregateError(errors, "Harness shutdown cleanup failed");
   return { closed: true };
 }
@@ -995,6 +1409,12 @@ async function dispatch(operation, payload) {
       return hostEvaluate(payload?.source, payload?.timeoutMs);
     case "bridgeEvaluate":
       return await bridgeEvaluate(payload);
+    case "bridgeDomBatch":
+      return await bridgeDomBatch(payload);
+    case "bridgeDomOperation":
+      return await bridgeDomOperation(payload);
+    case "bootstrapEvaluate":
+      return await bootstrapEvaluate(payload);
     case "bridgeStatus":
       return bridgeStatus();
     case "bridgeRelease":
