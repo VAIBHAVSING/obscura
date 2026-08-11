@@ -310,3 +310,108 @@ same revision before setting a performance target.
 
 Migration completion requires all phases. The current successful artifacts and
 tests do not satisfy the full-browser acceptance gates.
+
+
+---
+
+# 2026-08-11 follow-up: stateful WASM DOM bridge parity audit and tests (2026-08-11 16:28:24 UTC)
+
+Implementation commit: `2da61c9` on `wasm-node-migration` (parent
+`da3b1d4`); evidence commit `fbdc200`. Only `crates/obscura-wasm/src/lib.rs`
+changed (source), plus this memory file.
+
+## What changed
+
+1. Page revision now mirrors native `render_mutation_impact`:
+   `dom_op_inner` consults `mutation_effectiveness()` (pre-op state) and
+   advances `page_revision` only for effective mutations. No-op attribute
+   writes (same value / missing attribute), same-value text writes,
+   rejected cycle moves (append_child / insert_before mirror the tree's
+   host-including cycle guard via `ancestor_chain_contains`), and all
+   create/clone/template-content allocations never bump. Wire results
+   (`"true"`/`"false"`) are unchanged. Revision overflow fails safely
+   before mutating; read-only ops keep working at the boundary.
+2. `mod tests` grew from 4 to 39 tests:
+
+   - ABI: versions 1/1/1/1, `probe()` capabilities including the
+     previously-unasserted `documentMetadataAbiVersion`, document identity,
+     metadata round-trip, strict batch envelope validation.
+   - 63-command surface: canonical `ALL_DOM_COMMANDS` manifest
+     source-locked against the dispatcher arms (charset-validated,
+     sorted/deduped) plus a smoke test hitting every command and asserting
+     its contract shape.
+   - Handles: same-node stability, per-node uniqueness over a full BFS,
+     detached/reparented retention, clone uniqueness, set_html
+     invalidation of every previous handle, never-reuse across resets,
+     controlled errors for invalid/zero/stale handles, allocation overflow
+     fail-safe, cycle rejection + 3000-deep traversal termination, template
+     content fragment handles (lazy, stable, cloned, reset-invalidated).
+   - Revision: full matrix incl. no-op writes, already-last append,
+     already-immediately-before insert, cycle-rejected moves, element
+     textContent no-op, creation ops, set_html exactly once, batch
+     revision = effective ops only, overflow fail-safe.
+   - Parity: id index (detach cleans subtree ids, reparent restores via
+     fallback scan, plain remove_attribute leaves a stale entry and
+     rewrite-with-missing-attr cannot purge it - both native quirks
+     verified against ops.rs and tree.rs), namespace attributes, selector
+     error degradation, contains() self=false quirk, insert_before
+     (new, reference) argument order, connected/root semantics,
+     doctype/PI serialization and cloning, compare_order.
+   - Limits/failure: 1024/1025 batch ops (pre-execution rejection),
+     8MiB/64KiB/64-byte caps with UTF-8 byte-length semantics,
+     malformed/truncated/structurally-invalid batch JSON never applies a
+     prefix, reuse-after-failure, panic-boundary translation (js_sys
+     cannot construct errors on native test hosts; the panic arm is
+     asserted via the documented js_sys limitation and the real module
+     exercises the same arm on wasm32 in Node).
+
+## Verification evidence
+
+- `cargo-nextest nextest run --release -p obscura-wasm`: **39/39 PASS**.
+- `npm test --prefix node/wasm-v8-harness`: **34 pass, 0 fail, 3 skip**
+  (real-artifact tests skipped without env).
+- wasm32 release build:
+  `target/wasm32-unknown-unknown/release/obscura_wasm.wasm`,
+  1,497,297 bytes, sha256
+  `07df9e353f2b48bafacd74062ae0bb613a93d45803cea68242d50df42a30e09f`.
+- wasm-bindgen wrapper generated into `/workspaces/.obscura-wasm-pkg-stateful/`
+  (previously missing; `/workspaces/.obscura-wasm-pkg-final/` holds the
+  outdated wrapper).
+- Real-artifact suite
+  (`OBSCURA_REAL_WASM_MODULE=...stateful/obscura_wasm.js
+  OBSCURA_REAL_NATIVE_ADDON=/workspaces/obscura-node.node
+  npm run test:artifacts --prefix node/wasm-v8-harness`): **37/37 PASS**,
+  including the production-bootstrap-vs-stateful-bridge test, the real
+  wasm-bindgen ABI-1/SyntaxError test, and bridge ABI limit enforcement.
+- Disposable real-module check (`/tmp/real-module-verify.mjs`, not
+  committed): **42/42 PASS** - 8MiB/64KiB/1024-op byte boundaries (UTF-8
+  byte semantics), revision semantics through the wrapper, batch order +
+  effective revision, setDocumentMetadata identity stability, set_html
+  invalidation and document-handle never-reuse, id index reindex, doctype
+  nodeType.
+- Full gates (delegated subagent):
+  - `cargo-nextest nextest run --release --features render --no-fail-fast`:
+    **1434 passed, 4 skipped, 0 failed** (release compile 17m42s + 55.2s
+    exec); all 39 obscura-wasm tests included; zero wasm-related warnings.
+  - `CARGO_INCREMENTAL=0 CARGO_BUILD_JOBS=2 cargo build --release -p
+    obscura-cli --bins --features render`: exit 0, 2m28s;
+    `./target/release/obscura` 93,518,056 bytes, sha256
+    `c3c184b2cb531e7cc49bdf06e7d75bbac5b8029e3968451445c354aa0ea98a70`.
+- **External blocker**: the companion `obscura-benchmark` repository is not
+  present in this workspace, so the 33/33 obstacle course cannot run. It
+  must be reported as an unavailable gate, not a passed one.
+
+## Debugging note (real-module verification)
+
+Passing a JS number (e.g. `JSON.parse(...).nodeId`) instead of a string to
+`domOp` corrupts the wasm heap: wasm-bindgen's `passStringToWasm0` coerces
+it through `encodeInto` into a zero-length view, and the trap surfaces
+later as `__rdl_realloc: memory access out of bounds` in an unrelated call.
+Always `String(...)` handles before crossing the ABI. The module itself was
+not at fault; artifact tests passed unchanged.
+
+## Follow-ups
+
+- Browser-page migration (networking, timers, script loading, rendering,
+  Page/CDP, edge adapters) remains separate and is not claimed here.
+- Obstacle course 33/33 must be run in the companion repo when available.
