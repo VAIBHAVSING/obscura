@@ -9,6 +9,7 @@ import { promisify } from "node:util";
 
 import { WasmV8Worker } from "../src/client.mjs";
 import { loadModule } from "../src/module-loader.mjs";
+import { MAX_PENDING_TASKS } from "../src/task-runtime.mjs";
 import {
   MAX_DOCUMENT_METADATA_BYTES,
   MAX_DOM_BATCH_OPERATIONS,
@@ -39,6 +40,7 @@ const harnessCli = fileURLToPath(new URL("../bin/run.mjs", import.meta.url));
 const realWasmModule = process.env.OBSCURA_REAL_WASM_MODULE;
 const realNativeAddon = process.env.OBSCURA_REAL_NATIVE_ADDON;
 const execFileAsync = promisify(execFile);
+const wait = (milliseconds) => new Promise((resolve) => setTimeout(resolve, milliseconds));
 
 if (process.env.OBSCURA_REQUIRE_REAL_ARTIFACTS === "1") {
   assert.ok(realWasmModule, "OBSCURA_REAL_WASM_MODULE is required by the artifact test gate");
@@ -278,6 +280,17 @@ test("bridges ObscuraCore queries into the persistent host V8 document facade", 
         compiled: false,
         fullBrowser: false,
         denoIntegration: false,
+        tasks: {
+          available: false,
+          pending: 0,
+          scheduled: 0,
+          delivered: 0,
+          running: 0,
+          canceled: 0,
+          dropped: 0,
+          timeouts: 0,
+          timeoutMs: 1_000,
+        },
       },
     });
     assert.equal(
@@ -642,7 +655,7 @@ test("runs the production bootstrap against the stateful op_dom bridge", async (
         hiddenBinding: "undefined",
         hostEscape: "undefined",
         optionalLayout: "undefined",
-        asyncRuntime: false,
+        asyncRuntime: true,
       },
     );
     assert.match(
@@ -672,6 +685,251 @@ test("runs the production bootstrap against the stateful op_dom bridge", async (
     assert.equal(status.generation, 2);
     assert.equal(status.disposed, 1);
     assert.equal(status.realm, "bootstrap");
+  } finally {
+    await worker.close();
+  }
+});
+
+test("portable timers preserve task boundaries, FIFO order, cancellation, and string handlers", async () => {
+  const worker = await WasmV8Worker.launch(mockStatefulCore);
+  try {
+    await worker.bootstrapEvaluate(
+      `(() => {
+        globalThis.__taskOrder = [];
+        setTimeout(() => {
+          __taskOrder.push("timer-one");
+          queueMicrotask(() => __taskOrder.push("timer-one-microtask"));
+        }, 0);
+        setTimeout(() => __taskOrder.push("timer-two"), 0);
+        const canceled = setTimeout(() => __taskOrder.push("canceled"), 0);
+        clearTimeout(canceled);
+        setTimeout("globalThis.__stringTimerValue = 42", 0);
+        globalThis.__intervalTicks = 0;
+        const intervalId = setInterval(() => {
+          __intervalTicks += 1;
+          if (__intervalTicks === 2) clearTimeout(intervalId);
+        }, 0);
+        queueMicrotask(() => __taskOrder.push("initial-microtask"));
+        __taskOrder.push("sync");
+        return true;
+      })()`,
+      { html: "<html><body></body></html>" },
+    );
+    let timerState;
+    const deadline = Date.now() + 2_000;
+    while (Date.now() < deadline) {
+      await wait(10);
+      timerState = await worker.bootstrapEvaluate(
+        "[__taskOrder, globalThis.__stringTimerValue, __intervalTicks]",
+      );
+      if (timerState[0].length === 5 && timerState[1] === 42 && timerState[2] === 2) break;
+    }
+    assert.deepEqual(
+      timerState,
+      [["sync", "initial-microtask", "timer-one", "timer-one-microtask", "timer-two"], 42, 2],
+    );
+    const status = (await worker.bridgeStatus()).bootstrap.tasks;
+    assert.equal(status.available, true);
+    assert.equal(status.pending, 0);
+    assert.equal(status.scheduled, 6);
+    assert.equal(status.delivered, 5);
+    assert.equal(status.canceled, 1);
+    assert.equal(status.running, 0);
+  } finally {
+    await worker.close();
+  }
+});
+
+test("portable posted tasks preserve priority, FIFO, and a microtask checkpoint per callback", async () => {
+  const worker = await WasmV8Worker.launch(mockStatefulCore);
+  try {
+    await worker.bootstrapEvaluate(
+      `(() => {
+        globalThis.__postedOrder = [];
+        scheduler.postTask(() => {
+          __postedOrder.push("background-one");
+          queueMicrotask(() => __postedOrder.push("background-one-microtask"));
+        }, { priority: "background" });
+        scheduler.postTask(() => {
+          __postedOrder.push("blocking");
+          queueMicrotask(() => __postedOrder.push("blocking-microtask"));
+        }, { priority: "user-blocking" });
+        scheduler.postTask(() => __postedOrder.push("background-two"), {
+          priority: "background",
+        });
+        return true;
+      })()`,
+      { html: "<html><body></body></html>" },
+    );
+    let postedOrder = [];
+    const deadline = Date.now() + 2_000;
+    while (Date.now() < deadline) {
+      await wait(10);
+      postedOrder = await worker.bootstrapEvaluate("__postedOrder");
+      if (postedOrder.length === 5) break;
+    }
+    assert.deepEqual(postedOrder, [
+      "blocking",
+      "blocking-microtask",
+      "background-one",
+      "background-one-microtask",
+      "background-two",
+    ]);
+    const status = (await worker.bridgeStatus()).bootstrap.tasks;
+    assert.equal(status.pending, 0);
+    assert.equal(status.scheduled, 3);
+    assert.equal(status.delivered, 3);
+  } finally {
+    await worker.close();
+  }
+});
+
+test("portable task failures and deadlines do not poison later tasks or evaluations", async () => {
+  const worker = await WasmV8Worker.launch(mockStatefulCore, { taskTimeoutMs: 20 });
+  try {
+    await worker.bootstrapEvaluate(
+      `(() => {
+        globalThis.__taskRecovery = [];
+        setTimeout(() => { throw new Error("ordinary callback failure"); }, 0);
+        setTimeout(() => { while (true) {} }, 0);
+        setTimeout(() => __taskRecovery.push("after-timeout"), 0);
+        return true;
+      })()`,
+      { html: "<html><body></body></html>" },
+    );
+    let recovery = [];
+    const deadline = Date.now() + 2_000;
+    while (Date.now() < deadline) {
+      await wait(10);
+      recovery = await worker.bootstrapEvaluate("__taskRecovery");
+      if (recovery.length === 1) break;
+    }
+    assert.deepEqual(recovery, ["after-timeout"]);
+    const status = (await worker.bridgeStatus()).bootstrap.tasks;
+    assert.equal(status.pending, 0);
+    assert.equal(status.running, 0);
+    assert.equal(status.scheduled, 3);
+    assert.equal(status.delivered, 2);
+    assert.equal(status.timeouts, 1);
+    assert.equal(await worker.bootstrapEvaluate("21 * 2"), 42);
+  } finally {
+    await worker.close();
+  }
+});
+
+test("portable task deadlines never fire early and pending work is bounded and reclaimable", async () => {
+  const worker = await WasmV8Worker.launch(mockStatefulCore);
+  try {
+    await worker.bootstrapEvaluate(
+      `(() => {
+        globalThis.__longTaskFired = false;
+        globalThis.__longTask = setTimeout(() => { __longTaskFired = true; }, 2 ** 31);
+        return true;
+      })()`,
+      { html: "<html><body></body></html>" },
+    );
+    await wait(30);
+    assert.equal(await worker.bootstrapEvaluate("__longTaskFired"), false);
+    assert.equal((await worker.bridgeStatus()).bootstrap.tasks.pending, 1);
+    assert.equal(await worker.bootstrapEvaluate("clearTimeout(__longTask)"), undefined);
+    assert.equal((await worker.bridgeStatus()).bootstrap.tasks.pending, 0);
+
+    await assert.rejects(
+      worker.bootstrapEvaluate(
+        `(() => {
+          globalThis.__boundedTaskIds = [];
+          for (let i = 0; i < ${MAX_PENDING_TASKS}; i++) {
+            __boundedTaskIds.push(setTimeout(() => {}, Infinity));
+          }
+          setTimeout(() => {}, Infinity);
+        })()`,
+        { timeoutMs: 10_000, requestTimeoutMs: 20_000 },
+      ),
+      { name: "RangeError", message: /task queue exceeds/ },
+    );
+    assert.equal((await worker.bridgeStatus()).bootstrap.tasks.pending, MAX_PENDING_TASKS);
+    await worker.bootstrapEvaluate(
+      "for (const id of __boundedTaskIds) clearTimeout(id); __boundedTaskIds = [];",
+      { timeoutMs: 10_000, requestTimeoutMs: 20_000 },
+    );
+    assert.equal((await worker.bridgeStatus()).bootstrap.tasks.pending, 0);
+  } finally {
+    await worker.close();
+  }
+});
+
+test("page replacement and release invalidate all pending portable tasks", async () => {
+  const worker = await WasmV8Worker.launch(mockStatefulCore);
+  try {
+    await worker.bootstrapEvaluate(
+      `(() => {
+        setTimeout(() => document.body.setAttribute("data-stale", "yes"), 40);
+        setTimeout(() => { globalThis.__staleRealmRan = true; }, 40);
+        return true;
+      })()`,
+      { html: "<html><body></body></html>" },
+    );
+    assert.equal((await worker.bridgeStatus()).bootstrap.tasks.pending, 2);
+    assert.equal(
+      await worker.bootstrapEvaluate("document.body.hasAttribute('data-stale')", {
+        html: "<html><body><main>replacement</main></body></html>",
+      }),
+      false,
+    );
+    await wait(70);
+    assert.deepEqual(
+      await worker.bootstrapEvaluate(
+        "[document.body.hasAttribute('data-stale'), typeof __staleRealmRan]",
+      ),
+      [false, "undefined"],
+    );
+
+    await worker.bootstrapEvaluate("setTimeout(() => {}, 10000); true");
+    const released = await worker.releaseBridge();
+    assert.equal(released.loaded, false);
+    assert.equal(released.bootstrap.tasks.available, false);
+    assert.equal(released.bootstrap.tasks.pending, 0);
+    assert.equal(released.bootstrap.tasks.dropped, 1);
+  } finally {
+    await worker.close();
+  }
+});
+
+test("portable task internals do not expose host callbacks or dispatcher slots", async () => {
+  assert.throws(
+    () => new WasmV8Worker(mockStatefulCore, { taskTimeoutMs: 0 }),
+    /taskTimeoutMs must be an integer/,
+  );
+  const worker = await WasmV8Worker.launch(mockStatefulCore);
+  try {
+    assert.deepEqual(
+      await worker.bootstrapEvaluate(
+        `(() => ({
+          process: typeof process,
+          require: typeof require,
+          hostTaskBinding: typeof globalThis.__obscuraHostTaskOpBridge__,
+          hostDispatchBinding: typeof globalThis.__obscuraHostTaskDispatchSlot__,
+          taskGlobals: Object.getOwnPropertyNames(globalThis)
+            .filter(name => name.includes("obscuraTask")),
+          constructorEscape: Deno.core.queueUserTimer.constructor("return typeof process")(),
+          queueMicrotaskError: (() => {
+            try { queueMicrotask(42); return null; } catch (error) { return error.name; }
+          })(),
+          queueMicrotaskReturn: queueMicrotask(() => {}),
+        }))()`,
+        { html: "<html><body></body></html>" },
+      ),
+      {
+        process: "undefined",
+        require: "undefined",
+        hostTaskBinding: "undefined",
+        hostDispatchBinding: "undefined",
+        taskGlobals: [],
+        constructorEscape: "undefined",
+        queueMicrotaskError: "TypeError",
+        queueMicrotaskReturn: undefined,
+      },
+    );
   } finally {
     await worker.close();
   }

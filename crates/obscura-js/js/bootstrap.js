@@ -743,11 +743,32 @@ globalThis.console = {
   assert: (c, ...a) => { if (!c) _consoleFn("error", ["Assertion failed:", ...a]); },
 };
 
+const _MAX_TIMER_ID = 0x7fffffff;
 let _tid = 0;
-const _clearedTimers = new Set();
+// HTML timers and animation callbacks share one positive, bounded ID space in
+// this realm. Keeping only live IDs avoids the unbounded cancellation
+// tombstones the old `_clearedTimers` set accumulated, including for unknown
+// IDs passed by page code.
+const _activeTimerIds = new Set();
 const _intervals = new Set();
 const _nativeTimerIds = new Map();
 const __obscuraPendingTimeoutDeadlines = new Map();
+function _allocateTimerId() {
+  // The HTML timer algorithm requires an implementation-defined positive
+  // integer which is not already active. Wrap before Number loses integer
+  // precision, and scan only on wrap/collision in normal use.
+  for (let attempts = 0; attempts < _MAX_TIMER_ID; attempts++) {
+    _tid = _tid >= _MAX_TIMER_ID ? 1 : _tid + 1;
+    if (!_activeTimerIds.has(_tid)) {
+      _activeTimerIds.add(_tid);
+      return _tid;
+    }
+  }
+  throw new RangeError("No browser timer IDs are available");
+}
+function _releaseTimerId(id) {
+  _activeTimerIds.delete(id);
+}
 Object.defineProperty(globalThis, '__obscura_nextPendingTimeoutDelay', {
   value: function() {
     const now = performance.now();
@@ -809,51 +830,96 @@ const _coerceTimerFn = (fn) => {
 
 globalThis.setTimeout = (fn, delay = 0, ...args) => {
   const f = _coerceTimerFn(fn);
-  if (f === null) return ++_tid;
-  const id = ++_tid;
+  if (f === null) {
+    const id = _allocateTimerId();
+    _releaseTimerId(id);
+    return id;
+  }
   const normalizedDelay = Math.max(0, Number(delay) || 0);
-  const nativeId = _scheduleAfter(normalizedDelay, () => {
-    _nativeTimerIds.delete(id);
-    __obscuraPendingTimeoutDeadlines.delete(id);
-    if (_clearedTimers.has(id)) return;
-    try { f(...args); } catch(e) { console.error("Timer error:", e); }
-  });
+  const id = _allocateTimerId();
+  let nativeId;
+  try {
+    nativeId = _scheduleAfter(normalizedDelay, () => {
+      _nativeTimerIds.delete(id);
+      __obscuraPendingTimeoutDeadlines.delete(id);
+      _releaseTimerId(id);
+      try { f(...args); } catch(e) { console.error("Timer error:", e); }
+    });
+  } catch (error) {
+    _releaseTimerId(id);
+    throw error;
+  }
   if (nativeId !== undefined) {
     _nativeTimerIds.set(id, nativeId);
     __obscuraPendingTimeoutDeadlines.set(id, performance.now() + normalizedDelay);
+  } else {
+    _releaseTimerId(id);
   }
   return id;
 };
 
 globalThis.clearTimeout = (id) => {
-  _clearedTimers.add(id);
+  // setTimeout() and setInterval() draw from the same ordered map. Either
+  // clear function may therefore cancel either kind, including an interval
+  // clearing itself from inside its currently running callback.
+  const ownedId = _intervals.delete(id)
+    || _nativeTimerIds.has(id)
+    || __obscuraPendingTimeoutDeadlines.has(id);
   __obscuraPendingTimeoutDeadlines.delete(id);
   const nativeId = _nativeTimerIds.get(id);
   if (nativeId !== undefined) {
     Deno.core.cancelTimer(nativeId);
     _nativeTimerIds.delete(id);
   }
+  if (ownedId) _releaseTimerId(id);
 };
 
 globalThis.setInterval = (fn, delay = 0, ...args) => {
   const f = _coerceTimerFn(fn);
-  if (f === null) return ++_tid;
-  const id = ++_tid;
-  _intervals.add(id);
+  if (f === null) {
+    const id = _allocateTimerId();
+    _releaseTimerId(id);
+    return id;
+  }
+  const normalizedDelay = Math.max(0, Number(delay) || 0);
+  const id = _allocateTimerId();
   const tick = () => {
+    _nativeTimerIds.delete(id);
     if (!_intervals.has(id)) return;
     try { f(...args); } catch(e) { console.error("Interval error:", e); }
     if (!_intervals.has(id)) return;
-    const nativeId = _scheduleAfter(delay, tick);
-    if (nativeId !== undefined) _nativeTimerIds.set(id, nativeId);
+    let nativeId;
+    try {
+      nativeId = _scheduleAfter(normalizedDelay, tick);
+    } catch (error) {
+      _intervals.delete(id);
+      _releaseTimerId(id);
+      throw error;
+    }
+    if (nativeId !== undefined) {
+      _nativeTimerIds.set(id, nativeId);
+    } else {
+      _intervals.delete(id);
+      _releaseTimerId(id);
+    }
   };
-  const nativeId = _scheduleAfter(delay, tick);
-  if (nativeId !== undefined) _nativeTimerIds.set(id, nativeId);
+  let nativeId;
+  try {
+    nativeId = _scheduleAfter(normalizedDelay, tick);
+  } catch (error) {
+    _releaseTimerId(id);
+    throw error;
+  }
+  if (nativeId !== undefined) {
+    _intervals.add(id);
+    _nativeTimerIds.set(id, nativeId);
+  } else {
+    _releaseTimerId(id);
+  }
   return id;
 };
 
 globalThis.clearInterval = (id) => {
-  _intervals.delete(id);
   globalThis.clearTimeout(id);
 };
 
@@ -889,7 +955,12 @@ function _scheduleRenderingOpportunity() {
   if (_renderOpportunityScheduled || _renderOpportunityRunning
       || !_renderOpportunityHasWork()) return;
   _renderOpportunityScheduled = true;
-  _scheduleAfter(_RAF_FRAME_DELAY_MS, _runRenderingOpportunity);
+  try {
+    _scheduleAfter(_RAF_FRAME_DELAY_MS, _runRenderingOpportunity);
+  } catch (error) {
+    _renderOpportunityScheduled = false;
+    throw error;
+  }
 }
 
 function _runRenderingOpportunity() {
@@ -929,6 +1000,7 @@ function _runAnimationFrameBatch() {
       // callback in the same frame is running.
       if (!batch.has(id)) continue;
       batch.delete(id);
+      _releaseTimerId(id);
       try { callback(timestamp); }
       catch (e) { console.error("Animation frame error:", e); }
     }
@@ -945,17 +1017,34 @@ globalThis.requestAnimationFrame = (fn) => {
       "Failed to execute 'requestAnimationFrame' on 'Window': parameter 1 is not of type 'Function'."
     );
   }
-  const id = ++_tid;
+  const id = _allocateTimerId();
   _rafPending.set(id, fn);
-  _scheduleAnimationFrame();
+  try {
+    _scheduleAnimationFrame();
+  } catch (error) {
+    _rafPending.delete(id);
+    _releaseTimerId(id);
+    throw error;
+  }
   return id;
 };
 
 globalThis.cancelAnimationFrame = (id) => {
-  _rafPending.delete(id);
-  if (_rafCurrentBatch) _rafCurrentBatch.delete(id);
+  const ownedId = _rafPending.delete(id)
+    || (_rafCurrentBatch ? _rafCurrentBatch.delete(id) : false);
+  if (ownedId) _releaseTimerId(id);
 };
-globalThis.queueMicrotask = globalThis.queueMicrotask || ((fn) => Promise.resolve().then(fn));
+const _resolvedMicrotaskPromise = Promise.resolve();
+globalThis.queueMicrotask = function queueMicrotask(callback) {
+  if (typeof callback !== "function") {
+    throw new TypeError(
+      "Failed to execute 'queueMicrotask' on 'Window': parameter 1 is not of type 'Function'."
+    );
+  }
+  // Do not return the Promise: queueMicrotask returns undefined. The host's
+  // end-of-task checkpoint drains this reaction before the next browser task.
+  _resolvedMicrotaskPromise.then(callback);
+};
 
 // Browser posted tasks need an event-loop boundary but no clock delay. Tokio's
 // timer wheel imposes roughly a one-millisecond floor even for delay zero,

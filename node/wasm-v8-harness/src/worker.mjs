@@ -8,6 +8,7 @@ import {
   compileBootstrapRuntime,
 } from "./bootstrap-runtime.mjs";
 import { loadModule } from "./module-loader.mjs";
+import { PortableTaskHost } from "./task-runtime.mjs";
 import {
   MAX_DOCUMENT_METADATA_BYTES,
   MAX_DOM_ARGUMENT_BYTES,
@@ -366,6 +367,9 @@ let bridgePageRevision = null;
 let compiledBootstrapRuntime;
 let bridgeCapabilityProbePromise;
 let portablePlatformOp;
+let bridgeTaskHost;
+let bridgeTaskLastStatus = null;
+let enqueueSerializedWork;
 let shuttingDown = false;
 
 function propertyNames(value) {
@@ -1213,6 +1217,11 @@ async function disposeBridgeCore() {
   bridgeCore = null;
   bridgeDocumentHandle = null;
   bridgePageRevision = null;
+  if (bridgeTaskHost) {
+    bridgeTaskHost.close();
+    bridgeTaskLastStatus = bridgeTaskHost.status();
+    bridgeTaskHost = null;
+  }
   // Loading or releasing a document is a page boundary. Discard the old V8
   // realm so globals and queued microtask state cannot leak into the next page.
   hostContext = null;
@@ -1303,6 +1312,7 @@ async function replaceBridgeCore(html, documentMetadata) {
   }
   bridgeCore = next;
   bridgeGeneration += 1;
+  bridgeTaskLastStatus = null;
   if (nextIdentity) {
     bridgeDocumentHandle = nextIdentity.documentHandle;
     bridgePageRevision = nextIdentity.revision;
@@ -1340,6 +1350,17 @@ function bridgeStatus() {
       compiled: Boolean(compiledBootstrapRuntime),
       fullBrowser: false,
       denoIntegration: false,
+      tasks: bridgeTaskHost?.status() ?? bridgeTaskLastStatus ?? {
+        available: false,
+        pending: 0,
+        scheduled: 0,
+        delivered: 0,
+        running: 0,
+        canceled: 0,
+        dropped: 0,
+        timeouts: 0,
+        timeoutMs: vmTimeout(workerData.taskTimeoutMs, 1_000),
+      },
     },
   };
 }
@@ -1395,17 +1416,31 @@ async function installBootstrapRealm(timeoutMs = 5_000) {
   const context = getHostContext();
   const generation = bridgeGeneration;
   const documentHandle = bridgeDocumentHandle;
+  const taskHost = new PortableTaskHost({
+    enqueue(work) {
+      if (typeof enqueueSerializedWork !== "function") {
+        throw new Error("Obscura Worker task queue is unavailable");
+      }
+      return enqueueSerializedWork(work);
+    },
+    timeoutMs: vmTimeout(workerData.taskTimeoutMs, 1_000),
+  });
   try {
     const runtime = await getCompiledBootstrapRuntime();
-    runtime.install(context, {
+    const taskDispatcher = runtime.install(context, {
       timeoutMs: vmTimeout(timeoutMs, 5_000),
       opDom: (command, arg1, arg2) =>
         domOperation(command, arg1, arg2, generation, documentHandle),
       opPlatform: platformOperation,
+      opTask: (command, argument) => taskHost.operation(command, argument),
     });
+    taskHost.attach(taskDispatcher);
+    bridgeTaskHost = taskHost;
+    bridgeTaskLastStatus = null;
     bridgeRealmKind = "bootstrap";
     return context;
   } catch (error) {
+    taskHost.close();
     hostContext = null;
     bridgeRealmKind = null;
     throw error;
@@ -1663,19 +1698,24 @@ try {
   // Operations mutate persistent runtime and bridge ownership state. Preserve
   // message order instead of allowing async listener invocations to overlap.
   let operationQueue = Promise.resolve();
+  const fatalQueueFailure = (error) => {
+    // handleMessage and portable task delivery normally contain their own
+    // failures. If the response channel or queue itself fails, close rather
+    // than running later work against uncertain page state.
+    shuttingDown = true;
+    try {
+      parentPort.postMessage({ type: "fatal", error: serializeError(error) });
+    } catch {
+      // The port is already unusable.
+    }
+    parentPort.close();
+  };
+  enqueueSerializedWork = (work) => {
+    operationQueue = operationQueue.then(work).catch(fatalQueueFailure);
+    return operationQueue;
+  };
   parentPort.on("message", (message) => {
-    operationQueue = operationQueue.then(() => handleMessage(message)).catch((error) => {
-      // handleMessage normally converts every failure into a response. If the
-      // response channel itself fails, reset the chain and close this worker
-      // instead of leaving all later queue entries attached to a rejection.
-      shuttingDown = true;
-      try {
-        parentPort.postMessage({ type: "fatal", error: serializeError(error) });
-      } catch {
-        // The port is already unusable.
-      }
-      parentPort.close();
-    });
+    void enqueueSerializedWork(() => handleMessage(message));
   });
   parentPort.postMessage({
     type: "ready",

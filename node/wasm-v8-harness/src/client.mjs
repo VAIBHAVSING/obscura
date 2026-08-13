@@ -15,6 +15,7 @@ import { resolveModulePath } from "./module-loader.mjs";
 
 const workerUrl = new URL("./worker.mjs", import.meta.url);
 const MAX_TIMER_MS = 2_147_483_647;
+const MAX_VM_TIMEOUT_MS = 4_294_967_295;
 const require = createRequire(import.meta.url);
 
 function nativeInitializationError(message) {
@@ -23,13 +24,14 @@ function nativeInitializationError(message) {
   return error;
 }
 
-function preloadNativeAddon(modulePath, cwd, bootstrapPath) {
+function preloadNativeAddon(modulePath, cwd, bootstrapPath, taskTimeoutMs) {
   const resolvedPath = resolveModulePath(modulePath, cwd);
   if (!resolvedPath || extname(resolvedPath) !== ".node") {
     return {
       modulePath,
       cwd,
       bootstrapPath: bootstrapPath === undefined ? undefined : resolveModulePath(bootstrapPath, cwd),
+      taskTimeoutMs,
     };
   }
   if (!isMainThread) {
@@ -57,6 +59,7 @@ function preloadNativeAddon(modulePath, cwd, bootstrapPath) {
     modulePath: resolvedPath,
     cwd,
     bootstrapPath: bootstrapPath === undefined ? undefined : resolveModulePath(bootstrapPath, cwd),
+    taskTimeoutMs,
   };
 }
 
@@ -127,6 +130,13 @@ function validateTimeout(timeoutMs, label) {
   return timeoutMs;
 }
 
+function validateVmTimeout(timeoutMs, label) {
+  if (!Number.isSafeInteger(timeoutMs) || timeoutMs < 1 || timeoutMs > MAX_VM_TIMEOUT_MS) {
+    throw new RangeError(`${label} must be an integer between 1 and ${MAX_VM_TIMEOUT_MS} milliseconds`);
+  }
+  return timeoutMs;
+}
+
 function remoteError(value) {
   const error = new Error(value?.message ?? "Harness worker failed");
   error.name = value?.name ?? "Error";
@@ -147,11 +157,12 @@ export class WasmV8Worker {
   #readyResolve;
   #readyReject;
 
-  constructor(modulePath, { cwd = process.cwd(), bootstrapPath } = {}) {
+  constructor(modulePath, { cwd = process.cwd(), bootstrapPath, taskTimeoutMs = 1_000 } = {}) {
     if (bootstrapPath !== undefined && (typeof bootstrapPath !== "string" || bootstrapPath.length === 0)) {
       throw new TypeError("bootstrapPath must be a non-empty string");
     }
-    const workerData = preloadNativeAddon(modulePath, cwd, bootstrapPath);
+    validateVmTimeout(taskTimeoutMs, "taskTimeoutMs");
+    const workerData = preloadNativeAddon(modulePath, cwd, bootstrapPath, taskTimeoutMs);
     this.#ready = new Promise((resolve, reject) => {
       this.#readyResolve = resolve;
       this.#readyReject = reject;

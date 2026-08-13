@@ -1,7 +1,12 @@
 import vm from "node:vm";
+import { randomBytes } from "node:crypto";
+
+import { translateTaskDispatchError } from "./task-runtime.mjs";
 
 const HOST_DOM_OP_BINDING = "__obscuraHostDomOpBridge__";
 const HOST_PLATFORM_OP_BINDING = "__obscuraHostPlatformOpBridge__";
+const HOST_TASK_OP_BINDING = "__obscuraHostTaskOpBridge__";
+const HOST_TASK_DISPATCH_SLOT_BINDING = "__obscuraHostTaskDispatchSlot__";
 const DEFAULT_INSTALL_TIMEOUT_MS = 5_000;
 const MAX_VM_TIMEOUT_MS = 4_294_967_295;
 
@@ -101,7 +106,10 @@ const installDomBridgeScript = new vm.Script(
     "use strict";
     const hostDomOp = globalThis.${HOST_DOM_OP_BINDING};
     const hostPlatformOp = globalThis.${HOST_PLATFORM_OP_BINDING};
+    const hostTaskOp = globalThis.${HOST_TASK_OP_BINDING};
+    const taskDispatchSlot = globalThis.${HOST_TASK_DISPATCH_SLOT_BINDING};
     const safeApply = Reflect.apply;
+    const safeCreate = Object.create;
     const safeJsonStringify = JSON.stringify;
     const safeArrayBufferIsView = ArrayBuffer.isView;
     const safeArrayJoin = Array.prototype.join;
@@ -116,7 +124,12 @@ const installDomBridgeScript = new vm.Script(
     const ContextURIError = URIError;
     const ContextString = String;
     const ContextNumber = Number;
+    const ContextPromise = Promise;
     const ContextUint8Array = Uint8Array;
+    const ContextMap = Map;
+    const safeMapGet = Map.prototype.get;
+    const safeMapSet = Map.prototype.set;
+    const safeMapDelete = Map.prototype.delete;
     const BASE64 = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
     const MAX_PLATFORM_BINARY_BYTES = 8 * 1024 * 1024;
 
@@ -348,23 +361,68 @@ const installDomBridgeScript = new vm.Script(
       opSubtleAesGcm, opSubtleAesCbc, opSubtleAesCtr, opSubtlePbkdf2, opSubtleHkdf]
       .forEach(Object.freeze);
 
-    // The first portable bootstrap slice is deliberately synchronous. False
-    // makes bootstrap.js leave timers and posted tasks pending instead of
-    // manufacturing microtask semantics for browser tasks.
+    const taskEntries = new ContextMap();
+    const callTaskHost = (command, argument) => {
+      const response = safeApply(hostTaskOp, undefined, [command, argument]);
+      if (response === null || typeof response !== "object") {
+        throw new ContextTypeError("Obscura task bridge returned an invalid response");
+      }
+      if (response.ok === true) return response.value;
+      if (response.ok === false) throw translatedError(response.error);
+      throw new ContextTypeError("Obscura task bridge returned an invalid response");
+    };
+
     const asyncRuntimeAvailable = function op_async_runtime_available() {
-      return false;
+      return true;
     };
     Object.freeze(asyncRuntimeAvailable);
 
-    const unavailableTimer = function unavailableTimer() {
-      throw new ContextError("Obscura portable browser task scheduling is unavailable");
+    const queueUserTimer = function queueUserTimer(_scope, _repeat, delay, callback) {
+      if (typeof callback !== "function") {
+        throw new ContextTypeError("Obscura portable timer callback must be a function");
+      }
+      const id = callTaskHost("schedule-timer", safeApply(ContextNumber, undefined, [delay]));
+      const entry = safeApply(safeCreate, undefined, [null]);
+      entry.kind = "timer";
+      entry.callback = callback;
+      safeApply(safeMapSet, taskEntries, [id, entry]);
+      return id;
     };
-    Object.freeze(unavailableTimer);
+    const cancelTimer = function cancelTimer(id) {
+      const taskId = safeApply(ContextNumber, undefined, [id]);
+      safeApply(safeMapDelete, taskEntries, [taskId]);
+      callTaskHost("cancel-task", taskId);
+    };
+    const postedTask = function op_posted_task() {
+      return new ContextPromise((resolve, reject) => {
+        try {
+          const id = callTaskHost("schedule-posted-task", 0);
+          const entry = safeApply(safeCreate, undefined, [null]);
+          entry.kind = "posted";
+          entry.resolve = resolve;
+          entry.reject = reject;
+          safeApply(safeMapSet, taskEntries, [id, entry]);
+        } catch (error) {
+          reject(error);
+        }
+      });
+    };
+    const dispatchTask = function dispatchTask(id) {
+      const entry = safeApply(safeMapGet, taskEntries, [id]);
+      if (entry === undefined) return false;
+      safeApply(safeMapDelete, taskEntries, [id]);
+      if (entry.kind === "timer") safeApply(entry.callback, undefined, []);
+      else if (entry.kind === "posted") safeApply(entry.resolve, undefined, [undefined]);
+      else throw new ContextTypeError("Obscura task registry contains an invalid entry");
+      return true;
+    };
+    [queueUserTimer, cancelTimer, postedTask, dispatchTask].forEach(Object.freeze);
 
     const ops = Object.create(null);
     Object.defineProperties(ops, {
       op_dom: { value: opDom, enumerable: true },
       op_async_runtime_available: { value: asyncRuntimeAvailable, enumerable: true },
+      op_posted_task: { value: postedTask, enumerable: true },
       op_url_parse: { value: opUrlParse, enumerable: true },
       op_url_set: { value: opUrlSet, enumerable: true },
       op_url_resolve: { value: opUrlResolve, enumerable: true },
@@ -386,8 +444,8 @@ const installDomBridgeScript = new vm.Script(
     const core = Object.create(null);
     Object.defineProperties(core, {
       ops: { value: ops, enumerable: true },
-      queueUserTimer: { value: unavailableTimer, enumerable: true },
-      cancelTimer: { value: unavailableTimer, enumerable: true },
+      queueUserTimer: { value: queueUserTimer, enumerable: true },
+      cancelTimer: { value: cancelTimer, enumerable: true },
     });
     Object.freeze(core);
 
@@ -399,6 +457,12 @@ const installDomBridgeScript = new vm.Script(
       writable: false,
       enumerable: false,
       configurable: false,
+    });
+    Object.defineProperty(globalThis, taskDispatchSlot, {
+      value: dispatchTask,
+      writable: false,
+      enumerable: false,
+      configurable: true,
     });
   })()`,
   { filename: "obscura-portable-dom-bridge.js" },
@@ -467,6 +531,26 @@ function hostResponse(call, fallbackMessage, ...args) {
   return Object.freeze(response);
 }
 
+function taskHostResponse(call, command, argument) {
+  const response = Object.create(null);
+  try {
+    const value = call(command, argument);
+    if (typeof value !== "number" && typeof value !== "boolean") {
+      throw new TypeError("Portable task operation must return a number or boolean");
+    }
+    Object.defineProperties(response, {
+      ok: { enumerable: true, value: true },
+      value: { enumerable: true, value },
+    });
+  } catch (error) {
+    Object.defineProperties(response, {
+      ok: { enumerable: true, value: false },
+      error: { enumerable: true, value: safeErrorRecord(error, "Obscura task bridge operation failed") },
+    });
+  }
+  return Object.freeze(response);
+}
+
 export function compileBootstrapRuntime(source, { filename = "<obscura:bootstrap>" } = {}) {
   if (typeof source !== "string" || source.length === 0) {
     throw new TypeError("Obscura bootstrap source must be a non-empty string");
@@ -476,8 +560,29 @@ export function compileBootstrapRuntime(source, { filename = "<obscura:bootstrap
   }
 
   const bootstrapScript = new vm.Script(source, { filename });
+  // Keep the page dispatcher in a realm-global lexical binding. Unlike a
+  // global property it is not enumerable or directly recoverable by page
+  // code. The random identifier is compiled only into host-owned scripts.
+  const secret = randomBytes(16).toString("hex");
+  const dispatchLexical = `__obscuraTaskDispatch_${secret}`;
+  const dispatchSlot = `__obscuraTaskDispatchSlot_${secret}`;
+  const dispatchIdSlot = `__obscuraTaskId_${secret}`;
+  const captureTaskDispatcherScript = new vm.Script(
+    `const ${dispatchLexical} = globalThis[${JSON.stringify(dispatchSlot)}];\n` +
+      `delete globalThis[${JSON.stringify(dispatchSlot)}];`,
+    { filename: "obscura-portable-task-capture.js" },
+  );
+  const dispatchTaskScript = new vm.Script(
+    `(() => {\n` +
+      `  "use strict";\n` +
+      `  const id = globalThis[${JSON.stringify(dispatchIdSlot)}];\n` +
+      `  delete globalThis[${JSON.stringify(dispatchIdSlot)}];\n` +
+      `  return ${dispatchLexical}(id);\n` +
+      `})()`,
+    { filename: "obscura-portable-task-dispatch.js" },
+  );
   return Object.freeze({
-    install(context, { opDom, opPlatform, timeoutMs } = {}) {
+    install(context, { opDom, opPlatform, opTask, timeoutMs } = {}) {
       if (!vm.isContext(context)) {
         throw new TypeError("Obscura bootstrap requires a Node vm context");
       }
@@ -486,6 +591,9 @@ export function compileBootstrapRuntime(source, { filename = "<obscura:bootstrap
       }
       if (typeof opPlatform !== "function") {
         throw new TypeError("Obscura bootstrap requires a synchronous platform_op callback");
+      }
+      if (typeof opTask !== "function") {
+        throw new TypeError("Obscura bootstrap requires a synchronous task callback");
       }
       timeoutMs = vmTimeout(timeoutMs);
       if (Object.hasOwn(context, "Deno") || Object.hasOwn(context, "document")) {
@@ -511,16 +619,49 @@ export function compileBootstrapRuntime(source, { filename = "<obscura:bootstrap
         ),
         configurable: true,
       });
+      Object.defineProperty(context, HOST_TASK_OP_BINDING, {
+        value: (command, argument) => taskHostResponse(opTask, command, argument),
+        configurable: true,
+      });
+      Object.defineProperty(context, HOST_TASK_DISPATCH_SLOT_BINDING, {
+        value: dispatchSlot,
+        configurable: true,
+      });
       try {
         installDomBridgeScript.runInContext(context, { timeout: timeoutMs });
       } finally {
         Reflect.deleteProperty(context, HOST_DOM_OP_BINDING);
         Reflect.deleteProperty(context, HOST_PLATFORM_OP_BINDING);
+        Reflect.deleteProperty(context, HOST_TASK_OP_BINDING);
+        Reflect.deleteProperty(context, HOST_TASK_DISPATCH_SLOT_BINDING);
       }
+
+      captureTaskDispatcherScript.runInContext(context, { timeout: timeoutMs });
 
       bootstrapScript.runInContext(context, { timeout: timeoutMs });
       initializePageScript.runInContext(context, { timeout: timeoutMs });
-      return context;
+      return Object.freeze({
+        context,
+        dispatch(id, taskTimeoutMs) {
+          if (!Number.isSafeInteger(id) || id < 1) {
+            throw new TypeError("Obscura task dispatch id must be a positive safe integer");
+          }
+          taskTimeoutMs = vmTimeout(taskTimeoutMs);
+          Object.defineProperty(context, dispatchIdSlot, {
+            value: id,
+            writable: false,
+            enumerable: false,
+            configurable: true,
+          });
+          try {
+            return dispatchTaskScript.runInContext(context, { timeout: taskTimeoutMs });
+          } catch (error) {
+            throw translateTaskDispatchError(error, taskTimeoutMs);
+          } finally {
+            Reflect.deleteProperty(context, dispatchIdSlot);
+          }
+        },
+      });
     },
   });
 }

@@ -2836,6 +2836,99 @@ mod tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
+    async fn timeout_and_interval_clear_functions_share_one_timer_registry() {
+        let mut rt = setup_runtime("<html><body></body></html>");
+        rt.execute_script(
+            "cross-kind-timer-cancellation",
+            r#"
+                globalThis.__crossTimerState = {
+                    intervalTicks: 0,
+                    intervalDelayCoercions: 0,
+                    timeoutRan: false,
+                };
+                const timeoutId = setTimeout(() => {
+                    __crossTimerState.timeoutRan = true;
+                }, 20);
+                clearInterval(timeoutId);
+
+                const intervalDelay = {
+                    valueOf() {
+                        __crossTimerState.intervalDelayCoercions++;
+                        return 0;
+                    }
+                };
+                const intervalId = setInterval(() => {
+                    __crossTimerState.intervalTicks++;
+                    clearTimeout(intervalId);
+                }, intervalDelay);
+            "#,
+        )
+        .unwrap();
+
+        rt.run_event_loop_bounded(100).await.unwrap();
+        assert_eq!(
+            rt.evaluate("__crossTimerState").unwrap(),
+            serde_json::json!({
+                "intervalTicks": 1,
+                "intervalDelayCoercions": 1,
+                "timeoutRan": false,
+            }),
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn queue_microtask_validates_synchronously_and_runs_before_timer_tasks() {
+        let mut rt = setup_runtime("<html><body></body></html>");
+        rt.execute_script(
+            "queue-microtask-contract",
+            r#"
+                globalThis.__queueMicrotaskState = { order: ["sync"], errors: [] };
+                for (const value of [undefined, null, 1, "callback"]) {
+                    try { queueMicrotask(value); }
+                    catch (error) { __queueMicrotaskState.errors.push(error.name); }
+                }
+                __queueMicrotaskState.returned = queueMicrotask(() => {
+                    __queueMicrotaskState.order.push("microtask");
+                }) === undefined;
+                setTimeout(() => __queueMicrotaskState.order.push("timer"), 0);
+            "#,
+        )
+        .unwrap();
+
+        rt.run_event_loop_bounded(100).await.unwrap();
+        assert_eq!(
+            rt.evaluate("__queueMicrotaskState").unwrap(),
+            serde_json::json!({
+                "order": ["sync", "microtask", "timer"],
+                "errors": ["TypeError", "TypeError", "TypeError", "TypeError"],
+                "returned": true,
+            }),
+        );
+    }
+
+    #[test]
+    fn browser_task_ids_are_positive_bounded_and_unique_while_live() {
+        let mut rt = setup_runtime("<html><body></body></html>");
+        let value = rt
+            .evaluate(
+                r#"(() => {
+                    const timeoutId = setTimeout(() => {}, 1000);
+                    const intervalId = setInterval(() => {}, 1000);
+                    const animationId = requestAnimationFrame(() => {});
+                    const ids = [timeoutId, intervalId, animationId];
+                    const valid = ids.every(id => Number.isInteger(id) && id > 0 && id <= 0x7fffffff);
+                    const unique = new Set(ids).size === ids.length;
+                    clearTimeout(timeoutId);
+                    clearInterval(intervalId);
+                    cancelAnimationFrame(animationId);
+                    return [valid, unique];
+                })()"#,
+            )
+            .unwrap();
+        assert_eq!(value, serde_json::json!([true, true]));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
     async fn scheduler_post_task_observes_priority_fifo_and_task_boundaries() {
         let mut rt = setup_runtime("<html><body></body></html>");
         rt.execute_script(
