@@ -19,6 +19,7 @@ import {
   MAX_PLATFORM_BINARY_BYTES,
   MAX_PLATFORM_KDF_OUTPUT_BYTES,
   MAX_PLATFORM_PBKDF2_ITERATIONS,
+  MAX_PLATFORM_PBKDF2_WORK_UNITS,
   MAX_PLATFORM_RANDOM_BYTES,
   MAX_PLATFORM_REQUEST_BYTES,
   MAX_PLATFORM_RESPONSE_BYTES,
@@ -834,6 +835,19 @@ function validatePlatformRequest(command, requestJson) {
       throw new RangeError(
         `platform PBKDF2 iterations must be an integer between 1 and ${MAX_PLATFORM_PBKDF2_ITERATIONS}`,
       );
+    }
+    const digestBytes = request.hash === "SHA-1" ? 20 :
+      request.hash === "SHA-256" ? 32 :
+      request.hash === "SHA-384" ? 48 :
+      request.hash === "SHA-512" ? 64 : 0;
+    if (digestBytes > 0 && Number.isSafeInteger(request.length) && request.length >= 0) {
+      const blocks = Math.ceil(request.length / digestBytes);
+      const work = request.iterations * blocks;
+      if (!Number.isSafeInteger(work) || work > MAX_PLATFORM_PBKDF2_WORK_UNITS) {
+        throw new RangeError(
+          `platform PBKDF2 request exceeds the ${MAX_PLATFORM_PBKDF2_WORK_UNITS}-unit work limit`,
+        );
+      }
     }
   }
   if (command === "op_subtle_pbkdf2" || command === "op_subtle_hkdf") {

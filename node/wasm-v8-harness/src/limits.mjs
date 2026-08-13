@@ -17,6 +17,7 @@ export const MAX_PLATFORM_BINARY_BYTES = 8 * 1024 * 1024;
 export const MAX_PLATFORM_RANDOM_BYTES = 65_536;
 export const MAX_PLATFORM_KDF_OUTPUT_BYTES = 1024 * 1024;
 export const MAX_PLATFORM_PBKDF2_ITERATIONS = 1_000_000;
+export const MAX_PLATFORM_PBKDF2_WORK_UNITS = 1_000_000;
 
 export function requireBoundedString(value, maximum, label) {
   if (typeof value !== "string") throw new TypeError(`${label} must be a string`);

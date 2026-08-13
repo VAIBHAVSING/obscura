@@ -7,6 +7,8 @@ use obscura_dom::{
 };
 use wasm_bindgen::prelude::*;
 
+mod platform;
+
 const ABI_VERSION: u32 = 1;
 const DOM_OP_ABI_VERSION: u32 = 1;
 const DOM_BATCH_ABI_VERSION: u32 = 1;
@@ -1295,8 +1297,11 @@ pub fn abi_version() -> u32 {
 pub fn probe() -> String {
     boundary_value("probe", || {
         format!(
-            r#"{{"abiVersion":{},"dom":true,"selectors":true,"javascript":"host","embeddedV8":false,"domOpAbiVersion":{},"domBatchAbiVersion":{},"documentMetadataAbiVersion":1,"stableNodeHandles":true}}"#,
-            ABI_VERSION, DOM_OP_ABI_VERSION, DOM_BATCH_ABI_VERSION
+            r#"{{"abiVersion":{},"dom":true,"selectors":true,"javascript":"host","embeddedV8":false,"domOpAbiVersion":{},"domBatchAbiVersion":{},"documentMetadataAbiVersion":1,"platformOpAbiVersion":{},"stableNodeHandles":true}}"#,
+            ABI_VERSION,
+            DOM_OP_ABI_VERSION,
+            DOM_BATCH_ABI_VERSION,
+            platform::PLATFORM_OP_ABI_VERSION,
         )
     })
 }
@@ -1338,6 +1343,7 @@ mod tests {
         assert!(probe().contains(r#""abiVersion":1"#));
         assert!(probe().contains(r#""domOpAbiVersion":1"#));
         assert!(probe().contains(r#""domBatchAbiVersion":1"#));
+        assert!(probe().contains(r#""platformOpAbiVersion":1"#));
         assert!(probe().contains(r#""stableNodeHandles":true"#));
     }
 

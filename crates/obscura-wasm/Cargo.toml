@@ -11,8 +11,17 @@ publish = false
 crate-type = ["cdylib", "rlib"]
 
 [dependencies]
+base64 = { workspace = true }
 html5ever = { workspace = true }
 js-sys = "0.3"
 obscura-dom = { workspace = true }
+obscura-platform = { workspace = true }
+serde = { workspace = true }
 serde_json = { workspace = true }
 wasm-bindgen = "0.2"
+
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+getrandom = "0.2"
+
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+getrandom = { version = "0.2", features = ["js"] }

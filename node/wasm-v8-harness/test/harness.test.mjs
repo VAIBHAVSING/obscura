@@ -16,6 +16,7 @@ import {
   MAX_PLATFORM_BINARY_BYTES,
   MAX_PLATFORM_KDF_OUTPUT_BYTES,
   MAX_PLATFORM_PBKDF2_ITERATIONS,
+  MAX_PLATFORM_PBKDF2_WORK_UNITS,
   MAX_PLATFORM_RANDOM_BYTES,
   MAX_PLATFORM_REQUEST_BYTES,
   MAX_PLATFORM_RESPONSE_BYTES,
@@ -882,6 +883,13 @@ test("bounds portable platform requests and responses without poisoning the real
           `${MAX_PLATFORM_PBKDF2_ITERATIONS + 1}, 32)`,
       ),
       { name: "RangeError", message: /platform PBKDF2 iterations/ },
+    );
+    await assert.rejects(
+      worker.bootstrapEvaluate(
+        `Deno.core.ops.op_subtle_pbkdf2("SHA-256", new Uint8Array(), new Uint8Array(), ` +
+          `${Math.floor(MAX_PLATFORM_PBKDF2_WORK_UNITS / 2) + 1}, 64)`,
+      ),
+      { name: "RangeError", message: /platform PBKDF2 request exceeds/ },
     );
     await assert.rejects(
       worker.bootstrapEvaluate(

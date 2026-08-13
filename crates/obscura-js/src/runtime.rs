@@ -13705,6 +13705,53 @@ mod tests {
         assert_eq!(result.as_str().unwrap(), "B");
     }
 
+    #[tokio::test(flavor = "current_thread")]
+    async fn platform_crypto_ops_keep_native_wire_contract() {
+        let mut rt = setup_runtime("<html><body></body></html>");
+        let result = rt
+            .call_function_on_for_cdp(
+                r#"async () => {
+                    const hex = bytes => Array.from(new Uint8Array(bytes))
+                        .map(byte => byte.toString(16).padStart(2, "0"))
+                        .join("");
+                    const data = new TextEncoder().encode("abc");
+                    const digest = await crypto.subtle.digest("SHA-256", data);
+                    const key = await crypto.subtle.importKey(
+                        "raw",
+                        new TextEncoder().encode("key"),
+                        { name: "HMAC", hash: "SHA-256" },
+                        false,
+                        ["sign"],
+                    );
+                    const signature = await crypto.subtle.sign("HMAC", key, data);
+                    const random = crypto.getRandomValues(new Uint16Array(4));
+                    const uuid = crypto.randomUUID();
+                    return {
+                        digest: hex(digest),
+                        signature: hex(signature),
+                        randomLength: random.byteLength,
+                        uuidShape: /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/.test(uuid),
+                    };
+                }"#,
+                None,
+                &[],
+                true,
+                true,
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(
+            result.value.unwrap(),
+            serde_json::json!({
+                "digest": "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad",
+                "signature": "9c196e32dc0175f86f4b1cb89289d6619de6bee699e4c378e68309ed97a1a6ab",
+                "randomLength": 8,
+                "uuidShape": true,
+            })
+        );
+    }
+
     #[test]
     fn test_document_doctype() {
         let mut rt = setup_runtime("<!DOCTYPE html><html><body></body></html>");
