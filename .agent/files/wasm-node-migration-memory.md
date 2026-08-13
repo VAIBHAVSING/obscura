@@ -415,3 +415,72 @@ not at fault; artifact tests passed unchanged.
 - Browser-page migration (networking, timers, script loading, rendering,
   Page/CDP, edge adapters) remains separate and is not claimed here.
 - Obstacle course 33/33 must be run in the companion repo when available.
+
+## Shared portable platform operations (2026-08-13)
+
+Implementation commit: `2dc3db0` (`feat: share portable platform operations`)
+on `wasm-node-migration`; it follows the committed Node/bootstrap bridge
+`22d482d`. The feature is pushed to `origin/wasm-node-migration`.
+
+### What changed
+
+- Added `crates/obscura-platform`, a target-neutral semantic source shared by
+  native `obscura-js` and portable `obscura-wasm`. It owns URL parsing/set/
+  resolution, `document.domain` Public Suffix validation, legacy encoding
+  labels/decoding/query encoding, and deterministic WebCrypto primitives
+  (digest, HMAC, AES-GCM/CBC/CTR, PBKDF2, HKDF).
+- `obscura-wasm` exposes a separately negotiated `platformOpAbiVersion() = 1`
+  and a bounded JSON/base64 `platformOp(command, request)` bridge for the 15
+  synchronous bootstrap operations. This remains separate from the stateful
+  DOM handle/revision ABI.
+- The host Node VM binds the same exact operations into page-realm
+  `Deno.core.ops`, without leaking Node globals or host callbacks.
+- `random_bytes` keeps entropy target-owned: the native/WASM boundary supplies
+  `getrandom`, while the shared crypto crate has no entropy feature. In
+  particular, `aes-gcm` is built with `default-features = false` and only
+  `aes,alloc`, preventing an accidental standalone WASM entropy dependency.
+- Platform limits: command 64 B, JSON request/response 12 MiB, binary input
+  and output 8 MiB, random output 64 KiB, strings 1 MiB, KDF output 1 MiB.
+  PBKDF2 also limits `iterations * ceil(outputBytes / digestBytes)` to
+  1,000,000 work units. This closes the prior amplification path where valid
+  independent iteration/output limits could require billions of HMAC blocks.
+
+### Verification evidence
+
+- `/workspaces/.obscura-tools/nextest/cargo-nextest nextest run --release
+  -p obscura-platform -p obscura-wasm`: **54/54 PASS** (run id
+  `b90495ed-70bd-4a63-ac9b-c1805d803474`).
+- `CARGO_INCREMENTAL=0 CARGO_BUILD_JOBS=2 cargo check --release
+  -p obscura-platform --target wasm32-unknown-unknown`: PASS. This verifies
+  the shared crate itself, not merely feature unification through the final
+  WASM package.
+- `CARGO_INCREMENTAL=0 CARGO_BUILD_JOBS=2 cargo build --release
+  -p obscura-wasm --target wasm32-unknown-unknown`: PASS. The raw binary is
+  3,309,395 B, SHA-256
+  `121810539ae16d70a266ec689af8a29ed5058b1fab22bdfdf9f42972bd95d486`.
+  A Node wasm-bindgen wrapper generated in
+  `/workspaces/obscura-platform-pkg.X0nw4m/` has a 2,845,598-B WASM payload,
+  SHA-256 `4b248ee2804737020d1cd1627000782af3c2766c2c18d6662706457d9b597ef4`.
+- `npm test --prefix node/wasm-v8-harness`: **39 pass, 0 fail, 3 optional
+  real-artifact skips** after the PBKDF2 host-side preflight bound.
+- Real backend suite with the generated wrapper and
+  `/workspaces/obscura-node.node`: **42/42 PASS**, no skips. It covered the
+  real platform bootstrap operations, host/WASM request/response limits,
+  DOM bridge, embedded-V8 timeout/reuse, and isolation lifecycle.
+- `/workspaces/.obscura-tools/nextest/cargo-nextest nextest run --release
+  --features render -p obscura-js -p obscura-net`: **443/443 PASS** (run id
+  `44e389f6-5898-4d46-ac47-9e5388ea5f62`). Existing warnings were in vendored
+  `cosmic-text` and a pre-existing unused test import in `obscura-net`.
+
+### Delivery decision and next step
+
+The user explicitly deferred the standalone npm/Playwright/npx package.
+No npm package launcher or CDP sidecar code was added in this milestone.
+When resumed, it should be a package-owned CDP sidecar exposing explicit
+ready/actual-port/shutdown lifecycle APIs; it must not wrap the existing Rust
+CLI or the evaluate-only native addon.
+
+The active portability prerequisite is now browser task scheduling: host
+`queueUserTimer`/`cancelTimer`, posted-task wakeups, cancellation, reset and
+close behavior, task/microtask ordering, and deadline-aware Worker teardown.
+Only after that should parser and dynamic script execution be ported.
