@@ -12,6 +12,8 @@ mod platform;
 const ABI_VERSION: u32 = 1;
 const DOM_OP_ABI_VERSION: u32 = 1;
 const DOM_BATCH_ABI_VERSION: u32 = 1;
+#[cfg(feature = "render")]
+const RENDER_ABI_VERSION: u32 = 1;
 const MAX_HTML_INPUT_BYTES: usize = 8 * 1024 * 1024;
 const MAX_SELECTOR_BYTES: usize = 64 * 1024;
 const MAX_RETURNED_STRING_BYTES: usize = 4 * 1024 * 1024;
@@ -84,6 +86,13 @@ fn boundary_result_with<T>(
     }
 }
 
+#[cfg(feature = "render")]
+fn portable_render_resources() -> obscura_render::RenderResourceCache {
+    let mut resources = obscura_render::RenderResourceCache::with_loader(|_url: &str| None);
+    resources.set_sync_loading_enabled(false);
+    resources
+}
+
 /// Portable part of an Obscura page.
 ///
 /// JavaScript execution deliberately belongs to the host runtime. In Node,
@@ -92,6 +101,8 @@ fn boundary_result_with<T>(
 #[wasm_bindgen]
 pub struct ObscuraCore {
     dom: DomTree,
+    #[cfg(feature = "render")]
+    render_resources: obscura_render::RenderResourceCache,
     /// Opaque handles are never recycled, even when `set_html` replaces the
     /// complete arena. This prevents a wrapper retained by host JavaScript
     /// from silently aliasing an unrelated node in the next document.
@@ -118,6 +129,8 @@ impl ObscuraCore {
         node_to_handle.insert(document, 1);
         Ok(Self {
             dom,
+            #[cfg(feature = "render")]
+            render_resources: portable_render_resources(),
             handle_to_node,
             node_to_handle,
             next_handle: 2,
@@ -141,6 +154,10 @@ impl ObscuraCore {
             let dom = parse_html(html);
             let document = dom.document();
             self.dom = dom;
+            #[cfg(feature = "render")]
+            {
+                self.render_resources = portable_render_resources();
+            }
             self.handle_to_node.clear();
             self.node_to_handle.clear();
             self.handle_to_node.insert(document_handle, document);
@@ -179,6 +196,75 @@ impl ObscuraCore {
         self.document_referrer = referrer.to_string();
         self.document_encoding = encoding.to_string();
         Ok(())
+    }
+
+    /// Seed one response body fetched by the Node page transport. Rendering
+    /// never opens sockets or reads files from inside the WASM module.
+    #[cfg(feature = "render")]
+    #[wasm_bindgen(js_name = seedRenderResource)]
+    pub fn seed_render_resource(&mut self, url: &str, bytes: &[u8]) -> Result<(), JsValue> {
+        require_max_bytes(url, MAX_DOCUMENT_METADATA_BYTES, "render resource URL")?;
+        if bytes.len() > 16 * 1024 * 1024 {
+            return Err(js_sys::RangeError::new(
+                "render resource exceeds the 16777216-byte ABI limit",
+            )
+            .into());
+        }
+        self.render_resources.seed(url.to_string(), bytes.to_vec());
+        Ok(())
+    }
+
+    /// Retain a failed Node fetch so repeated captures do not request the same
+    /// missing resource again during one page lifecycle.
+    #[cfg(feature = "render")]
+    #[wasm_bindgen(js_name = seedMissingRenderResource)]
+    pub fn seed_missing_render_resource(&mut self, url: &str) -> Result<(), JsValue> {
+        require_max_bytes(url, MAX_DOCUMENT_METADATA_BYTES, "render resource URL")?;
+        self.render_resources.seed_missing(url.to_string());
+        Ok(())
+    }
+
+    /// Layout and paint the current document entirely inside WASM and return
+    /// PNG bytes to the Node adapter. Node owns only V8, I/O, and persistence.
+    #[cfg(feature = "render")]
+    #[wasm_bindgen(js_name = screenshotPng)]
+    pub fn screenshot_png(
+        &mut self,
+        width: u32,
+        height: u32,
+        scroll_x: f32,
+        scroll_y: f32,
+    ) -> Result<Vec<u8>, JsValue> {
+        if width == 0 || height == 0 {
+            return Err(js_sys::RangeError::new("screenshot viewport must be non-zero").into());
+        }
+        if width > obscura_render::MAX_CAPTURE_DIMENSION
+            || height > obscura_render::MAX_CAPTURE_DIMENSION
+            || (width as u64).saturating_mul(height as u64)
+                > obscura_render::MAX_CAPTURE_PIXELS
+        {
+            return Err(js_sys::RangeError::new("screenshot viewport exceeds render limits").into());
+        }
+        if !scroll_x.is_finite() || !scroll_y.is_finite() {
+            return Err(js_sys::RangeError::new("screenshot scroll offsets must be finite").into());
+        }
+        boundary_result("screenshot_png", || {
+            let viewport = (width as f32, height as f32);
+            let mut prepared = obscura_render::prepare_dom(
+                &self.dom,
+                viewport,
+                Some(&self.document_url),
+                &mut self.render_resources,
+            )
+            .ok_or_else(|| "unable to prepare document render".to_string())?;
+            obscura_render::screenshot_prepared(
+                &self.dom,
+                &mut prepared,
+                &mut self.render_resources,
+                (scroll_x, scroll_y),
+            )
+            .ok_or_else(|| "unable to encode document screenshot".to_string())
+        })
     }
 
     /// Execute one command using the same three-string wire contract as the
@@ -1296,6 +1382,16 @@ pub fn abi_version() -> u32 {
 #[wasm_bindgen]
 pub fn probe() -> String {
     boundary_value("probe", || {
+        #[cfg(feature = "render")]
+        return format!(
+            r#"{{"abiVersion":{},"dom":true,"selectors":true,"javascript":"host","embeddedV8":false,"domOpAbiVersion":{},"domBatchAbiVersion":{},"documentMetadataAbiVersion":1,"platformOpAbiVersion":{},"renderAbiVersion":{},"screenshotPng":true,"stableNodeHandles":true}}"#,
+            ABI_VERSION,
+            DOM_OP_ABI_VERSION,
+            DOM_BATCH_ABI_VERSION,
+            platform::PLATFORM_OP_ABI_VERSION,
+            RENDER_ABI_VERSION,
+        );
+        #[cfg(not(feature = "render"))]
         format!(
             r#"{{"abiVersion":{},"dom":true,"selectors":true,"javascript":"host","embeddedV8":false,"domOpAbiVersion":{},"domBatchAbiVersion":{},"documentMetadataAbiVersion":1,"platformOpAbiVersion":{},"stableNodeHandles":true}}"#,
             ABI_VERSION,
@@ -1345,6 +1441,26 @@ mod tests {
         assert!(probe().contains(r#""domBatchAbiVersion":1"#));
         assert!(probe().contains(r#""platformOpAbiVersion":1"#));
         assert!(probe().contains(r#""stableNodeHandles":true"#));
+    }
+
+    #[cfg(feature = "render")]
+    #[test]
+    fn renders_the_live_wasm_dom_to_png_without_a_native_loader() {
+        let mut core = ObscuraCore::new(
+            "<!doctype html><style>html,body{margin:0}main{width:64px;height:48px;background:#123456}</style><main></main>",
+        )
+        .unwrap();
+        core.set_document_metadata("https://example.test/page", "", "UTF-8")
+            .unwrap();
+        let png = core.screenshot_png(96, 64, 0.0, 0.0).unwrap();
+        assert!(png.starts_with(b"\x89PNG\r\n\x1a\n"));
+        assert!(png.len() > 100, "encoded PNG was unexpectedly small");
+
+        core.set_html("<main style='width:8px;height:8px;background:red'></main>")
+            .unwrap();
+        let replacement = core.screenshot_png(16, 16, 0.0, 0.0).unwrap();
+        assert!(replacement.starts_with(b"\x89PNG\r\n\x1a\n"));
+        assert_ne!(png, replacement);
     }
 
     #[test]

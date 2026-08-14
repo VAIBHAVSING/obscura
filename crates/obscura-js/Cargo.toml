@@ -12,7 +12,7 @@ stealth = ["obscura-net/stealth"]
 # Builds the obscura-render layout layer and exposes real box geometry to JS
 # (getBoundingClientRect, elementFromPoint, offset*), and with paint enabled,
 # rasterizes screenshots. Off by default so the scraping build stays lean.
-render = ["dep:obscura-render", "obscura-render/paint"]
+render = ["dep:obscura-render", "obscura-render/native-resource-loader"]
 
 [build-dependencies]
 deno_core = "0.350"

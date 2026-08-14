@@ -21,7 +21,13 @@ import {
   MAX_PLATFORM_RANDOM_BYTES,
   MAX_PLATFORM_REQUEST_BYTES,
   MAX_PLATFORM_RESPONSE_BYTES,
+  MAX_RENDER_RESOURCE_BYTES,
+  MAX_RENDER_URL_BYTES,
+  MAX_SCREENSHOT_DIMENSION,
+  MAX_SCREENSHOT_PIXELS,
+  MAX_SCREENSHOT_PNG_BYTES,
   MAX_SELECTOR_BYTES,
+  PNG_HEADER_SIGNATURE,
 } from "../src/limits.mjs";
 
 const mockModule = fileURLToPath(new URL("./fixtures/mock-wasm-bindgen.cjs", import.meta.url));
@@ -270,9 +276,17 @@ test("bridges ObscuraCore queries into the persistent host V8 document facade", 
         pageRevision: null,
         documentHandle: null,
         setDocumentMetadata: null,
+        seedRenderResource: null,
+        seedMissingRenderResource: null,
+        screenshotPng: null,
         dispose: "free",
       },
       page: { revision: null, documentHandle: null },
+      render: {
+        available: false,
+        renderAbiVersion: null,
+        screenshotPng: false,
+      },
       bootstrap: {
         host: "node-vm",
         domTransport: "synchronous-op-dom",
@@ -1314,6 +1328,15 @@ test(
       assert.throws(() => core.query_text(":not("), SyntaxError);
       assert.throws(() => core.query_count("["), SyntaxError);
       assert.throws(() => core.query_snapshot("x".repeat(MAX_SELECTOR_BYTES + 1)), RangeError);
+      const capabilities = JSON.parse(namespace.probe());
+      assert.equal(capabilities.renderAbiVersion, 1);
+      assert.equal(capabilities.screenshotPng, true);
+      const png = core.screenshotPng(96, 64, 0, 0);
+      assert.ok(png instanceof Uint8Array);
+      assert.deepEqual(Array.from(png.subarray(0, 8)), Array.from(PNG_HEADER_SIGNATURE));
+      const header = new DataView(png.buffer, png.byteOffset, png.byteLength);
+      assert.equal(header.getUint32(16), 96);
+      assert.equal(header.getUint32(20), 64);
     } finally {
       core.free();
     }
@@ -1742,4 +1765,553 @@ test("CLI emits valid JSON for circular evaluation results", async () => {
   );
   const report = JSON.parse(stdout);
   assert.equal(report.smoke.hostV8.self, "[Circular]");
+});
+
+test("negotiates render ABI v1 and reports capability status without falsely advertising on old cores", async () => {
+  const oldWorker = await WasmV8Worker.launch(mockObscuraCore);
+  try {
+    await oldWorker.bridgeEvaluate("1 + 1", { html: "<html><body>old</body></html>" });
+    const status = await oldWorker.bridgeStatus();
+    assert.equal(status.render.available, false);
+    assert.equal(status.render.renderAbiVersion, null);
+    assert.equal(status.render.screenshotPng, false);
+    assert.equal(status.api.seedRenderResource, null);
+    assert.equal(status.api.seedMissingRenderResource, null);
+    assert.equal(status.api.screenshotPng, null);
+
+    await assert.rejects(
+      oldWorker.seedRenderResource("https://example.test/img.png", new Uint8Array([1, 2, 3])),
+      { code: "ERR_OBSCURA_WASM_RENDER_ABI", message: /requires a machine-readable capability probe/ },
+    );
+    await assert.rejects(
+      oldWorker.seedMissingRenderResource("https://example.test/missing.png"),
+      { code: "ERR_OBSCURA_WASM_RENDER_ABI", message: /requires a machine-readable capability probe/ },
+    );
+    await assert.rejects(
+      oldWorker.screenshotPng({ width: 100, height: 100 }),
+      { code: "ERR_OBSCURA_WASM_RENDER_ABI", message: /requires a machine-readable capability probe/ },
+    );
+  } finally {
+    await oldWorker.close();
+  }
+
+  const renderWorker = await WasmV8Worker.launch(mockStatefulCore);
+  try {
+    await renderWorker.bridgeDomBatch([["document_url", "", ""]], { html: "<html><body>render</body></html>" });
+    const status = await renderWorker.bridgeStatus();
+    assert.equal(status.render.available, true);
+    assert.equal(status.render.renderAbiVersion, 1);
+    assert.equal(status.render.screenshotPng, true);
+    assert.equal(status.api.seedRenderResource, "seedRenderResource");
+    assert.equal(status.api.seedMissingRenderResource, "seedMissingRenderResource");
+    assert.equal(status.api.screenshotPng, "screenshotPng");
+  } finally {
+    await renderWorker.close();
+  }
+
+  const directory = await mkdtemp(join(tmpdir(), "obscura-render-abi-"));
+  const variants = [
+    {
+      name: "mismatched-abi-version",
+      override: "{ renderAbiVersion: 2 }",
+      expected: /requires ABI version 1, but the probe exposes 2/,
+    },
+    {
+      name: "missing-abi-version",
+      override: "{ renderAbiVersion: undefined }",
+      expected: /requires ABI version 1, but the probe exposes undefined/,
+    },
+    {
+      name: "missing-screenshot-flag",
+      override: "{ screenshotPng: false }",
+      expected: /requires screenshotPng=true/,
+    },
+  ];
+
+  for (const variant of variants) {
+    const modulePath = join(directory, `${variant.name}.cjs`);
+    await writeFile(
+      modulePath,
+      `const base = require(${JSON.stringify(mockStatefulCore)});\n` +
+        `module.exports = { ...base, probe() { const p = JSON.parse(base.probe()); return JSON.stringify(Object.assign(p, ${variant.override})); } };\n`,
+    );
+    const worker = await WasmV8Worker.launch(modulePath);
+    try {
+      await worker.bridgeDomBatch([["document_url", "", ""]], { html: "<html><body></body></html>" });
+      const status = await worker.bridgeStatus();
+      assert.equal(status.render.available, false);
+      await assert.rejects(
+        worker.screenshotPng(),
+        { code: "ERR_OBSCURA_WASM_RENDER_ABI", message: variant.expected },
+      );
+      await assert.rejects(
+        worker.seedRenderResource("https://example.test/img.png", new Uint8Array([1])),
+        { code: "ERR_OBSCURA_WASM_RENDER_ABI", message: variant.expected },
+      );
+    } finally {
+      await worker.close();
+    }
+  }
+
+  const missingMethodPath = join(directory, "missing-methods.cjs");
+  await writeFile(
+    missingMethodPath,
+    `const base = require(${JSON.stringify(mockStatefulCore)});\n` +
+      `class IncompleteCore extends base.ObscuraCore {\n` +
+      `  constructor(html) {\n` +
+      `    super(html);\n` +
+      `    this.screenshotPng = undefined;\n` +
+      `    this.seedRenderResource = undefined;\n` +
+      `    this.seedMissingRenderResource = undefined;\n` +
+      `  }\n` +
+      `}\n` +
+      `IncompleteCore.prototype.screenshotPng = undefined;\n` +
+      `IncompleteCore.prototype.seedRenderResource = undefined;\n` +
+      `IncompleteCore.prototype.seedMissingRenderResource = undefined;\n` +
+      `module.exports = { ...base, ObscuraCore: IncompleteCore };\n`,
+  );
+  const missingWorker = await WasmV8Worker.launch(missingMethodPath);
+  try {
+    await missingWorker.bridgeDomBatch([["document_url", "", ""]], { html: "<html><body></body></html>" });
+    await assert.rejects(
+      missingWorker.screenshotPng(),
+      { code: "ERR_OBSCURA_WASM_RENDER_ABI", message: /does not expose screenshot_png\/screenshotPng/ },
+    );
+    await assert.rejects(
+      missingWorker.seedRenderResource("https://example.test/img.png", new Uint8Array([1])),
+      { code: "ERR_OBSCURA_WASM_RENDER_ABI", message: /does not expose seed_render_resource\/seedRenderResource/ },
+    );
+    await assert.rejects(
+      missingWorker.seedMissingRenderResource("https://example.test/missing.png"),
+      { code: "ERR_OBSCURA_WASM_RENDER_ABI", message: /does not expose seed_missing_render_resource\/seedMissingRenderResource/ },
+    );
+  } finally {
+    await missingWorker.close();
+  }
+});
+
+test("seeds resources, records missing resources, and captures PNG screenshots with page identity", async () => {
+  const worker = await WasmV8Worker.launch(mockStatefulCore);
+  try {
+    const opened = await worker.bridgeDomBatch([["document_url", "", ""]], {
+      html: "<!doctype html><html><body><h1>render live</h1></body></html>",
+    });
+    assert.equal(opened.generation, 1);
+    assert.equal(opened.revision, 0);
+
+    const resourceData = new Uint8Array([10, 20, 30, 40, 50]);
+    const seeded = await worker.seedRenderResource("https://example.test/image.png", resourceData, {
+      expectedPage: {
+        generation: opened.generation,
+        documentHandle: opened.documentHandle,
+        revision: opened.revision,
+      },
+    });
+    assert.equal(seeded.generation, opened.generation);
+    assert.equal(seeded.documentHandle, opened.documentHandle);
+    assert.equal(seeded.revision, opened.revision);
+
+    const missing = await worker.seedMissingRenderResource("https://example.test/missing.png", {
+      expectedGeneration: opened.generation,
+      expectedDocumentHandle: opened.documentHandle,
+      expectedRevision: opened.revision,
+    });
+    assert.equal(missing.generation, opened.generation);
+    assert.equal(missing.documentHandle, opened.documentHandle);
+    assert.equal(missing.revision, opened.revision);
+
+    const shot = await worker.screenshotPng({
+      width: 128,
+      height: 96,
+      scrollX: 12.5,
+      scrollY: 24.5,
+      expectedGeneration: opened.generation,
+      expectedDocumentHandle: opened.documentHandle,
+      expectedRevision: opened.revision,
+    });
+    assert.equal(shot.generation, opened.generation);
+    assert.equal(shot.documentHandle, opened.documentHandle);
+    assert.equal(shot.revision, opened.revision);
+    assert.ok(shot.data instanceof Uint8Array);
+    assert.equal(shot.data.byteLength, 32);
+    assert.deepEqual(Array.from(shot.data.subarray(0, 8)), Array.from(PNG_HEADER_SIGNATURE));
+
+    const view = new DataView(shot.data.buffer, shot.data.byteOffset, shot.data.byteLength);
+    assert.equal(view.getUint32(8), 128);
+    assert.equal(view.getUint32(12), 96);
+    assert.equal(view.getFloat32(16), 12.5);
+    assert.equal(view.getFloat32(20), 24.5);
+
+    const defaultShot = await worker.screenshotPng();
+    assert.equal(defaultShot.generation, opened.generation);
+    assert.equal(defaultShot.documentHandle, opened.documentHandle);
+    assert.equal(defaultShot.revision, opened.revision);
+    assert.deepEqual(Array.from(defaultShot.data.subarray(0, 8)), Array.from(PNG_HEADER_SIGNATURE));
+    const defaultView = new DataView(defaultShot.data.buffer, defaultShot.data.byteOffset, defaultShot.data.byteLength);
+    assert.equal(defaultView.getUint32(8), 800);
+    assert.equal(defaultView.getUint32(12), 600);
+    assert.equal(defaultView.getFloat32(16), 0);
+    assert.equal(defaultView.getFloat32(20), 0);
+  } finally {
+    await worker.close();
+  }
+});
+
+test("enforces render URL, byte, dimension, pixel, and scroll bounds before dispatch", async () => {
+  const worker = await WasmV8Worker.launch(mockStatefulCore);
+  try {
+    await worker.bridgeDomBatch([["document_url", "", ""]], { html: "<html><body></body></html>" });
+
+    await assert.rejects(
+      worker.seedRenderResource("x".repeat(MAX_RENDER_URL_BYTES + 1), new Uint8Array([1])),
+      { name: "RangeError", message: /render resource URL exceeds the 65536-byte ABI limit/ },
+    );
+    await assert.rejects(
+      worker.seedRenderResource(12345, new Uint8Array([1])),
+      { name: "TypeError", message: /render resource URL must be a string/ },
+    );
+    await assert.rejects(
+      worker.seedMissingRenderResource("x".repeat(MAX_RENDER_URL_BYTES + 1)),
+      { name: "RangeError", message: /render resource URL exceeds the 65536-byte ABI limit/ },
+    );
+    await assert.rejects(
+      worker.seedMissingRenderResource(null),
+      { name: "TypeError", message: /render resource URL must be a string/ },
+    );
+
+    await assert.rejects(
+      worker.seedRenderResource("https://example.test/large", new Uint8Array(MAX_RENDER_RESOURCE_BYTES + 1)),
+      { name: "RangeError", message: /render resource bytes exceeds the 16777216-byte ABI limit/ },
+    );
+    await assert.rejects(
+      worker.seedRenderResource("https://example.test/invalid", "not-bytes"),
+      { name: "TypeError", message: /render resource bytes must be a Uint8Array or Buffer/ },
+    );
+    await assert.rejects(
+      worker.seedRenderResource("https://example.test/invalid", { length: 10 }),
+      { name: "TypeError", message: /render resource bytes must be a Uint8Array or Buffer/ },
+    );
+
+    await assert.rejects(
+      worker.screenshotPng({ width: 0 }),
+      { name: "RangeError", message: /screenshot width must be an integer between 1 and 32768/ },
+    );
+    await assert.rejects(
+      worker.screenshotPng({ height: -1 }),
+      { name: "RangeError", message: /screenshot height must be an integer between 1 and 32768/ },
+    );
+    await assert.rejects(
+      worker.screenshotPng({ width: MAX_SCREENSHOT_DIMENSION + 1 }),
+      { name: "RangeError", message: /screenshot width must be an integer between 1 and 32768/ },
+    );
+    await assert.rejects(
+      worker.screenshotPng({ height: MAX_SCREENSHOT_DIMENSION + 1 }),
+      { name: "RangeError", message: /screenshot height must be an integer between 1 and 32768/ },
+    );
+    await assert.rejects(
+      worker.screenshotPng({ width: 16_384, height: 16_384 }),
+      { name: "RangeError", message: /screenshot pixel count \(268435456\) exceeds the 16777216 pixel limit/ },
+    );
+    await assert.rejects(
+      worker.screenshotPng({ scrollX: Number.NaN }),
+      { name: "TypeError", message: /screenshot scrollX must be a finite number/ },
+    );
+    await assert.rejects(
+      worker.screenshotPng({ scrollY: Infinity }),
+      { name: "TypeError", message: /screenshot scrollY must be a finite number/ },
+    );
+    await assert.rejects(
+      worker.screenshotPng({ scrollX: Number.MAX_VALUE }),
+      { name: "TypeError", message: /screenshot scrollX must be a finite number/ },
+    );
+    await assert.rejects(
+      worker.screenshotPng({ scrollX: "0" }),
+      { name: "TypeError", message: /screenshot scrollX must be a finite number/ },
+    );
+    await assert.rejects(
+      worker.screenshotPng(null),
+      { name: "TypeError", message: /options must be an object/ },
+    );
+
+    // Direct request calls bypass the public client's validation. The Worker
+    // must independently enforce every untrusted message boundary.
+    await assert.rejects(
+      worker.request("seedRenderResource", {
+        url: "x".repeat(MAX_RENDER_URL_BYTES + 1),
+        bytes: new Uint8Array([1]),
+      }),
+      { name: "RangeError", message: /render resource URL exceeds the 65536-byte ABI limit/ },
+    );
+    await assert.rejects(
+      worker.request("seedRenderResource", {
+        url: "https://example.test/large",
+        bytes: new Uint8Array(MAX_RENDER_RESOURCE_BYTES + 1),
+      }),
+      { name: "RangeError", message: /render resource bytes exceeds the 16777216-byte ABI limit/ },
+    );
+    await assert.rejects(
+      worker.request("screenshotPng", { width: 0, height: 1, scrollX: 0, scrollY: 0 }),
+      { name: "RangeError", message: /screenshot width must be an integer between 1 and 32768/ },
+    );
+    await assert.rejects(
+      worker.request("screenshotPng", { width: 8, height: 8, scrollX: Infinity, scrollY: 0 }),
+      { name: "TypeError", message: /screenshot scrollX must be a finite number/ },
+    );
+    await assert.rejects(
+      worker.request("screenshotPng", { width: 8, height: 8, scrollX: 0, scrollY: Number.MAX_VALUE }),
+      { name: "TypeError", message: /screenshot scrollY must be a finite number/ },
+    );
+  } finally {
+    await worker.close();
+  }
+});
+test("enforces stale page generation, handle, and revision preconditions for render calls", async () => {
+  const worker = await WasmV8Worker.launch(mockStatefulCore);
+  try {
+    const opened = await worker.bridgeDomBatch([["document_url", "", ""]], {
+      html: "<html><body><h1>precondition test</h1></body></html>",
+    });
+
+    await assert.rejects(
+      worker.seedRenderResource("https://example.test/a", new Uint8Array([1]), { expectedGeneration: 99 }),
+      { code: "ERR_OBSCURA_STALE_PAGE", message: /Expected Obscura bridge generation 99/ },
+    );
+    await assert.rejects(
+      worker.seedMissingRenderResource("https://example.test/b", { expectedGeneration: 99 }),
+      { code: "ERR_OBSCURA_STALE_PAGE", message: /Expected Obscura bridge generation 99/ },
+    );
+    await assert.rejects(
+      worker.screenshotPng({ expectedGeneration: 99 }),
+      { code: "ERR_OBSCURA_STALE_PAGE", message: /Expected Obscura bridge generation 99/ },
+    );
+
+    await assert.rejects(
+      worker.seedRenderResource("https://example.test/a", new Uint8Array([1]), {
+        expectedDocumentHandle: opened.documentHandle + 100,
+      }),
+      { code: "ERR_OBSCURA_STALE_PAGE", message: /Expected Obscura document handle/ },
+    );
+    await assert.rejects(
+      worker.seedMissingRenderResource("https://example.test/b", {
+        expectedDocumentHandle: opened.documentHandle + 100,
+      }),
+      { code: "ERR_OBSCURA_STALE_PAGE", message: /Expected Obscura document handle/ },
+    );
+    await assert.rejects(
+      worker.screenshotPng({
+        expectedDocumentHandle: opened.documentHandle + 100,
+      }),
+      { code: "ERR_OBSCURA_STALE_PAGE", message: /Expected Obscura document handle/ },
+    );
+
+    const mutation = await worker.bridgeDomOp("create_text_node", "new node", "");
+    assert.ok(mutation.revision > opened.revision);
+
+    await assert.rejects(
+      worker.seedRenderResource("https://example.test/a", new Uint8Array([1]), {
+        expectedRevision: opened.revision,
+      }),
+      { code: "ERR_OBSCURA_STALE_PAGE", message: /Expected Obscura page revision/ },
+    );
+    await assert.rejects(
+      worker.seedMissingRenderResource("https://example.test/b", {
+        expectedRevision: opened.revision,
+      }),
+      { code: "ERR_OBSCURA_STALE_PAGE", message: /Expected Obscura page revision/ },
+    );
+    await assert.rejects(
+      worker.screenshotPng({
+        expectedRevision: opened.revision,
+      }),
+      { code: "ERR_OBSCURA_STALE_PAGE", message: /Expected Obscura page revision/ },
+    );
+
+    const validSeed = await worker.seedRenderResource("https://example.test/a", new Uint8Array([1]), {
+      expectedRevision: mutation.revision,
+    });
+    assert.equal(validSeed.revision, mutation.revision);
+
+    const validShot = await worker.screenshotPng({
+      expectedPage: {
+        generation: opened.generation,
+        documentHandle: opened.documentHandle,
+        revision: mutation.revision,
+      },
+    });
+    assert.equal(validShot.revision, mutation.revision);
+
+    const replaced = await worker.bridgeDomBatch([["document_url", "", ""]], {
+      html: "<html><body><h1>replaced</h1></body></html>",
+    });
+    assert.equal(replaced.generation, 2);
+
+    await assert.rejects(
+      worker.screenshotPng({ expectedGeneration: 1 }),
+      { code: "ERR_OBSCURA_STALE_PAGE", message: /Expected Obscura bridge generation 1/ },
+    );
+    await assert.rejects(
+      worker.seedRenderResource("https://example.test/a", new Uint8Array([1]), { expectedGeneration: 1 }),
+      { code: "ERR_OBSCURA_STALE_PAGE", message: /Expected Obscura bridge generation 1/ },
+    );
+  } finally {
+    await worker.close();
+  }
+});
+
+test("caller mutation after request cannot alter seeded bytes", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "obscura-seed-clone-"));
+  const modulePath = join(directory, "inspectable-seed.cjs");
+  await writeFile(
+    modulePath,
+    `const base = require(${JSON.stringify(mockStatefulCore)});\n` +
+      `class InspectableCore extends base.ObscuraCore {\n` +
+      `  domOp(cmd, a1, a2) {\n` +
+      `    if (cmd === "get_seeded_byte") {\n` +
+      `      const resource = this.renderResources.get(a1);\n` +
+      `      return JSON.stringify(resource ? Array.from(resource) : null);\n` +
+      `    }\n` +
+      `    return super.domOp(cmd, a1, a2);\n` +
+      `  }\n` +
+      `}\n` +
+      `module.exports = { ...base, ObscuraCore: InspectableCore };\n`,
+  );
+  const worker = await WasmV8Worker.launch(modulePath);
+  try {
+    await worker.bridgeDomBatch([["document_url", "", ""]], { html: "<html><body></body></html>" });
+
+    const sourceBuffer = new Uint8Array([10, 20, 30, 40]);
+    const seedPromise = worker.seedRenderResource("https://example.test/immutable.png", sourceBuffer);
+    sourceBuffer[0] = 99;
+    sourceBuffer[1] = 88;
+    sourceBuffer[2] = 77;
+    sourceBuffer[3] = 66;
+    await seedPromise;
+
+    const opResult = await worker.bridgeDomOp("get_seeded_byte", "https://example.test/immutable.png", "");
+    assert.deepEqual(JSON.parse(opResult.result), [10, 20, 30, 40]);
+  } finally {
+    await worker.close();
+  }
+});
+
+test("invalid non-PNG or oversized return rejected without poisoning the Worker", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "obscura-bad-png-"));
+  const nonPngModule = join(directory, "non-png.cjs");
+  await writeFile(
+    nonPngModule,
+    `const base = require(${JSON.stringify(mockStatefulCore)});\n` +
+      `class NonPngCore extends base.ObscuraCore {\n` +
+      `  screenshotPng() { return new Uint8Array([1, 2, 3, 4, 5, 6, 7, 8]); }\n` +
+      `}\n` +
+      `module.exports = { ...base, ObscuraCore: NonPngCore };\n`,
+  );
+  const nonPngWorker = await WasmV8Worker.launch(nonPngModule);
+  try {
+    await nonPngWorker.bridgeDomBatch([["document_url", "", ""]], { html: "<html><body></body></html>" });
+    await assert.rejects(
+      nonPngWorker.screenshotPng(),
+      { name: "TypeError", message: /does not start with a valid 8-byte PNG signature/ },
+    );
+    const healthCheck = await nonPngWorker.bridgeDomOp("document_url", "", "");
+    assert.equal(healthCheck.result, '"about:blank"');
+  } finally {
+    await nonPngWorker.close();
+  }
+
+  const oversizedModule = join(directory, "oversized-png.cjs");
+  await writeFile(
+    oversizedModule,
+    `const base = require(${JSON.stringify(mockStatefulCore)});\n` +
+      `class OversizedCore extends base.ObscuraCore {\n` +
+      `  screenshotPng() {\n` +
+      `    const bad = new Uint8Array(128 * 1024 * 1024 + 1);\n` +
+      `    bad.set([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a], 0);\n` +
+      `    return bad;\n` +
+      `  }\n` +
+      `}\n` +
+      `module.exports = { ...base, ObscuraCore: OversizedCore };\n`,
+  );
+  const oversizedWorker = await WasmV8Worker.launch(oversizedModule);
+  try {
+    await oversizedWorker.bridgeDomBatch([["document_url", "", ""]], { html: "<html><body></body></html>" });
+    await assert.rejects(
+      oversizedWorker.screenshotPng(),
+      { name: "RangeError", message: /exceeds the 134217728-byte ABI limit/ },
+    );
+    const healthCheck = await oversizedWorker.bridgeDomOp("document_url", "", "");
+    assert.equal(healthCheck.result, '"about:blank"');
+  } finally {
+    await oversizedWorker.close();
+  }
+
+  const nonBytesModule = join(directory, "non-bytes-png.cjs");
+  await writeFile(
+    nonBytesModule,
+    `const base = require(${JSON.stringify(mockStatefulCore)});\n` +
+      `class NonBytesCore extends base.ObscuraCore {\n` +
+      `  screenshotPng() { return "not-a-uint8array"; }\n` +
+      `}\n` +
+      `module.exports = { ...base, ObscuraCore: NonBytesCore };\n`,
+  );
+  const nonBytesWorker = await WasmV8Worker.launch(nonBytesModule);
+  try {
+    await nonBytesWorker.bridgeDomBatch([["document_url", "", ""]], { html: "<html><body></body></html>" });
+    await assert.rejects(
+      nonBytesWorker.screenshotPng(),
+      { name: "TypeError", message: /must return a Uint8Array or Buffer/ },
+    );
+    const healthCheck = await nonBytesWorker.bridgeDomOp("document_url", "", "");
+    assert.equal(healthCheck.result, '"about:blank"');
+  } finally {
+    await nonBytesWorker.close();
+  }
+});
+
+test("cleans up render resources on release and allows subsequent bridge reuse", async () => {
+  const worker = await WasmV8Worker.launch(mockStatefulCore);
+  try {
+    const opened = await worker.bridgeDomBatch([["document_url", "", ""]], {
+      html: "<html><body><h1>first</h1></body></html>",
+    });
+    await worker.seedRenderResource("https://example.test/img.png", new Uint8Array([1, 2, 3]));
+    const firstShot = await worker.screenshotPng();
+    assert.ok(firstShot.data instanceof Uint8Array);
+
+    const released = await worker.releaseBridge();
+    assert.equal(released.loaded, false);
+    assert.equal(released.render.available, false);
+    assert.equal(released.render.renderAbiVersion, null);
+    assert.equal(released.render.screenshotPng, false);
+
+    await assert.rejects(
+      worker.seedRenderResource("https://example.test/img.png", new Uint8Array([1])),
+      /No ObscuraCore is loaded/,
+    );
+    await assert.rejects(
+      worker.seedMissingRenderResource("https://example.test/missing.png"),
+      /No ObscuraCore is loaded/,
+    );
+    await assert.rejects(
+      worker.screenshotPng(),
+      /No ObscuraCore is loaded/,
+    );
+
+    const reopened = await worker.bridgeDomBatch([["document_url", "", ""]], {
+      html: "<html><body><h1>second</h1></body></html>",
+    });
+    assert.equal(reopened.generation, 2);
+    assert.equal((await worker.bridgeStatus()).loaded, true);
+    assert.equal((await worker.bridgeStatus()).render.available, true);
+
+    const secondSeed = await worker.seedRenderResource("https://example.test/img2.png", new Uint8Array([4, 5, 6]), {
+      expectedGeneration: 2,
+    });
+    assert.equal(secondSeed.generation, 2);
+
+    const secondShot = await worker.screenshotPng({ expectedGeneration: 2 });
+    assert.equal(secondShot.generation, 2);
+    assert.ok(secondShot.data instanceof Uint8Array);
+  } finally {
+    await worker.close();
+  }
 });

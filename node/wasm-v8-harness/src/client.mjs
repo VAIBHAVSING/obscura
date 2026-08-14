@@ -9,6 +9,11 @@ import {
   MAX_DOM_BATCH_OPERATIONS,
   MAX_DOM_COMMAND_BYTES,
   MAX_HTML_INPUT_BYTES,
+  MAX_RENDER_RESOURCE_BYTES,
+  MAX_RENDER_URL_BYTES,
+  MAX_SCREENSHOT_DIMENSION,
+  MAX_SCREENSHOT_PIXELS,
+  requireBoundedBytes,
   requireBoundedString,
 } from "./limits.mjs";
 import { resolveModulePath } from "./module-loader.mjs";
@@ -99,10 +104,18 @@ function boundedDomOperations(operations) {
 }
 
 function boundedPageExpectation(options) {
+  if (options === undefined || options === null) return undefined;
+  if (typeof options !== "object" || Array.isArray(options)) {
+    throw new TypeError("options must be an object");
+  }
+  const page = options.expectedPage;
+  if (page !== undefined && (page === null || typeof page !== "object" || Array.isArray(page))) {
+    throw new TypeError("expectedPage must be an object");
+  }
   const expectation = {
-    generation: options.expectedGeneration,
-    documentHandle: options.expectedDocumentHandle,
-    revision: options.expectedRevision,
+    generation: options.expectedGeneration ?? page?.generation,
+    documentHandle: options.expectedDocumentHandle ?? page?.documentHandle,
+    revision: options.expectedRevision ?? page?.revision,
   };
   if (expectation.generation !== undefined) {
     if (!Number.isSafeInteger(expectation.generation) || expectation.generation < 0) {
@@ -121,6 +134,35 @@ function boundedPageExpectation(options) {
     throw new TypeError("expectedDocumentHandle must be non-zero");
   }
   return Object.values(expectation).some((value) => value !== undefined) ? expectation : undefined;
+}
+
+function boundedScreenshotOptions(options = {}) {
+  if (options !== undefined && (typeof options !== "object" || options === null || Array.isArray(options))) {
+    throw new TypeError("options must be an object");
+  }
+  const width = options.width ?? 800;
+  const height = options.height ?? 600;
+  const scrollX = options.scrollX ?? 0.0;
+  const scrollY = options.scrollY ?? 0.0;
+
+  if (!Number.isSafeInteger(width) || width < 1 || width > MAX_SCREENSHOT_DIMENSION) {
+    throw new RangeError(`screenshot width must be an integer between 1 and ${MAX_SCREENSHOT_DIMENSION}`);
+  }
+  if (!Number.isSafeInteger(height) || height < 1 || height > MAX_SCREENSHOT_DIMENSION) {
+    throw new RangeError(`screenshot height must be an integer between 1 and ${MAX_SCREENSHOT_DIMENSION}`);
+  }
+  if (width * height > MAX_SCREENSHOT_PIXELS) {
+    throw new RangeError(`screenshot pixel count (${width * height}) exceeds the ${MAX_SCREENSHOT_PIXELS} pixel limit`);
+  }
+  if (typeof scrollX !== "number" || !Number.isFinite(scrollX) || !Number.isFinite(Math.fround(scrollX))) {
+    throw new TypeError("screenshot scrollX must be a finite number");
+  }
+  if (typeof scrollY !== "number" || !Number.isFinite(scrollY) || !Number.isFinite(Math.fround(scrollY))) {
+    throw new TypeError("screenshot scrollY must be a finite number");
+  }
+
+  const expectedPage = boundedPageExpectation(options);
+  return { width, height, scrollX, scrollY, expectedPage };
 }
 
 function validateTimeout(timeoutMs, label) {
@@ -315,6 +357,48 @@ export class WasmV8Worker {
       return this.request(
         "bridgeDomOperation",
         { command, arg1, arg2, html: options.html, documentMetadata, expectedPage },
+        options.requestTimeoutMs,
+      );
+    } catch (error) {
+      return Promise.reject(error);
+    }
+  }
+
+  seedRenderResource(url, bytes, options = {}) {
+    try {
+      requireBoundedString(url, MAX_RENDER_URL_BYTES, "render resource URL");
+      bytes = requireBoundedBytes(bytes, MAX_RENDER_RESOURCE_BYTES, "render resource bytes");
+      const expectedPage = boundedPageExpectation(options);
+      return this.request(
+        "seedRenderResource",
+        { url, bytes, expectedPage },
+        options.requestTimeoutMs,
+      );
+    } catch (error) {
+      return Promise.reject(error);
+    }
+  }
+
+  seedMissingRenderResource(url, options = {}) {
+    try {
+      requireBoundedString(url, MAX_RENDER_URL_BYTES, "render resource URL");
+      const expectedPage = boundedPageExpectation(options);
+      return this.request(
+        "seedMissingRenderResource",
+        { url, expectedPage },
+        options.requestTimeoutMs,
+      );
+    } catch (error) {
+      return Promise.reject(error);
+    }
+  }
+
+  screenshotPng(options = {}) {
+    try {
+      const { width, height, scrollX, scrollY, expectedPage } = boundedScreenshotOptions(options);
+      return this.request(
+        "screenshotPng",
+        { width, height, scrollX, scrollY, expectedPage },
         options.requestTimeoutMs,
       );
     } catch (error) {

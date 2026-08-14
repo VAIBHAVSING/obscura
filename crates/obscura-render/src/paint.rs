@@ -34,10 +34,12 @@ const DEFAULT_RESOURCE_CACHE_BYTES: usize = 64 * 1024 * 1024;
 /// bounded set of successful selections so repeated prepares can seed their
 /// intrinsic geometry before that cascade instead of always laying out twice.
 const DEFAULT_CONTENT_IMAGE_INTRINSIC_ENTRIES: usize = 256;
+#[cfg(not(target_arch = "wasm32"))]
 const MISSING_RESOURCE_RETRY_AFTER: std::time::Duration = std::time::Duration::from_secs(2);
 /// Exact formats the renderer can decode. Do not use `image/*` or `*/*` here:
 /// either wildcard permits a content-negotiating server to choose AVIF,
 /// JPEG-XL, or another format that this build cannot rasterize.
+#[cfg(feature = "native-resource-loader")]
 const IMAGE_ACCEPT: &str = "image/webp,image/apng,image/svg+xml,image/png,image/jpeg,image/gif,image/bmp,image/x-icon,image/vnd.microsoft.icon";
 
 /// Synchronous byte loader used by [`RenderResourceCache`]. The default
@@ -69,17 +71,58 @@ where
     }
 }
 
+#[cfg(not(feature = "native-resource-loader"))]
+struct EmptyResourceLoader;
+
+#[cfg(not(feature = "native-resource-loader"))]
+impl RenderResourceLoader for EmptyResourceLoader {
+    fn load(&mut self, _url: &str) -> Option<Vec<u8>> {
+        None
+    }
+}
+
+#[cfg(feature = "native-resource-loader")]
 struct HttpResourceLoader;
 
+#[cfg(feature = "native-resource-loader")]
 impl RenderResourceLoader for HttpResourceLoader {
     fn load(&mut self, url: &str) -> Option<Vec<u8>> {
         http_get_bytes(url)
     }
 }
 
+#[cfg(not(target_arch = "wasm32"))]
+type MissingResourceStamp = std::time::Instant;
+
+#[cfg(target_arch = "wasm32")]
+struct MissingResourceStamp;
+
+fn missing_resource_stamp() -> MissingResourceStamp {
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        std::time::Instant::now()
+    }
+    #[cfg(target_arch = "wasm32")]
+    {
+        MissingResourceStamp
+    }
+}
+
+fn missing_resource_is_live(stamp: &MissingResourceStamp) -> bool {
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        stamp.elapsed() < MISSING_RESOURCE_RETRY_AFTER
+    }
+    #[cfg(target_arch = "wasm32")]
+    {
+        let _ = stamp;
+        true
+    }
+}
+
 enum CachedResource {
     Bytes(Arc<[u8]>),
-    Missing(std::time::Instant),
+    Missing(MissingResourceStamp),
 }
 
 /// Fetch credentials/CORS identity for an HTML image request. No-CORS uses
@@ -151,8 +194,12 @@ pub struct RenderResourceCache {
 
 impl Default for RenderResourceCache {
     fn default() -> Self {
+        #[cfg(feature = "native-resource-loader")]
+        let loader = HttpResourceLoader;
+        #[cfg(not(feature = "native-resource-loader"))]
+        let loader = EmptyResourceLoader;
         Self::with_loader_and_limits(
-            HttpResourceLoader,
+            loader,
             DEFAULT_RESOURCE_CACHE_ENTRIES,
             DEFAULT_RESOURCE_CACHE_BYTES,
         )
@@ -208,7 +255,7 @@ impl RenderResourceCache {
     pub fn has_live_outcome(&self, url: &str) -> bool {
         match self.entries.get(&network_resource_url(url)) {
             Some(CachedResource::Bytes(_)) => true,
-            Some(CachedResource::Missing(at)) => at.elapsed() < MISSING_RESOURCE_RETRY_AFTER,
+            Some(CachedResource::Missing(at)) => missing_resource_is_live(at),
             None => false,
         }
     }
@@ -297,7 +344,7 @@ impl RenderResourceCache {
                 image_metadata_from_bytes(bytes)
                     .map(|(width, height)| (resolved_url, width, height)),
             ),
-            Some(CachedResource::Missing(at)) if at.elapsed() < MISSING_RESOURCE_RETRY_AFTER => {
+            Some(CachedResource::Missing(at)) if missing_resource_is_live(at) => {
                 Some(None)
             }
             _ => None,
@@ -320,7 +367,7 @@ impl RenderResourceCache {
                 image_metadata_from_bytes(bytes)
                     .map(|(width, height)| (resolved_url, width, height)),
             ),
-            Some(CachedResource::Missing(at)) if at.elapsed() < MISSING_RESOURCE_RETRY_AFTER => {
+            Some(CachedResource::Missing(at)) if missing_resource_is_live(at) => {
                 Some(None)
             }
             _ => None,
@@ -411,7 +458,7 @@ impl RenderResourceCache {
         if let Some(entry) = self.entries.get(&url) {
             match entry {
                 CachedResource::Bytes(bytes) => return Some(Arc::clone(bytes)),
-                CachedResource::Missing(at) if at.elapsed() < MISSING_RESOURCE_RETRY_AFTER => {
+                CachedResource::Missing(at) if missing_resource_is_live(at) => {
                     return None;
                 }
                 CachedResource::Missing(_) => {}
@@ -444,7 +491,7 @@ impl RenderResourceCache {
         if let Some(entry) = self.entries.get(&key) {
             match entry {
                 CachedResource::Bytes(bytes) => return Some(Arc::clone(bytes)),
-                CachedResource::Missing(at) if at.elapsed() < MISSING_RESOURCE_RETRY_AFTER => {
+                CachedResource::Missing(at) if missing_resource_is_live(at) => {
                     return None;
                 }
                 CachedResource::Missing(_) => {}
@@ -501,7 +548,7 @@ impl RenderResourceCache {
         }
         self.order.push_back(url.clone());
         self.entries
-            .insert(url, CachedResource::Missing(std::time::Instant::now()));
+            .insert(url, CachedResource::Missing(missing_resource_stamp()));
     }
 
     fn remove(&mut self, url: &str) {
@@ -7206,6 +7253,7 @@ fn split_css_top_level(value: &str, separator: char) -> Vec<&str> {
 /// retry the rate-limited images (e.g. an infobox photo montage fetched late in
 /// the burst) came back blank, and the failure was cached permanently. The
 /// backoff both recovers them and paces the burst back under the limit.
+#[cfg(feature = "native-resource-loader")]
 fn http_get_bytes(url: &str) -> Option<Vec<u8>> {
     let mut backoff = std::time::Duration::from_millis(200);
     for attempt in 0..3 {
@@ -7247,6 +7295,7 @@ fn http_get_bytes(url: &str) -> Option<Vec<u8>> {
 /// old per-call `ureq::get`) reads as a burst and gets 429'd, whereas reusing
 /// one pooled connection to the same host (as a browser does) both avoids most
 /// throttling and is much faster on an image-heavy page.
+#[cfg(feature = "native-resource-loader")]
 fn image_agent() -> &'static ureq::Agent {
     static AGENT: std::sync::OnceLock<ureq::Agent> = std::sync::OnceLock::new();
     AGENT.get_or_init(|| {

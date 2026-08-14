@@ -24,9 +24,15 @@ import {
   MAX_PLATFORM_RANDOM_BYTES,
   MAX_PLATFORM_REQUEST_BYTES,
   MAX_PLATFORM_RESPONSE_BYTES,
+  MAX_RENDER_RESOURCE_BYTES,
+  MAX_RENDER_URL_BYTES,
   MAX_RETURNED_STRING_BYTES,
+  MAX_SCREENSHOT_DIMENSION,
+  MAX_SCREENSHOT_PIXELS,
   MAX_SELECTOR_BYTES,
+  requireBoundedBytes,
   requireBoundedString,
+  requireValidPngBytes,
 } from "./limits.mjs";
 
 if (!parentPort) throw new Error("The WASM V8 harness worker must run as a Worker");
@@ -56,6 +62,9 @@ const DOM_BATCH_NAMES = ["dom_batch", "domBatch"];
 const PAGE_REVISION_NAMES = ["page_revision", "pageRevision"];
 const DOCUMENT_HANDLE_NAMES = ["document_handle", "documentHandle"];
 const SET_DOCUMENT_METADATA_NAMES = ["set_document_metadata", "setDocumentMetadata"];
+const SEED_RENDER_RESOURCE_NAMES = ["seed_render_resource", "seedRenderResource"];
+const SEED_MISSING_RENDER_RESOURCE_NAMES = ["seed_missing_render_resource", "seedMissingRenderResource"];
+const SCREENSHOT_PNG_NAMES = ["screenshot_png", "screenshotPng"];
 const PLATFORM_OP_ABI_VERSION_NAME = "platformOpAbiVersion";
 const PLATFORM_OP_NAME = "platformOp";
 const REQUIRED_CORE_ABI_VERSION = 1;
@@ -63,6 +72,7 @@ const REQUIRED_DOM_OP_ABI_VERSION = 1;
 const REQUIRED_DOM_BATCH_ABI_VERSION = 1;
 const REQUIRED_DOCUMENT_METADATA_ABI_VERSION = 1;
 const REQUIRED_PLATFORM_OP_ABI_VERSION = 1;
+const REQUIRED_RENDER_ABI_VERSION = 1;
 const PLATFORM_OP_COMMAND_SET = new Set(BOOTSTRAP_PLATFORM_OP_COMMANDS);
 const PLATFORM_BYTE_FIELDS = Object.freeze({
   op_text_decode: ["bytes"],
@@ -742,6 +752,9 @@ function bridgeApi(core = bridgeCore) {
     pageRevision: member(core, PAGE_REVISION_NAMES),
     documentHandle: member(core, DOCUMENT_HANDLE_NAMES),
     setDocumentMetadata: member(core, SET_DOCUMENT_METADATA_NAMES),
+    seedRenderResource: member(core, SEED_RENDER_RESOURCE_NAMES),
+    seedMissingRenderResource: member(core, SEED_MISSING_RENDER_RESOURCE_NAMES),
+    screenshotPng: member(core, SCREENSHOT_PNG_NAMES),
     dispose: member(core, DISPOSE_NAMES),
   };
 }
@@ -750,6 +763,36 @@ function bridgeAbiError(message) {
   const error = new Error(message);
   error.code = "ERR_OBSCURA_WASM_DOM_ABI";
   return error;
+}
+
+function renderAbiError(message) {
+  const error = new Error(message);
+  error.code = "ERR_OBSCURA_WASM_RENDER_ABI";
+  return error;
+}
+
+async function requireRenderCompatibility(api, requiredMethod) {
+  const capabilities = await getBridgeCapabilityProbe();
+  if (!capabilities) {
+    throw renderAbiError("ObscuraCore render ABI requires a machine-readable capability probe");
+  }
+  if (capabilities.renderAbiVersion !== REQUIRED_RENDER_ABI_VERSION) {
+    throw renderAbiError(
+      `ObscuraCore render requires ABI version ${REQUIRED_RENDER_ABI_VERSION}, but the probe exposes ${String(capabilities.renderAbiVersion)}`,
+    );
+  }
+  if (capabilities.screenshotPng !== true) {
+    throw renderAbiError("ObscuraCore render requires screenshotPng=true");
+  }
+  if (requiredMethod && !api[requiredMethod]) {
+    const names =
+      requiredMethod === "screenshotPng"
+        ? "screenshot_png/screenshotPng"
+        : requiredMethod === "seedRenderResource"
+          ? "seed_render_resource/seedRenderResource"
+          : "seed_missing_render_resource/seedMissingRenderResource";
+    throw renderAbiError(`ObscuraCore does not expose ${names}`);
+  }
 }
 
 function platformAbiError(message) {
@@ -1319,9 +1362,26 @@ async function replaceBridgeCore(html, documentMetadata) {
   }
 }
 
-function bridgeStatus() {
+async function bridgeStatus() {
   const api = bridgeCore ? bridgeApi() : {};
   if (bridgeCore && (api.domOp || api.domBatch)) synchronizeBridgeIdentity();
+  let capabilities = null;
+  if (bridgeCore) {
+    try {
+      capabilities = await getBridgeCapabilityProbe();
+    } catch {
+      capabilities = null;
+    }
+  }
+  const hasValidVersion = capabilities?.renderAbiVersion === REQUIRED_RENDER_ABI_VERSION;
+  const hasScreenshotFlag = capabilities?.screenshotPng === true;
+  const hasRenderAbi = hasValidVersion && hasScreenshotFlag;
+  const hasScreenshotPng = hasRenderAbi && Boolean(api.screenshotPng);
+  const hasCompleteRenderApi =
+    hasRenderAbi &&
+    Boolean(api.seedRenderResource) &&
+    Boolean(api.seedMissingRenderResource) &&
+    Boolean(api.screenshotPng);
   return {
     loaded: Boolean(bridgeCore),
     generation: bridgeGeneration,
@@ -1337,11 +1397,19 @@ function bridgeStatus() {
       pageRevision: api.pageRevision?.name ?? null,
       documentHandle: api.documentHandle?.name ?? null,
       setDocumentMetadata: api.setDocumentMetadata?.name ?? null,
+      seedRenderResource: api.seedRenderResource?.name ?? null,
+      seedMissingRenderResource: api.seedMissingRenderResource?.name ?? null,
+      screenshotPng: api.screenshotPng?.name ?? null,
       dispose: api.dispose?.name ?? null,
     },
     page: {
       revision: bridgePageRevision,
       documentHandle: bridgeDocumentHandle,
+    },
+    render: {
+      available: hasCompleteRenderApi,
+      renderAbiVersion: hasValidVersion ? REQUIRED_RENDER_ABI_VERSION : null,
+      screenshotPng: Boolean(hasScreenshotPng),
     },
     bootstrap: {
       host: "node-vm",
@@ -1397,6 +1465,81 @@ async function bridgeDomOperation({ html, command, arg1, arg2, documentMetadata,
     documentHandle: bridgeDocumentHandle,
     revision: bridgePageRevision,
     result,
+  };
+}
+
+async function seedRenderResource({ url, bytes, expectedPage } = {}) {
+  requireExpectedPage(expectedPage);
+  requireBridgeCore();
+  const api = bridgeApi();
+  await requireRenderCompatibility(api, "seedRenderResource");
+  requireBoundedString(url, MAX_RENDER_URL_BYTES, "render resource URL");
+  bytes = requireBoundedBytes(bytes, MAX_RENDER_RESOURCE_BYTES, "render resource bytes");
+  const generation = bridgeGeneration;
+  const documentHandle = bridgeDocumentHandle;
+  synchronizeBridgeIdentity(generation, documentHandle);
+  syncCall(api.seedRenderResource, url, bytes);
+  const identity = synchronizeBridgeIdentity(generation, documentHandle);
+  return {
+    generation,
+    documentHandle: identity.documentHandle,
+    revision: identity.revision,
+  };
+}
+
+async function seedMissingRenderResource({ url, expectedPage } = {}) {
+  requireExpectedPage(expectedPage);
+  requireBridgeCore();
+  const api = bridgeApi();
+  await requireRenderCompatibility(api, "seedMissingRenderResource");
+  requireBoundedString(url, MAX_RENDER_URL_BYTES, "render resource URL");
+  const generation = bridgeGeneration;
+  const documentHandle = bridgeDocumentHandle;
+  synchronizeBridgeIdentity(generation, documentHandle);
+  syncCall(api.seedMissingRenderResource, url);
+  const identity = synchronizeBridgeIdentity(generation, documentHandle);
+  return {
+    generation,
+    documentHandle: identity.documentHandle,
+    revision: identity.revision,
+  };
+}
+
+async function screenshotPng({ width, height, scrollX, scrollY, expectedPage } = {}) {
+  requireExpectedPage(expectedPage);
+  requireBridgeCore();
+  const api = bridgeApi();
+  await requireRenderCompatibility(api, "screenshotPng");
+  width = width ?? 800;
+  height = height ?? 600;
+  scrollX = scrollX ?? 0.0;
+  scrollY = scrollY ?? 0.0;
+  if (!Number.isSafeInteger(width) || width < 1 || width > MAX_SCREENSHOT_DIMENSION) {
+    throw new RangeError(`screenshot width must be an integer between 1 and ${MAX_SCREENSHOT_DIMENSION}`);
+  }
+  if (!Number.isSafeInteger(height) || height < 1 || height > MAX_SCREENSHOT_DIMENSION) {
+    throw new RangeError(`screenshot height must be an integer between 1 and ${MAX_SCREENSHOT_DIMENSION}`);
+  }
+  if (width * height > MAX_SCREENSHOT_PIXELS) {
+    throw new RangeError(`screenshot pixel count (${width * height}) exceeds the ${MAX_SCREENSHOT_PIXELS} pixel limit`);
+  }
+  if (typeof scrollX !== "number" || !Number.isFinite(scrollX) || !Number.isFinite(Math.fround(scrollX))) {
+    throw new TypeError("screenshot scrollX must be a finite number");
+  }
+  if (typeof scrollY !== "number" || !Number.isFinite(scrollY) || !Number.isFinite(Math.fround(scrollY))) {
+    throw new TypeError("screenshot scrollY must be a finite number");
+  }
+  const generation = bridgeGeneration;
+  const documentHandle = bridgeDocumentHandle;
+  synchronizeBridgeIdentity(generation, documentHandle);
+  const rawBytes = syncCall(api.screenshotPng, width, height, scrollX, scrollY);
+  const data = requireValidPngBytes(rawBytes, "screenshot PNG");
+  const identity = synchronizeBridgeIdentity(generation, documentHandle);
+  return {
+    generation,
+    documentHandle: identity.documentHandle,
+    revision: identity.revision,
+    data,
   };
 }
 
@@ -1623,12 +1766,18 @@ async function dispatch(operation, payload) {
       return await bridgeDomBatch(payload);
     case "bridgeDomOperation":
       return await bridgeDomOperation(payload);
+    case "seedRenderResource":
+      return await seedRenderResource(payload);
+    case "seedMissingRenderResource":
+      return await seedMissingRenderResource(payload);
+    case "screenshotPng":
+      return await screenshotPng(payload);
     case "bootstrapEvaluate":
       return await bootstrapEvaluate(payload);
     case "bridgeStatus":
-      return bridgeStatus();
+      return await bridgeStatus();
     case "bridgeRelease":
-      return { dispose: await disposeBridgeCore(), ...bridgeStatus() };
+      return { dispose: await disposeBridgeCore(), ...(await bridgeStatus()) };
     case "moduleEvaluate":
       return await evaluateWithModule(payload?.source, payload?.timeoutMs);
     case "createDrop":

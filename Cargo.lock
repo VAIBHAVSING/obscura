@@ -2048,6 +2048,7 @@ dependencies = [
  "js-sys",
  "obscura-dom",
  "obscura-platform",
+ "obscura-render",
  "serde",
  "serde_json",
  "wasm-bindgen",

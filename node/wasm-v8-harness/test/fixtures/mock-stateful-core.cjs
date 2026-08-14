@@ -22,6 +22,8 @@ class ObscuraCore {
     this.referrer = "";
     this.encoding = "UTF-8";
     this.nodes = new Map();
+    this.renderResources = new Map();
+    this.missingResources = new Set();
     this.document = this.#node(9, "#document");
     this.#parse(html);
     this.freed = false;
@@ -76,6 +78,52 @@ class ObscuraCore {
     this.#assertOpen();
     const node = this.#query(this.document, selector, true)[0];
     return node ? [this.#serialize(node), this.#text(node)] : undefined;
+  }
+
+  seedRenderResource(url, bytes) {
+    this.#assertOpen();
+    if (typeof url !== "string" || Buffer.byteLength(url, "utf8") > 64 * 1024) {
+      throw new RangeError("render resource URL exceeds limit");
+    }
+    if (!(bytes instanceof Uint8Array) && !Buffer.isBuffer(bytes)) {
+      throw new TypeError("bytes must be a Uint8Array or Buffer");
+    }
+    if (bytes.byteLength > 16 * 1024 * 1024) {
+      throw new RangeError("render resource exceeds the 16777216-byte ABI limit");
+    }
+    this.renderResources.set(
+      url,
+      new Uint8Array(bytes.buffer.slice(bytes.byteOffset, bytes.byteOffset + bytes.byteLength)),
+    );
+  }
+
+  seedMissingRenderResource(url) {
+    this.#assertOpen();
+    if (typeof url !== "string" || Buffer.byteLength(url, "utf8") > 64 * 1024) {
+      throw new RangeError("render resource URL exceeds limit");
+    }
+    this.missingResources.add(url);
+  }
+
+  screenshotPng(width, height, scrollX, scrollY) {
+    this.#assertOpen();
+    if (width === 0 || height === 0) {
+      throw new RangeError("screenshot viewport must be non-zero");
+    }
+    if (width > 32768 || height > 32768 || width * height > 16777216) {
+      throw new RangeError("screenshot viewport exceeds render limits");
+    }
+    if (!Number.isFinite(scrollX) || !Number.isFinite(scrollY)) {
+      throw new RangeError("screenshot scroll offsets must be finite");
+    }
+    const png = new Uint8Array(32);
+    png.set([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a], 0);
+    const view = new DataView(png.buffer);
+    view.setUint32(8, width);
+    view.setUint32(12, height);
+    view.setFloat32(16, scrollX);
+    view.setFloat32(20, scrollY);
+    return png;
   }
 
   free() {
@@ -301,6 +349,8 @@ module.exports = {
       domOpAbiVersion: 1,
       domBatchAbiVersion: 1,
       documentMetadataAbiVersion: 1,
+      renderAbiVersion: 1,
+      screenshotPng: true,
       stableNodeHandles: true,
       javascript: "host",
     });
