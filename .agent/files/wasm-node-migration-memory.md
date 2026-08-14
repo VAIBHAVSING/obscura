@@ -1,9 +1,9 @@
 # Obscura Node and WebAssembly migration memory
 
-Verified implementation commit: `40cd6948b93a403cfb1dc1722a2790060da83103`
-(`fix: harden WASM harness verification`). The final harness and portable
-boundary gates include the fail-closed CLI and WASM-audit regression fixes in
-that commit.
+Latest verified implementation commit:
+`f248863a2504ea002f38c0530a44462814f15c8e`
+(`feat: discover render resources in portable WASM`). The earlier harness,
+portable rendering, and boundary-hardening milestones remain recorded below.
 
 ## Decision
 
@@ -574,3 +574,74 @@ single-file ownership. Codex independently reviewed its output, rejected
 duplicated coverage and a second 128 MiB allocation, and retained only three
 additive tests: partial-method capability reporting, result anti-aliasing, and
 the real WASM-through-Worker screenshot path.
+
+## Portable render-resource discovery checkpoint (2026-08-14)
+
+Source commit: `f248863a2504ea002f38c0530a44462814f15c8e`
+(`feat: discover render resources in portable WASM`). The remaining migration
+work is decomposed into independently consumable packets in plan commit
+`62031df93a810665bd33d2917254ad8b75c07130`.
+
+### Implemented boundary
+
+- Target-neutral CSS resource discovery now lives in `obscura-render/paint`.
+  It classifies image and font requests, skips comments, strings, fragments,
+  data URLs, variables and imports, handles nested blocks and UTF-8 safely,
+  and preserves the native browser path.
+- `obscura-dom` owns the shared document-base resolver. The first `<base>` is
+  authoritative; an invalid, `data:`, or `javascript:` first base falls back
+  to the document URL rather than consulting a later element.
+- Portable render-resource ABI v1 exposes deterministic paged discovery and
+  exact-profile seed/missing operations. Profiles cover no-CORS/include,
+  CORS/same-origin and CORS/include. Page reset clears the outcome cache.
+- The Node Worker/client bridge validates the complete capability set, limits,
+  cursor progression, request profiles and page identity before and after each
+  operation. Seed bytes are copied at both trust boundaries.
+- The real-artifact integration test seeds a valid 2x3 PNG into one otherwise
+  identical document and marks it missing in another, then proves that the
+  WASM-produced screenshot bytes differ.
+
+### Artifact evidence
+
+- Raw release WASM: 15,363,565 bytes, SHA-256
+  `50acd3870dd0e4d84f0d8ab633ea59e319330d24755310c0c7aa22a03249c0a6`.
+- Disposable Node package: `/workspaces/obscura-resource-pkg.LNDqKH/`.
+  - `obscura_wasm.js`: 24,855 bytes, SHA-256
+    `1e668cb9a02b3690eacb55c8acb7b86012096e539e896f67249365145e1cc32f`.
+  - `obscura_wasm_bg.wasm`: 14,983,898 bytes, SHA-256
+    `9df31bcaab911c83ff78cb1efe04ad35c577927f66eb9a9186666a85c65c4cb7`.
+
+### Verification evidence
+
+- Focused release nextest:
+  - `obscura-wasm --features render`: **46/46 passed**, run
+    `4174c0df-45db-4c2f-8604-9516a70cd59a`.
+  - `obscura-browser --features render`: **63/63 passed**, run
+    `bd6afad2-3d33-46b2-a2bb-eb199a1e7c7a`.
+- Node mock suite: **57 passed, 5 expected artifact skips, 0 failed**.
+- Node suite with the fresh real WASM wrapper: **60 passed, 2 legacy
+  native-addon skips, 0 failed**.
+- Full repository render gate: **1,461/1,461 passed, 4 configured skips,
+  0 failed**, run `fcb91513-e510-436a-bc29-dee02a9016fb`.
+- Exact required CLI release build passed. The resulting verification binary
+  is 93,532,528 bytes, SHA-256
+  `136593b03d0c775ec1be6df0f215f708ee79389dbe2402a0de17c0113836855b`.
+- Dependency inspection found no `deno_core`, `v8`, `tokio`, `mio`, `ureq`,
+  `ring`, `rustls`, or `reqwest` in the portable WASM render graph.
+
+### Unavailable external evidence
+
+- The deterministic fixture runner produced all 63 Obscura PNGs, each
+  nontrivial (5,723 to 36,167 bytes), with no Obscura log errors. Chromium
+  comparisons could not run because the Python `playwright` package and a
+  Chromium executable are absent.
+- Representative top/bottom captures could not start because Python `numpy`
+  is absent. No fidelity claim is made from those runs.
+- `/workspaces/obscura-benchmark` is absent, so the required 33/33 obstacle
+  course remains unavailable, not passed.
+
+This checkpoint completes discovery and explicit resource seeding. It does not
+yet supply Node-owned navigation/fetch/cookie orchestration, dynamic script
+loading, portable PDF, CDP/WebSocket transport, Playwright compatibility, or
+the final npm/npx package. Those are the remaining packets in
+`.agent/files/remaining/`.
