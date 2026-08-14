@@ -10,11 +10,13 @@ import {
   MAX_DOM_COMMAND_BYTES,
   MAX_HTML_INPUT_BYTES,
   MAX_RENDER_RESOURCE_BYTES,
+  MAX_RENDER_RESOURCE_REQUESTS_PER_PAGE,
   MAX_RENDER_URL_BYTES,
   MAX_SCREENSHOT_DIMENSION,
   MAX_SCREENSHOT_PIXELS,
   requireBoundedBytes,
   requireBoundedString,
+  requireRenderImageRequestProfile,
 } from "./limits.mjs";
 import { resolveModulePath } from "./module-loader.mjs";
 
@@ -163,6 +165,34 @@ function boundedScreenshotOptions(options = {}) {
 
   const expectedPage = boundedPageExpectation(options);
   return { width, height, scrollX, scrollY, expectedPage };
+}
+
+function boundedRenderResourceRequestOptions(options = {}) {
+  if (options === null || typeof options !== "object" || Array.isArray(options)) {
+    throw new TypeError("options must be an object");
+  }
+  const width = options.width ?? 800;
+  const height = options.height ?? 600;
+  const offset = options.offset ?? 0;
+  const limit = options.limit ?? MAX_RENDER_RESOURCE_REQUESTS_PER_PAGE;
+  if (!Number.isSafeInteger(width) || width < 1 || width > MAX_SCREENSHOT_DIMENSION) {
+    throw new RangeError(`render width must be an integer between 1 and ${MAX_SCREENSHOT_DIMENSION}`);
+  }
+  if (!Number.isSafeInteger(height) || height < 1 || height > MAX_SCREENSHOT_DIMENSION) {
+    throw new RangeError(`render height must be an integer between 1 and ${MAX_SCREENSHOT_DIMENSION}`);
+  }
+  if (width * height > MAX_SCREENSHOT_PIXELS) {
+    throw new RangeError(`render pixel count (${width * height}) exceeds the ${MAX_SCREENSHOT_PIXELS} pixel limit`);
+  }
+  if (!Number.isSafeInteger(offset) || offset < 0 || offset > 0xffff_ffff) {
+    throw new RangeError("render resource request offset must be an unsigned 32-bit integer");
+  }
+  if (!Number.isSafeInteger(limit) || limit < 1 || limit > MAX_RENDER_RESOURCE_REQUESTS_PER_PAGE) {
+    throw new RangeError(
+      `render resource request limit must be an integer between 1 and ${MAX_RENDER_RESOURCE_REQUESTS_PER_PAGE}`,
+    );
+  }
+  return { width, height, offset, limit, expectedPage: boundedPageExpectation(options) };
 }
 
 function validateTimeout(timeoutMs, label) {
@@ -386,6 +416,50 @@ export class WasmV8Worker {
       return this.request(
         "seedMissingRenderResource",
         { url, expectedPage },
+        options.requestTimeoutMs,
+      );
+    } catch (error) {
+      return Promise.reject(error);
+    }
+  }
+
+  renderResourceRequests(options = {}) {
+    try {
+      const { width, height, offset, limit, expectedPage } = boundedRenderResourceRequestOptions(options);
+      return this.request(
+        "renderResourceRequests",
+        { width, height, offset, limit, expectedPage },
+        options.requestTimeoutMs,
+      );
+    } catch (error) {
+      return Promise.reject(error);
+    }
+  }
+
+  seedRenderImageResource(url, profile, bytes, options = {}) {
+    try {
+      requireBoundedString(url, MAX_RENDER_URL_BYTES, "render resource URL");
+      profile = requireRenderImageRequestProfile(profile);
+      bytes = requireBoundedBytes(bytes, MAX_RENDER_RESOURCE_BYTES, "render resource bytes");
+      const expectedPage = boundedPageExpectation(options);
+      return this.request(
+        "seedRenderImageResource",
+        { url, profile, bytes, expectedPage },
+        options.requestTimeoutMs,
+      );
+    } catch (error) {
+      return Promise.reject(error);
+    }
+  }
+
+  seedMissingRenderImageResource(url, profile, options = {}) {
+    try {
+      requireBoundedString(url, MAX_RENDER_URL_BYTES, "render resource URL");
+      profile = requireRenderImageRequestProfile(profile);
+      const expectedPage = boundedPageExpectation(options);
+      return this.request(
+        "seedMissingRenderImageResource",
+        { url, profile, expectedPage },
         options.requestTimeoutMs,
       );
     } catch (error) {

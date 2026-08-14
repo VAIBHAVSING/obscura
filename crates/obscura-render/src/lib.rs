@@ -96,8 +96,11 @@ mod image_capability_tests {
 #[cfg(feature = "paint")]
 mod paint;
 #[cfg(feature = "paint")]
+pub use obscura_dom::resolve_document_base_url;
+#[cfg(feature = "paint")]
 pub use paint::{
-    image_intrinsic_dimensions, paint_dom, paint_dom_scrolled,
+    css_resource_requests, css_resource_urls, image_intrinsic_dimensions, paint_dom,
+    paint_dom_scrolled, CssResourceKind, CssResourceRequest,
     paint_dom_scrolled_at_animation_time,
     paint_dom_scrolled_at_animation_time_with_surface_color, paint_prepared,
     paint_prepared_region_with_scroll, paint_prepared_region_with_scroll_and_surface_color,

@@ -116,6 +116,8 @@ test(
       assert.deepEqual(status.render, {
         available: true,
         renderAbiVersion: 1,
+        resourcesAvailable: true,
+        resourceRequestAbiVersion: 1,
         screenshotPng: true,
       });
 

@@ -20,6 +20,12 @@ export const MAX_PLATFORM_PBKDF2_ITERATIONS = 1_000_000;
 export const MAX_PLATFORM_PBKDF2_WORK_UNITS = 1_000_000;
 export const MAX_RENDER_URL_BYTES = 64 * 1024;
 export const MAX_RENDER_RESOURCE_BYTES = 16 * 1024 * 1024;
+export const MAX_RENDER_RESOURCE_REQUESTS_PER_PAGE = 32;
+export const RENDER_IMAGE_REQUEST_PROFILES = Object.freeze([
+  "no-cors-include",
+  "cors-same-origin",
+  "cors-include",
+]);
 export const MAX_SCREENSHOT_DIMENSION = 32_768;
 export const MAX_SCREENSHOT_PIXELS = 16_777_216;
 export const MAX_SCREENSHOT_PNG_BYTES = 128 * 1024 * 1024;
@@ -60,4 +66,13 @@ export function requireValidPngBytes(bytes, label = "screenshot PNG") {
     }
   }
   return new Uint8Array(bytes.buffer.slice(bytes.byteOffset, bytes.byteOffset + bytes.byteLength));
+}
+
+export function requireRenderImageRequestProfile(value) {
+  if (typeof value !== "string" || !RENDER_IMAGE_REQUEST_PROFILES.includes(value)) {
+    throw new TypeError(
+      `render image request profile must be one of ${RENDER_IMAGE_REQUEST_PROFILES.join(", ")}`,
+    );
+  }
+  return value;
 }

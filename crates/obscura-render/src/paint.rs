@@ -168,6 +168,246 @@ fn network_resource_url(url: &str) -> String {
     parsed.to_string()
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum CssResourceKind {
+    Image,
+    Font,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CssResourceRequest {
+    pub url: String,
+    pub kind: CssResourceKind,
+}
+
+/// Extract network-backed `url(...)` assets while respecting CSS comments and
+/// strings. Linked sheets have already been rebased before materialization;
+/// inline declarations are resolved against the document base here.
+pub fn css_resource_urls(css: &str, base: &url::Url) -> Vec<String> {
+    css_resource_requests(css, base)
+        .into_iter()
+        .map(|request| request.url)
+        .collect()
+}
+
+/// Typed counterpart to [`css_resource_urls`]. URLs inside an `@font-face`
+/// block retain their font request identity even when the URL has no file
+/// extension; all other CSS URLs are paint image resources.
+pub fn css_resource_requests(css: &str, base: &url::Url) -> Vec<CssResourceRequest> {
+    let mut requests = Vec::new();
+    let mut index = 0usize;
+    let mut brace_depth = 0usize;
+    let mut font_face_depths = Vec::new();
+    let mut pending_font_face = false;
+    while index < css.len() {
+        let rest = &css[index..];
+        if rest.starts_with("/*") {
+            if let Some(end) = rest[2..].find("*/") {
+                index += end + 4;
+            } else {
+                break;
+            }
+            continue;
+        }
+        // `@import url(...)` is a stylesheet dependency, not a paint asset.
+        // It is fetched by the bounded stylesheet graph above. Letting the
+        // generic image/font warmup rediscover it issues a second request with
+        // the wrong ResourceType::Image classification.
+        if let Some(length) = css_import_rule_len(rest) {
+            index += length;
+            continue;
+        }
+        let Some(first) = rest.chars().next() else {
+            break;
+        };
+        if first == '"' || first == '\'' {
+            let quote = first;
+            let mut escaped = false;
+            let mut length = quote.len_utf8();
+            for ch in rest[quote.len_utf8()..].chars() {
+                length += ch.len_utf8();
+                if escaped {
+                    escaped = false;
+                } else if ch == '\\' {
+                    escaped = true;
+                } else if ch == quote {
+                    break;
+                }
+            }
+            index += length;
+            continue;
+        }
+        let font_face_prefix = rest
+            .get(..10)
+            .is_some_and(|prefix| prefix.eq_ignore_ascii_case("@font-face"));
+        // `get(10..)` is intentional: byte 10 is a valid boundary when the
+        // ASCII prefix matched, and returns `None` rather than panicking for
+        // unrelated non-ASCII input whose tenth byte splits a code point.
+        let font_face_boundary = font_face_prefix
+            && rest.get(10..).is_some_and(|tail| {
+                tail.is_empty()
+                    || tail.starts_with("/*")
+                    || tail
+                        .chars()
+                        .next()
+                        .is_some_and(|ch| ch.is_ascii_whitespace() || ch == '{')
+            });
+        let previous_boundary = index == 0
+            || css[..index].ends_with("*/")
+            || css[..index]
+                .chars()
+                .next_back()
+                .is_some_and(|ch| ch.is_ascii_whitespace() || matches!(ch, '{' | '}' | ';'));
+        if font_face_boundary && previous_boundary {
+            pending_font_face = true;
+            index += 10;
+            continue;
+        }
+        match first {
+            '{' => {
+                brace_depth += 1;
+                if pending_font_face {
+                    font_face_depths.push(brace_depth);
+                    pending_font_face = false;
+                }
+                index += 1;
+                continue;
+            }
+            '}' => {
+                if font_face_depths.last() == Some(&brace_depth) {
+                    font_face_depths.pop();
+                }
+                brace_depth = brace_depth.saturating_sub(1);
+                pending_font_face = false;
+                index += 1;
+                continue;
+            }
+            ';' if pending_font_face => {
+                pending_font_face = false;
+                index += 1;
+                continue;
+            }
+            _ => {}
+        }
+        if !rest
+            .get(..4)
+            .is_some_and(|prefix| prefix.eq_ignore_ascii_case("url("))
+        {
+            index += first.len_utf8();
+            continue;
+        }
+        let mut quote = None;
+        let mut escaped = false;
+        let mut end = None;
+        for (offset, ch) in rest[4..].char_indices() {
+            if escaped {
+                escaped = false;
+                continue;
+            }
+            if ch == '\\' {
+                escaped = true;
+                continue;
+            }
+            match quote {
+                Some(open) if ch == open => quote = None,
+                Some(_) => {}
+                None if ch == '"' || ch == '\'' => quote = Some(ch),
+                None if ch == ')' => {
+                    end = Some(4 + offset);
+                    break;
+                }
+                None => {}
+            }
+        }
+        let Some(end) = end else { break };
+        let raw = rest[4..end].trim();
+        let value = if raw.len() >= 2
+            && ((raw.starts_with('"') && raw.ends_with('"'))
+                || (raw.starts_with('\'') && raw.ends_with('\'')))
+        {
+            &raw[1..raw.len() - 1]
+        } else {
+            raw
+        };
+        if !value.is_empty()
+            && !value.starts_with('#')
+            && !value.starts_with("data:")
+            && !value.contains("var(")
+        {
+            if let Ok(mut url) = base.join(value) {
+                url.set_fragment(None);
+                if matches!(url.scheme(), "http" | "https") {
+                    requests.push(CssResourceRequest {
+                        url: url.to_string(),
+                        kind: if font_face_depths.is_empty() {
+                            CssResourceKind::Image
+                        } else {
+                            CssResourceKind::Font
+                        },
+                    });
+                }
+            }
+        }
+        index += end + 1;
+    }
+    requests
+}
+
+/// Return the byte length of a leading CSS `@import` rule, including its
+/// terminating semicolon. Semicolons inside quoted URLs, comments, or `url()`
+/// parentheses do not end the rule. A malformed import is left to the normal
+/// scanner so this helper cannot swallow following declarations.
+fn css_import_rule_len(css: &str) -> Option<usize> {
+    let prefix = css.get(..7)?;
+    if !prefix.eq_ignore_ascii_case("@import") {
+        return None;
+    }
+    if css[7..]
+        .chars()
+        .next()
+        .is_some_and(|ch| ch.is_ascii_alphanumeric() || ch == '-' || ch == '_')
+    {
+        return None;
+    }
+
+    let bytes = css.as_bytes();
+    let mut index = 7usize;
+    let mut quote = None;
+    let mut escaped = false;
+    let mut paren_depth = 0usize;
+    while index < bytes.len() {
+        let byte = bytes[index];
+        if let Some(open) = quote {
+            if escaped {
+                escaped = false;
+            } else if byte == b'\\' {
+                escaped = true;
+            } else if byte == open {
+                quote = None;
+            }
+            index += 1;
+            continue;
+        }
+        if byte == b'/' && bytes.get(index + 1) == Some(&b'*') {
+            let Some(end) = css[index + 2..].find("*/") else {
+                return None;
+            };
+            index += end + 4;
+            continue;
+        }
+        match byte {
+            b'\'' | b'"' => quote = Some(byte),
+            b'(' => paren_depth += 1,
+            b')' => paren_depth = paren_depth.saturating_sub(1),
+            b';' if paren_depth == 0 => return Some(index + 1),
+            b'{' if paren_depth == 0 => return None,
+            _ => {}
+        }
+        index += 1;
+    }
+    (quote.is_none() && paren_depth == 0).then_some(css.len())
+}
+
 #[derive(Clone, Debug, PartialEq)]
 struct RememberedContentImageIntrinsic {
     resolved_url: String,
@@ -11543,6 +11783,7 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "native-resource-loader")]
     #[test]
     fn image_accept_advertises_exactly_decodable_mime_types() {
         assert!(!IMAGE_ACCEPT.contains('*'));
@@ -16829,5 +17070,175 @@ mod tests {
         assert_eq!(at_end.layout.styles[&overlay].visibility_hidden, Some(true));
         assert!(at_end.layout.styles[&overlay].effectively_invisible);
         assert!(!at_end.has_active_css_animations());
+    }
+
+    #[test]
+    fn css_resource_urls_ignores_strings_comments_data_and_fragments() {
+        let base = url::Url::parse("https://example.test/css/app/main.css").unwrap();
+        let css = r#"
+            /* url(ignored.png) */
+            .copy::before { content: "url(also-ignored.png)"; }
+            @import URL("theme.css") print;
+            @import url("semi;colon.css") screen;
+            .hero { background: url('../img/hero.png'); }
+            .icon { mask: URL("https://cdn.test/icon.svg#shape"); }
+            .inline { background: url(data:image/svg+xml,<svg/>); }
+            .local { mask: url(#local); }
+        "#;
+        assert_eq!(
+            css_resource_urls(css, &base),
+            vec![
+                "https://example.test/css/img/hero.png".to_string(),
+                "https://cdn.test/icon.svg".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn css_resource_urls_handles_import_variations_and_skips_stylesheet_dependencies() {
+        let base = url::Url::parse("https://example.test/base.css").unwrap();
+        let css = r#"
+            @import "simple.css";
+            @import url("with-url.css");
+            @import url('with-single.css');
+            @import 'semi;colon.css';
+            @import url("media;query.css") (min-width: 600px);
+            @import /* comment ; inside */ "comment.css";
+            @import "nested.css" screen and (max-width: 768px);
+            .a { background: url("image-a.png"); }
+            @important { color: red; }
+            .b { background: url("image-b.png"); }
+        "#;
+        assert_eq!(
+            css_resource_urls(css, &base),
+            vec![
+                "https://example.test/image-a.png".to_string(),
+                "https://example.test/image-b.png".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn css_resource_urls_preserves_order_and_duplicates() {
+        let base = url::Url::parse("https://example.test/page.html").unwrap();
+        let css = r#"
+            .first { background: url("shared.png"); }
+            .second { background: url("second.png"); }
+            .repeat { background: url("shared.png"); }
+        "#;
+        assert_eq!(
+            css_resource_urls(css, &base),
+            vec![
+                "https://example.test/shared.png".to_string(),
+                "https://example.test/second.png".to_string(),
+                "https://example.test/shared.png".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn css_resource_urls_filters_schemes_var_and_url_parser_canonicalization() {
+        let base = url::Url::parse("https://example.test/style.css").unwrap();
+        let css = r#"
+            .http { background: url("http://insecure.test/img.png"); }
+            .https { background: url("https://secure.test/img.png"); }
+            .ftp { background: url("ftp://files.test/img.png"); }
+            .file { background: url("file:///local/img.png"); }
+            .blob { background: url("blob:https://example.test/uuid"); }
+            .javascript { background: url("javascript:alert(1)"); }
+            .var1 { background: url(var(--custom-bg)); }
+            .var2 { background: url(var(--bg, "fallback.png")); }
+            .empty1 { background: url(); }
+            .empty2 { background: url(""); }
+            .empty3 { background: url('   '); }
+            .unquoted { background: url(unquoted.png); }
+            .spaced { background: url(  "spaced.png"  ); }
+        "#;
+        assert_eq!(
+            css_resource_urls(css, &base),
+            vec![
+                "http://insecure.test/img.png".to_string(),
+                "https://secure.test/img.png".to_string(),
+                // The URL parser trims an all-whitespace reference and joins
+                // the resulting empty relative URL to the stylesheet base.
+                "https://example.test/style.css".to_string(),
+                "https://example.test/unquoted.png".to_string(),
+                "https://example.test/spaced.png".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn css_resource_urls_handles_malformed_and_edge_cases() {
+        let base = url::Url::parse("https://example.test/app.css").unwrap();
+        assert_eq!(css_resource_urls("/* url(a.png)", &base), Vec::<String>::new());
+        assert_eq!(css_resource_urls(r#""url(a.png)"#, &base), Vec::<String>::new());
+        assert_eq!(
+            css_resource_urls(r#"content: "escaped \" url(a.png)"; .b { background: url(b.png); }"#, &base),
+            vec!["https://example.test/b.png".to_string()]
+        );
+        assert_eq!(css_resource_urls("background: url(unclosed.png", &base), Vec::<String>::new());
+        assert_eq!(css_resource_urls("@import url(unclosed.css", &base), Vec::<String>::new());
+        assert_eq!(
+            css_resource_urls(r#"background: url("foo%20bar.png");"#, &base),
+            vec!["https://example.test/foo%20bar.png".to_string()]
+        );
+    }
+
+    #[test]
+    fn css_resource_requests_preserve_font_face_context_not_url_suffixes() {
+        let base = url::Url::parse("https://example.test/css/app.css").unwrap();
+        let css = r#"
+            😀 .image { background: url("looks-like-font.woff2"); }
+            @FONT-FACE/* valid comment boundary */{
+                src: local("Ignored"), url("/download?family=portable");
+                @supports (font-tech(color-COLRv1)) {
+                    src: url("nested?id=2");
+                }
+            }
+            .after { mask: url("after.svg"); }
+            .copy::before { content: "@font-face { src:url(fake) }"; }
+        "#;
+        assert_eq!(
+            css_resource_requests(css, &base),
+            vec![
+                CssResourceRequest {
+                    url: "https://example.test/css/looks-like-font.woff2".to_string(),
+                    kind: CssResourceKind::Image,
+                },
+                CssResourceRequest {
+                    url: "https://example.test/download?family=portable".to_string(),
+                    kind: CssResourceKind::Font,
+                },
+                CssResourceRequest {
+                    url: "https://example.test/css/nested?id=2".to_string(),
+                    kind: CssResourceKind::Font,
+                },
+                CssResourceRequest {
+                    url: "https://example.test/css/after.svg".to_string(),
+                    kind: CssResourceKind::Image,
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn css_resource_scanner_treats_comments_as_boundaries_and_balanced_eof_import_as_import() {
+        let base = url::Url::parse("https://example.test/app.css").unwrap();
+        assert_eq!(
+            css_resource_requests("/* lead */@font-face/* gap */{src:url(font?id=1)}", &base),
+            vec![CssResourceRequest {
+                url: "https://example.test/font?id=1".to_string(),
+                kind: CssResourceKind::Font,
+            }]
+        );
+        assert_eq!(
+            css_resource_requests("@import url(theme.css)", &base),
+            Vec::<CssResourceRequest>::new()
+        );
+        assert_eq!(
+            css_resource_requests("@import url(unclosed.css", &base),
+            Vec::<CssResourceRequest>::new()
+        );
     }
 }

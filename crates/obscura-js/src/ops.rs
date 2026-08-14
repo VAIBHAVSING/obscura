@@ -3929,20 +3929,8 @@ fn op_waapi_control(
 
 #[cfg(feature = "render")]
 pub(crate) fn document_base_url(state: &ObscuraState) -> Option<String> {
-    let document_url = url::Url::parse(&state.url).ok()?;
-    let base_href = state.dom.as_ref().and_then(|dom| {
-        dom.query_selector("base[href]")
-            .ok()
-            .flatten()
-            .and_then(|id| {
-                dom.get_node(id)
-                    .and_then(|node| node.get_attribute("href").map(str::to_string))
-            })
-    });
-    match base_href {
-        Some(href) => document_url.join(&href).ok().map(|url| url.to_string()),
-        None => Some(document_url.to_string()),
-    }
+    let dom = state.dom.as_ref()?;
+    obscura_dom::resolve_document_base_url(dom, &state.url).map(|url| url.to_string())
 }
 
 #[cfg(feature = "render")]

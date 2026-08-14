@@ -278,6 +278,9 @@ test("bridges ObscuraCore queries into the persistent host V8 document facade", 
         setDocumentMetadata: null,
         seedRenderResource: null,
         seedMissingRenderResource: null,
+        renderResourceRequests: null,
+        seedRenderImageResource: null,
+        seedMissingRenderImageResource: null,
         screenshotPng: null,
         dispose: "free",
       },
@@ -285,6 +288,8 @@ test("bridges ObscuraCore queries into the persistent host V8 document facade", 
       render: {
         available: false,
         renderAbiVersion: null,
+        resourcesAvailable: false,
+        resourceRequestAbiVersion: null,
         screenshotPng: false,
       },
       bootstrap: {
@@ -1774,10 +1779,15 @@ test("negotiates render ABI v1 and reports capability status without falsely adv
     const status = await oldWorker.bridgeStatus();
     assert.equal(status.render.available, false);
     assert.equal(status.render.renderAbiVersion, null);
+    assert.equal(status.render.resourcesAvailable, false);
+    assert.equal(status.render.resourceRequestAbiVersion, null);
     assert.equal(status.render.screenshotPng, false);
     assert.equal(status.api.seedRenderResource, null);
     assert.equal(status.api.seedMissingRenderResource, null);
     assert.equal(status.api.screenshotPng, null);
+    assert.equal(status.api.renderResourceRequests, null);
+    assert.equal(status.api.seedRenderImageResource, null);
+    assert.equal(status.api.seedMissingRenderImageResource, null);
 
     await assert.rejects(
       oldWorker.seedRenderResource("https://example.test/img.png", new Uint8Array([1, 2, 3])),
@@ -1801,10 +1811,15 @@ test("negotiates render ABI v1 and reports capability status without falsely adv
     const status = await renderWorker.bridgeStatus();
     assert.equal(status.render.available, true);
     assert.equal(status.render.renderAbiVersion, 1);
+    assert.equal(status.render.resourcesAvailable, true);
+    assert.equal(status.render.resourceRequestAbiVersion, 1);
     assert.equal(status.render.screenshotPng, true);
     assert.equal(status.api.seedRenderResource, "seedRenderResource");
     assert.equal(status.api.seedMissingRenderResource, "seedMissingRenderResource");
     assert.equal(status.api.screenshotPng, "screenshotPng");
+    assert.equal(status.api.renderResourceRequests, "renderResourceRequests");
+    assert.equal(status.api.seedRenderImageResource, "seedRenderImageResource");
+    assert.equal(status.api.seedMissingRenderImageResource, "seedMissingRenderImageResource");
   } finally {
     await renderWorker.close();
   }

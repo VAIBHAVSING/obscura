@@ -1936,6 +1936,7 @@ dependencies = [
  "servo_arc",
  "thiserror 2.0.18",
  "tracing",
+ "url",
 ]
 
 [[package]]
@@ -2051,6 +2052,7 @@ dependencies = [
  "obscura-render",
  "serde",
  "serde_json",
+ "url",
  "wasm-bindgen",
 ]
 

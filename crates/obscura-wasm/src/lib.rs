@@ -1,11 +1,15 @@
 use std::any::Any;
 use std::collections::HashMap;
+#[cfg(feature = "render")]
+use std::collections::BTreeMap;
 use std::panic::{catch_unwind, AssertUnwindSafe};
 
 use obscura_dom::{
     parse_fragment, parse_fragment_with_context, parse_html, DomTree, NodeData, NodeId,
 };
 use wasm_bindgen::prelude::*;
+#[cfg(feature = "render")]
+use serde::Serialize;
 
 mod platform;
 
@@ -14,6 +18,8 @@ const DOM_OP_ABI_VERSION: u32 = 1;
 const DOM_BATCH_ABI_VERSION: u32 = 1;
 #[cfg(feature = "render")]
 const RENDER_ABI_VERSION: u32 = 1;
+#[cfg(feature = "render")]
+const RENDER_RESOURCE_REQUEST_ABI_VERSION: u32 = 1;
 const MAX_HTML_INPUT_BYTES: usize = 8 * 1024 * 1024;
 const MAX_SELECTOR_BYTES: usize = 64 * 1024;
 const MAX_RETURNED_STRING_BYTES: usize = 4 * 1024 * 1024;
@@ -22,6 +28,10 @@ const MAX_DOM_ARGUMENT_BYTES: usize = MAX_HTML_INPUT_BYTES;
 const MAX_DOM_BATCH_BYTES: usize = 8 * 1024 * 1024;
 const MAX_DOM_BATCH_OPS: usize = 1024;
 const MAX_DOCUMENT_METADATA_BYTES: usize = 64 * 1024;
+#[cfg(feature = "render")]
+const MAX_RENDER_RESOURCE_BYTES: usize = 16 * 1024 * 1024;
+#[cfg(feature = "render")]
+const MAX_RENDER_RESOURCE_REQUESTS_PER_PAGE: usize = 32;
 
 fn require_max_bytes(value: &str, maximum: usize, label: &str) -> Result<(), JsValue> {
     if value.len() > maximum {
@@ -91,6 +101,59 @@ fn portable_render_resources() -> obscura_render::RenderResourceCache {
     let mut resources = obscura_render::RenderResourceCache::with_loader(|_url: &str| None);
     resources.set_sync_loading_enabled(false);
     resources
+}
+
+#[cfg(feature = "render")]
+fn image_request_profile(
+    node: &obscura_dom::Node,
+) -> obscura_render::ImageRequestProfile {
+    match node
+        .get_attribute("crossorigin")
+        .map(|value| value.trim().to_ascii_lowercase())
+        .as_deref()
+    {
+        Some("use-credentials") => obscura_render::ImageRequestProfile::CorsInclude,
+        Some(_) => obscura_render::ImageRequestProfile::CorsSameOrigin,
+        None => obscura_render::ImageRequestProfile::NoCorsInclude,
+    }
+}
+
+#[cfg(feature = "render")]
+fn image_request_profile_name(profile: obscura_render::ImageRequestProfile) -> &'static str {
+    match profile {
+        obscura_render::ImageRequestProfile::NoCorsInclude => "no-cors-include",
+        obscura_render::ImageRequestProfile::CorsSameOrigin => "cors-same-origin",
+        obscura_render::ImageRequestProfile::CorsInclude => "cors-include",
+    }
+}
+
+#[cfg(feature = "render")]
+fn parse_image_request_profile(value: &str) -> Result<obscura_render::ImageRequestProfile, String> {
+    match value {
+        "no-cors-include" => Ok(obscura_render::ImageRequestProfile::NoCorsInclude),
+        "cors-same-origin" => Ok(obscura_render::ImageRequestProfile::CorsSameOrigin),
+        "cors-include" => Ok(obscura_render::ImageRequestProfile::CorsInclude),
+        _ => Err("unknown render image request profile".to_string()),
+    }
+}
+
+#[cfg(feature = "render")]
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct RenderResourceRequest {
+    url: String,
+    kind: &'static str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    profile: Option<&'static str>,
+}
+
+#[cfg(feature = "render")]
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct RenderResourceRequestPage {
+    requests: Vec<RenderResourceRequest>,
+    next_offset: usize,
+    done: bool,
 }
 
 /// Portable part of an Obscura page.
@@ -204,7 +267,7 @@ impl ObscuraCore {
     #[wasm_bindgen(js_name = seedRenderResource)]
     pub fn seed_render_resource(&mut self, url: &str, bytes: &[u8]) -> Result<(), JsValue> {
         require_max_bytes(url, MAX_DOCUMENT_METADATA_BYTES, "render resource URL")?;
-        if bytes.len() > 16 * 1024 * 1024 {
+        if bytes.len() > MAX_RENDER_RESOURCE_BYTES {
             return Err(js_sys::RangeError::new(
                 "render resource exceeds the 16777216-byte ABI limit",
             )
@@ -222,6 +285,90 @@ impl ObscuraCore {
         require_max_bytes(url, MAX_DOCUMENT_METADATA_BYTES, "render resource URL")?;
         self.render_resources.seed_missing(url.to_string());
         Ok(())
+    }
+
+    /// Discover network-backed bytes needed by the next layout/paint. The
+    /// Node transport applies network policy and fetches at most its own page
+    /// budget; pagination prevents rejected URLs from hiding later candidates.
+    #[cfg(feature = "render")]
+    #[wasm_bindgen(js_name = renderResourceRequests)]
+    pub fn render_resource_requests(
+        &self,
+        width: u32,
+        height: u32,
+        offset: u32,
+        limit: u32,
+    ) -> Result<String, JsValue> {
+        if width == 0 || height == 0 {
+            return Err(js_sys::RangeError::new("render viewport must be non-zero").into());
+        }
+        if width > obscura_render::MAX_CAPTURE_DIMENSION
+            || height > obscura_render::MAX_CAPTURE_DIMENSION
+            || (width as u64).saturating_mul(height as u64)
+                > obscura_render::MAX_CAPTURE_PIXELS
+        {
+            return Err(js_sys::RangeError::new("render viewport exceeds render limits").into());
+        }
+        if limit == 0 || limit as usize > MAX_RENDER_RESOURCE_REQUESTS_PER_PAGE {
+            return Err(js_sys::RangeError::new(
+                "render resource request page limit must be between 1 and 32",
+            )
+            .into());
+        }
+        boundary_result("render_resource_requests", || {
+            self.render_resource_requests_inner(width, height, offset as usize, limit as usize)
+        })
+        .and_then(|value| bounded_return(value, "render resource request page"))
+    }
+
+    /// Seed an HTML image or video-poster response under its exact Fetch
+    /// credentials/CORS profile. Invalid image bytes become a retained miss,
+    /// matching the native page transport and preventing repeated decode work.
+    #[cfg(feature = "render")]
+    #[wasm_bindgen(js_name = seedRenderImageResource)]
+    pub fn seed_render_image_resource(
+        &mut self,
+        url: &str,
+        profile: &str,
+        bytes: &[u8],
+    ) -> Result<(), JsValue> {
+        require_max_bytes(url, MAX_DOCUMENT_METADATA_BYTES, "render resource URL")?;
+        require_max_bytes(profile, MAX_DOM_COMMAND_BYTES, "render image request profile")?;
+        if bytes.len() > MAX_RENDER_RESOURCE_BYTES {
+            return Err(js_sys::RangeError::new(
+                "render resource exceeds the 16777216-byte ABI limit",
+            )
+            .into());
+        }
+        boundary_result("seed_render_image_resource", || {
+            let profile = parse_image_request_profile(profile)?;
+            if obscura_render::image_intrinsic_dimensions(bytes).is_some() {
+                self.render_resources
+                    .seed_image(url.to_string(), profile, bytes.to_vec());
+            } else {
+                self.render_resources
+                    .seed_image_missing(url.to_string(), profile);
+            }
+            Ok(())
+        })
+    }
+
+    /// Retain a failed profiled image request for the current document.
+    #[cfg(feature = "render")]
+    #[wasm_bindgen(js_name = seedMissingRenderImageResource)]
+    pub fn seed_missing_render_image_resource(
+        &mut self,
+        url: &str,
+        profile: &str,
+    ) -> Result<(), JsValue> {
+        require_max_bytes(url, MAX_DOCUMENT_METADATA_BYTES, "render resource URL")?;
+        require_max_bytes(profile, MAX_DOM_COMMAND_BYTES, "render image request profile")?;
+        boundary_result("seed_missing_render_image_resource", || {
+            let profile = parse_image_request_profile(profile)?;
+            self.render_resources
+                .seed_image_missing(url.to_string(), profile);
+            Ok(())
+        })
     }
 
     /// Layout and paint the current document entirely inside WASM and return
@@ -250,10 +397,12 @@ impl ObscuraCore {
         }
         boundary_result("screenshot_png", || {
             let viewport = (width as f32, height as f32);
+            let base_url =
+                obscura_render::resolve_document_base_url(&self.dom, &self.document_url);
             let mut prepared = obscura_render::prepare_dom(
                 &self.dom,
                 viewport,
-                Some(&self.document_url),
+                base_url.as_ref().map(url::Url::as_str),
                 &mut self.render_resources,
             )
             .ok_or_else(|| "unable to prepare document render".to_string())?;
@@ -265,6 +414,117 @@ impl ObscuraCore {
             )
             .ok_or_else(|| "unable to encode document screenshot".to_string())
         })
+    }
+
+    #[cfg(feature = "render")]
+    fn render_resource_requests_inner(
+        &self,
+        width: u32,
+        height: u32,
+        offset: usize,
+        limit: usize,
+    ) -> Result<String, String> {
+        let viewport = (width as f32, height as f32);
+        let base_url = obscura_render::resolve_document_base_url(&self.dom, &self.document_url);
+        let base = base_url.as_ref().map(url::Url::as_str);
+        let mut candidates: BTreeMap<
+            (String, Option<obscura_render::ImageRequestProfile>),
+            &'static str,
+        > = BTreeMap::new();
+        let mut css_sources = Vec::new();
+
+        for id in self.dom.descendants(self.dom.document()) {
+            let Some(node) = self.dom.get_node(id) else {
+                continue;
+            };
+            let candidate = match node.as_element().map(|name| name.local.as_ref()) {
+                Some("img") => self
+                    .render_resources
+                    .cached_image_element_metadata(&self.dom, id, viewport, base)
+                    .map(|(url, _, known, _)| {
+                        (url, image_request_profile(&node), known)
+                    }),
+                Some("video") => self
+                    .render_resources
+                    .cached_video_poster_metadata(&self.dom, id, base)
+                    .map(|(url, profile, known, _)| (url, profile, known)),
+                _ => None,
+            };
+            if let Some((raw, profile, _known)) = candidate {
+                if !raw.starts_with("data:") {
+                    if let Ok(mut parsed) = url::Url::parse(&raw) {
+                        parsed.set_fragment(None);
+                        let url = parsed.to_string();
+                        if url.len() <= MAX_DOCUMENT_METADATA_BYTES {
+                            candidates.insert((url, Some(profile)), "image");
+                        }
+                    }
+                }
+            }
+
+            if node
+                .as_element()
+                .is_some_and(|element| element.local.as_ref() == "style")
+            {
+                css_sources.push(self.dom.text_content(id));
+            }
+            if let Some(style) = node.get_attribute("style") {
+                css_sources.push(style.to_string());
+            }
+            if node
+                .as_element()
+                .is_some_and(|element| element.local.as_ref() == "use")
+            {
+                if let Some(href) = node
+                    .get_attribute("href")
+                    .or_else(|| node.get_attribute("xlink:href"))
+                {
+                    css_sources.push(format!("url({href})"));
+                }
+            }
+        }
+
+        if let Some(base_url) = base_url.as_ref() {
+            for css in css_sources {
+                for request in obscura_render::css_resource_requests(&css, base_url) {
+                    if let Ok(mut parsed) = url::Url::parse(&request.url) {
+                        parsed.set_fragment(None);
+                        let url = parsed.to_string();
+                        if url.len() <= MAX_DOCUMENT_METADATA_BYTES {
+                            let kind = match request.kind {
+                                obscura_render::CssResourceKind::Image => "image",
+                                obscura_render::CssResourceKind::Font => "font",
+                            };
+                            candidates.insert((url, None), kind);
+                        }
+                    }
+                }
+            }
+        }
+
+        let candidates: Vec<_> = candidates.into_iter().collect();
+        let start = offset.min(candidates.len());
+        let end = start.saturating_add(limit).min(candidates.len());
+        let requests = candidates[start..end]
+            .iter()
+            .filter(|((url, profile), _)| match profile {
+                Some(profile) => !self
+                    .render_resources
+                    .has_live_image_outcome(url, *profile),
+                None => !self.render_resources.has_live_outcome(url),
+            })
+            .map(|((url, profile), kind)| RenderResourceRequest {
+                url: url.clone(),
+                kind: *kind,
+                profile: (*profile).map(image_request_profile_name),
+            })
+            .collect();
+        serde_json::to_string(&RenderResourceRequestPage {
+            requests,
+            next_offset: if offset > candidates.len() { offset } else { end },
+            done: end == candidates.len(),
+        })
+        .map_err(|error| error.to_string())
     }
 
     /// Execute one command using the same three-string wire contract as the
@@ -1384,12 +1644,13 @@ pub fn probe() -> String {
     boundary_value("probe", || {
         #[cfg(feature = "render")]
         return format!(
-            r#"{{"abiVersion":{},"dom":true,"selectors":true,"javascript":"host","embeddedV8":false,"domOpAbiVersion":{},"domBatchAbiVersion":{},"documentMetadataAbiVersion":1,"platformOpAbiVersion":{},"renderAbiVersion":{},"screenshotPng":true,"stableNodeHandles":true}}"#,
+            r#"{{"abiVersion":{},"dom":true,"selectors":true,"javascript":"host","embeddedV8":false,"domOpAbiVersion":{},"domBatchAbiVersion":{},"documentMetadataAbiVersion":1,"platformOpAbiVersion":{},"renderAbiVersion":{},"renderResourceRequestAbiVersion":{},"renderResourceRequests":true,"screenshotPng":true,"stableNodeHandles":true}}"#,
             ABI_VERSION,
             DOM_OP_ABI_VERSION,
             DOM_BATCH_ABI_VERSION,
             platform::PLATFORM_OP_ABI_VERSION,
             RENDER_ABI_VERSION,
+            RENDER_RESOURCE_REQUEST_ABI_VERSION,
         );
         #[cfg(not(feature = "render"))]
         format!(
@@ -1461,6 +1722,155 @@ mod tests {
         let replacement = core.screenshot_png(16, 16, 0.0, 0.0).unwrap();
         assert!(replacement.starts_with(b"\x89PNG\r\n\x1a\n"));
         assert_ne!(png, replacement);
+    }
+
+    #[cfg(feature = "render")]
+    #[test]
+    fn render_resource_discovery_is_profiled_paged_and_base_url_aware() {
+        let mut core = ObscuraCore::new(
+            "<!doctype html><base href='https://assets.test/base/'>\
+             <style>@font-face{src:url(font.woff2)}.hero{background:url(bg.png)}</style>\
+             <img src='plain.png'><img crossorigin='anonymous' src='cors.png'>\
+             <img crossorigin='use-credentials' src='creds.png'>\
+             <video crossorigin='anonymous' poster='poster.png'></video>\
+             <svg><use href='../icons.svg#mark'></use></svg>",
+        )
+        .unwrap();
+        core.set_document_metadata("https://document.test/page", "", "UTF-8")
+            .unwrap();
+
+        let first: serde_json::Value = serde_json::from_str(
+            &core
+                .render_resource_requests_inner(800, 600, 0, 2)
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(first["requests"].as_array().unwrap().len(), 2);
+        assert_eq!(first["nextOffset"], 2);
+        assert_eq!(first["done"], false);
+
+        for request in first["requests"].as_array().unwrap() {
+            let url = request["url"].as_str().unwrap();
+            match request.get("profile").and_then(serde_json::Value::as_str) {
+                Some(profile) => core
+                    .seed_missing_render_image_resource(url, profile)
+                    .unwrap(),
+                None => core.seed_missing_render_resource(url).unwrap(),
+            }
+        }
+
+        let mut requests = first["requests"].as_array().unwrap().clone();
+        let mut offset = first["nextOffset"].as_u64().unwrap() as usize;
+        loop {
+            let page: serde_json::Value = serde_json::from_str(
+                &core
+                    .render_resource_requests_inner(800, 600, offset, 2)
+                    .unwrap(),
+            )
+            .unwrap();
+            requests.extend(page["requests"].as_array().unwrap().iter().cloned());
+            offset = page["nextOffset"].as_u64().unwrap() as usize;
+            if page["done"] == true {
+                break;
+            }
+        }
+
+        assert_eq!(
+            requests,
+            vec![
+                serde_json::json!({"url":"https://assets.test/base/bg.png","kind":"image"}),
+                serde_json::json!({"url":"https://assets.test/base/cors.png","kind":"image","profile":"cors-same-origin"}),
+                serde_json::json!({"url":"https://assets.test/base/creds.png","kind":"image","profile":"cors-include"}),
+                serde_json::json!({"url":"https://assets.test/base/font.woff2","kind":"font"}),
+                serde_json::json!({"url":"https://assets.test/base/plain.png","kind":"image","profile":"no-cors-include"}),
+                serde_json::json!({"url":"https://assets.test/base/poster.png","kind":"image","profile":"cors-same-origin"}),
+                serde_json::json!({"url":"https://assets.test/icons.svg","kind":"image"}),
+            ]
+        );
+
+        for request in &requests {
+            let url = request["url"].as_str().unwrap();
+            match request.get("profile").and_then(serde_json::Value::as_str) {
+                Some(profile) => core
+                    .seed_missing_render_image_resource(url, profile)
+                    .unwrap(),
+                None => core.seed_missing_render_resource(url).unwrap(),
+            }
+        }
+        let empty: serde_json::Value = serde_json::from_str(
+            &core
+                .render_resource_requests_inner(800, 600, 0, 32)
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(empty["requests"], serde_json::json!([]));
+        assert_eq!(empty["nextOffset"], 7);
+        assert_eq!(empty["done"], true);
+
+        core.set_html("<base href='https://assets.test/base/'><img src='plain.png'>")
+            .unwrap();
+        let reset: serde_json::Value = serde_json::from_str(
+            &core
+                .render_resource_requests_inner(800, 600, 0, 32)
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(reset["requests"].as_array().unwrap().len(), 1);
+        assert_eq!(reset["requests"][0]["profile"], "no-cors-include");
+    }
+
+    #[cfg(feature = "render")]
+    #[test]
+    fn render_resource_profile_wire_values_are_exact() {
+        use obscura_render::ImageRequestProfile;
+
+        for (wire, expected) in [
+            ("no-cors-include", ImageRequestProfile::NoCorsInclude),
+            ("cors-same-origin", ImageRequestProfile::CorsSameOrigin),
+            ("cors-include", ImageRequestProfile::CorsInclude),
+        ] {
+            assert_eq!(parse_image_request_profile(wire).unwrap(), expected);
+            assert_eq!(image_request_profile_name(expected), wire);
+        }
+        assert_eq!(
+            parse_image_request_profile("include").unwrap_err(),
+            "unknown render image request profile"
+        );
+    }
+
+    #[cfg(feature = "render")]
+    #[test]
+    fn render_resource_discovery_falls_back_from_invalid_base_and_keeps_css_kind() {
+        let mut core = ObscuraCore::new(
+            "<base href='http://['><base href='https://ignored.test/'>\
+             <style>@font-face{src:url(download?family=portable)}\
+             .hero{background:url(looks-like-font.woff2)}</style>",
+        )
+        .unwrap();
+        core.set_document_metadata("https://document.test/path/page.html", "", "UTF-8")
+            .unwrap();
+
+        let page: serde_json::Value = serde_json::from_str(
+            &core
+                .render_resource_requests_inner(800, 600, 0, 32)
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            page["requests"],
+            serde_json::json!([
+                {
+                    "url": "https://document.test/path/download?family=portable",
+                    "kind": "font"
+                },
+                {
+                    "url": "https://document.test/path/looks-like-font.woff2",
+                    "kind": "image"
+                }
+            ])
+        );
+        assert_eq!(page["nextOffset"], 2);
+        assert_eq!(page["done"], true);
     }
 
     #[test]
@@ -1845,6 +2255,16 @@ mod tests {
         assert_eq!(probe["selectors"], true);
         assert_eq!(probe["javascript"], "host");
         assert_eq!(probe["embeddedV8"], false);
+        #[cfg(feature = "render")]
+        {
+            assert_eq!(probe["renderAbiVersion"], RENDER_ABI_VERSION);
+            assert_eq!(
+                probe["renderResourceRequestAbiVersion"],
+                RENDER_RESOURCE_REQUEST_ABI_VERSION
+            );
+            assert_eq!(probe["renderResourceRequests"], true);
+            assert_eq!(probe["screenshotPng"], true);
+        }
     }
 
     #[test]

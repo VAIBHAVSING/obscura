@@ -24,6 +24,8 @@ class ObscuraCore {
     this.nodes = new Map();
     this.renderResources = new Map();
     this.missingResources = new Set();
+    this.renderImageResources = new Map();
+    this.missingImageResources = new Set();
     this.document = this.#node(9, "#document");
     this.#parse(html);
     this.freed = false;
@@ -103,6 +105,61 @@ class ObscuraCore {
       throw new RangeError("render resource URL exceeds limit");
     }
     this.missingResources.add(url);
+  }
+
+  renderResourceRequests(width, height, offset, limit) {
+    this.#assertOpen();
+    if (!Number.isInteger(width) || !Number.isInteger(height) || width < 1 || height < 1) {
+      throw new RangeError("render viewport must be non-zero");
+    }
+    if (!Number.isInteger(offset) || offset < 0 || !Number.isInteger(limit) || limit < 1 || limit > 32) {
+      throw new RangeError("invalid render resource request page");
+    }
+    const candidates = [
+      { url: "https://example.test/font.woff2", kind: "font" },
+      { url: "https://example.test/image.png", kind: "image", profile: "no-cors-include" },
+      { url: "https://example.test/private.png", kind: "image", profile: "cors-include" },
+    ];
+    const start = Math.min(offset, candidates.length);
+    const end = Math.min(start + limit, candidates.length);
+    const requests = candidates.slice(start, end).filter((request) => {
+      if (request.profile) {
+        const key = `${request.profile}\0${request.url}`;
+        return !this.renderImageResources.has(key) && !this.missingImageResources.has(key);
+      }
+      return !this.renderResources.has(request.url) && !this.missingResources.has(request.url);
+    });
+    return JSON.stringify({
+      requests,
+      nextOffset: offset > candidates.length ? offset : end,
+      done: end === candidates.length,
+    });
+  }
+
+  seedRenderImageResource(url, profile, bytes) {
+    this.#assertOpen();
+    if (typeof url !== "string" || Buffer.byteLength(url, "utf8") > 64 * 1024) {
+      throw new RangeError("render resource URL exceeds limit");
+    }
+    if (!["no-cors-include", "cors-same-origin", "cors-include"].includes(profile)) {
+      throw new TypeError("unknown render image request profile");
+    }
+    if (!(bytes instanceof Uint8Array) && !Buffer.isBuffer(bytes)) {
+      throw new TypeError("bytes must be a Uint8Array or Buffer");
+    }
+    const key = `${profile}\0${url}`;
+    this.renderImageResources.set(
+      key,
+      new Uint8Array(bytes.buffer.slice(bytes.byteOffset, bytes.byteOffset + bytes.byteLength)),
+    );
+  }
+
+  seedMissingRenderImageResource(url, profile) {
+    this.#assertOpen();
+    if (!["no-cors-include", "cors-same-origin", "cors-include"].includes(profile)) {
+      throw new TypeError("unknown render image request profile");
+    }
+    this.missingImageResources.add(`${profile}\0${url}`);
   }
 
   screenshotPng(width, height, scrollX, scrollY) {
@@ -350,6 +407,8 @@ module.exports = {
       domBatchAbiVersion: 1,
       documentMetadataAbiVersion: 1,
       renderAbiVersion: 1,
+      renderResourceRequestAbiVersion: 1,
+      renderResourceRequests: true,
       screenshotPng: true,
       stableNodeHandles: true,
       javascript: "host",

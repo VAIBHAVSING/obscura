@@ -25,6 +25,7 @@ import {
   MAX_PLATFORM_REQUEST_BYTES,
   MAX_PLATFORM_RESPONSE_BYTES,
   MAX_RENDER_RESOURCE_BYTES,
+  MAX_RENDER_RESOURCE_REQUESTS_PER_PAGE,
   MAX_RENDER_URL_BYTES,
   MAX_RETURNED_STRING_BYTES,
   MAX_SCREENSHOT_DIMENSION,
@@ -32,6 +33,7 @@ import {
   MAX_SELECTOR_BYTES,
   requireBoundedBytes,
   requireBoundedString,
+  requireRenderImageRequestProfile,
   requireValidPngBytes,
 } from "./limits.mjs";
 
@@ -64,6 +66,12 @@ const DOCUMENT_HANDLE_NAMES = ["document_handle", "documentHandle"];
 const SET_DOCUMENT_METADATA_NAMES = ["set_document_metadata", "setDocumentMetadata"];
 const SEED_RENDER_RESOURCE_NAMES = ["seed_render_resource", "seedRenderResource"];
 const SEED_MISSING_RENDER_RESOURCE_NAMES = ["seed_missing_render_resource", "seedMissingRenderResource"];
+const RENDER_RESOURCE_REQUEST_NAMES = ["render_resource_requests", "renderResourceRequests"];
+const SEED_RENDER_IMAGE_RESOURCE_NAMES = ["seed_render_image_resource", "seedRenderImageResource"];
+const SEED_MISSING_RENDER_IMAGE_RESOURCE_NAMES = [
+  "seed_missing_render_image_resource",
+  "seedMissingRenderImageResource",
+];
 const SCREENSHOT_PNG_NAMES = ["screenshot_png", "screenshotPng"];
 const PLATFORM_OP_ABI_VERSION_NAME = "platformOpAbiVersion";
 const PLATFORM_OP_NAME = "platformOp";
@@ -73,6 +81,7 @@ const REQUIRED_DOM_BATCH_ABI_VERSION = 1;
 const REQUIRED_DOCUMENT_METADATA_ABI_VERSION = 1;
 const REQUIRED_PLATFORM_OP_ABI_VERSION = 1;
 const REQUIRED_RENDER_ABI_VERSION = 1;
+const REQUIRED_RENDER_RESOURCE_REQUEST_ABI_VERSION = 1;
 const PLATFORM_OP_COMMAND_SET = new Set(BOOTSTRAP_PLATFORM_OP_COMMANDS);
 const PLATFORM_BYTE_FIELDS = Object.freeze({
   op_text_decode: ["bytes"],
@@ -754,9 +763,48 @@ function bridgeApi(core = bridgeCore) {
     setDocumentMetadata: member(core, SET_DOCUMENT_METADATA_NAMES),
     seedRenderResource: member(core, SEED_RENDER_RESOURCE_NAMES),
     seedMissingRenderResource: member(core, SEED_MISSING_RENDER_RESOURCE_NAMES),
+    renderResourceRequests: member(core, RENDER_RESOURCE_REQUEST_NAMES),
+    seedRenderImageResource: member(core, SEED_RENDER_IMAGE_RESOURCE_NAMES),
+    seedMissingRenderImageResource: member(core, SEED_MISSING_RENDER_IMAGE_RESOURCE_NAMES),
     screenshotPng: member(core, SCREENSHOT_PNG_NAMES),
     dispose: member(core, DISPOSE_NAMES),
   };
+}
+
+async function requireRenderResourceCompatibility(api, requiredMethod) {
+  const capabilities = await getBridgeCapabilityProbe();
+  if (!capabilities) {
+    throw renderAbiError("ObscuraCore render resource ABI requires a machine-readable capability probe");
+  }
+  if (capabilities.renderAbiVersion !== REQUIRED_RENDER_ABI_VERSION) {
+    throw renderAbiError(
+      `ObscuraCore render requires ABI version ${REQUIRED_RENDER_ABI_VERSION}, but the probe exposes ${String(capabilities.renderAbiVersion)}`,
+    );
+  }
+  if (capabilities.renderResourceRequestAbiVersion !== REQUIRED_RENDER_RESOURCE_REQUEST_ABI_VERSION) {
+    throw renderAbiError(
+      `ObscuraCore render resource requests require ABI version ${REQUIRED_RENDER_RESOURCE_REQUEST_ABI_VERSION}, but the probe exposes ${String(capabilities.renderResourceRequestAbiVersion)}`,
+    );
+  }
+  if (capabilities.renderResourceRequests !== true) {
+    throw renderAbiError("ObscuraCore render resources require renderResourceRequests=true");
+  }
+  const names = {
+    seedRenderResource: "seed_render_resource/seedRenderResource",
+    seedMissingRenderResource: "seed_missing_render_resource/seedMissingRenderResource",
+    renderResourceRequests: "render_resource_requests/renderResourceRequests",
+    seedRenderImageResource: "seed_render_image_resource/seedRenderImageResource",
+    seedMissingRenderImageResource:
+      "seed_missing_render_image_resource/seedMissingRenderImageResource",
+  };
+  for (const method of Object.keys(names)) {
+    if (!api[method]) {
+      throw renderAbiError(`ObscuraCore does not expose ${names[method]}`);
+    }
+  }
+  if (requiredMethod && !Object.hasOwn(names, requiredMethod)) {
+    throw new TypeError(`unknown render resource method ${requiredMethod}`);
+  }
 }
 
 function bridgeAbiError(message) {
@@ -1377,6 +1425,17 @@ async function bridgeStatus() {
   const hasScreenshotFlag = capabilities?.screenshotPng === true;
   const hasRenderAbi = hasValidVersion && hasScreenshotFlag;
   const hasScreenshotPng = hasRenderAbi && Boolean(api.screenshotPng);
+  const hasValidResourceRequestVersion =
+    capabilities?.renderResourceRequestAbiVersion === REQUIRED_RENDER_RESOURCE_REQUEST_ABI_VERSION;
+  const hasResourceRequestFlag = capabilities?.renderResourceRequests === true;
+  const hasRenderResourceAbi = hasValidVersion && hasValidResourceRequestVersion && hasResourceRequestFlag;
+  const hasCompleteRenderResourceApi =
+    hasRenderResourceAbi &&
+    Boolean(api.seedRenderResource) &&
+    Boolean(api.seedMissingRenderResource) &&
+    Boolean(api.renderResourceRequests) &&
+    Boolean(api.seedRenderImageResource) &&
+    Boolean(api.seedMissingRenderImageResource);
   const hasCompleteRenderApi =
     hasRenderAbi &&
     Boolean(api.seedRenderResource) &&
@@ -1399,6 +1458,9 @@ async function bridgeStatus() {
       setDocumentMetadata: api.setDocumentMetadata?.name ?? null,
       seedRenderResource: api.seedRenderResource?.name ?? null,
       seedMissingRenderResource: api.seedMissingRenderResource?.name ?? null,
+      renderResourceRequests: api.renderResourceRequests?.name ?? null,
+      seedRenderImageResource: api.seedRenderImageResource?.name ?? null,
+      seedMissingRenderImageResource: api.seedMissingRenderImageResource?.name ?? null,
       screenshotPng: api.screenshotPng?.name ?? null,
       dispose: api.dispose?.name ?? null,
     },
@@ -1409,6 +1471,10 @@ async function bridgeStatus() {
     render: {
       available: hasCompleteRenderApi,
       renderAbiVersion: hasValidVersion ? REQUIRED_RENDER_ABI_VERSION : null,
+      resourcesAvailable: hasCompleteRenderResourceApi,
+      resourceRequestAbiVersion: hasValidResourceRequestVersion
+        ? REQUIRED_RENDER_RESOURCE_REQUEST_ABI_VERSION
+        : null,
       screenshotPng: Boolean(hasScreenshotPng),
     },
     bootstrap: {
@@ -1503,6 +1569,135 @@ async function seedMissingRenderResource({ url, expectedPage } = {}) {
     documentHandle: identity.documentHandle,
     revision: identity.revision,
   };
+}
+
+function validateRenderResourceRequestPage(raw, offset, limit) {
+  requireBoundedString(raw, MAX_RETURNED_STRING_BYTES, "render resource request page");
+  let page;
+  try {
+    page = JSON.parse(raw);
+  } catch {
+    throw new TypeError("renderResourceRequests must return a JSON object");
+  }
+  if (page === null || typeof page !== "object" || Array.isArray(page)) {
+    throw new TypeError("renderResourceRequests must return an object");
+  }
+  if (!Array.isArray(page.requests)) {
+    throw new TypeError("renderResourceRequests requests must be an array");
+  }
+  if (page.requests.length > limit) {
+    throw new RangeError(`renderResourceRequests returned more than the requested ${limit} entries`);
+  }
+  const requests = page.requests.map((request, index) => {
+    if (request === null || typeof request !== "object" || Array.isArray(request)) {
+      throw new TypeError(`render resource request ${index} must be an object`);
+    }
+    const url = requireBoundedString(request.url, MAX_RENDER_URL_BYTES, `render resource request ${index} URL`);
+    if (request.kind !== "image" && request.kind !== "font") {
+      throw new TypeError(`render resource request ${index} kind must be image or font`);
+    }
+    let profile;
+    if (request.profile !== undefined) {
+      profile = requireRenderImageRequestProfile(request.profile);
+      if (request.kind !== "image") {
+        throw new TypeError(`render resource request ${index} profile is only valid for images`);
+      }
+    }
+    return profile === undefined
+      ? { url, kind: request.kind }
+      : { url, kind: request.kind, profile };
+  });
+  if (!Number.isSafeInteger(page.nextOffset) || page.nextOffset < 0 || page.nextOffset > 0xffff_ffff) {
+    throw new TypeError("renderResourceRequests nextOffset must be an unsigned 32-bit integer");
+  }
+  if (typeof page.done !== "boolean") {
+    throw new TypeError("renderResourceRequests done must be a boolean");
+  }
+  if (page.nextOffset < offset || page.nextOffset > offset + limit) {
+    throw new RangeError("renderResourceRequests nextOffset is outside the requested page");
+  }
+  const advanced = page.nextOffset - offset;
+  if (requests.length > advanced) {
+    throw new RangeError("renderResourceRequests returned more entries than its cursor consumed");
+  }
+  if (!page.done && advanced !== limit) {
+    throw new RangeError("renderResourceRequests non-final pages must consume the requested limit");
+  }
+  return { requests, nextOffset: page.nextOffset, done: page.done };
+}
+
+async function renderResourceRequests({ width, height, offset, limit, expectedPage } = {}) {
+  requireExpectedPage(expectedPage);
+  requireBridgeCore();
+  const api = bridgeApi();
+  await requireRenderResourceCompatibility(api, "renderResourceRequests");
+  width = width ?? 800;
+  height = height ?? 600;
+  offset = offset ?? 0;
+  limit = limit ?? MAX_RENDER_RESOURCE_REQUESTS_PER_PAGE;
+  if (!Number.isSafeInteger(width) || width < 1 || width > MAX_SCREENSHOT_DIMENSION) {
+    throw new RangeError(`render width must be an integer between 1 and ${MAX_SCREENSHOT_DIMENSION}`);
+  }
+  if (!Number.isSafeInteger(height) || height < 1 || height > MAX_SCREENSHOT_DIMENSION) {
+    throw new RangeError(`render height must be an integer between 1 and ${MAX_SCREENSHOT_DIMENSION}`);
+  }
+  if (width * height > MAX_SCREENSHOT_PIXELS) {
+    throw new RangeError(`render pixel count (${width * height}) exceeds the ${MAX_SCREENSHOT_PIXELS} pixel limit`);
+  }
+  if (!Number.isSafeInteger(offset) || offset < 0 || offset > 0xffff_ffff) {
+    throw new RangeError("render resource request offset must be an unsigned 32-bit integer");
+  }
+  if (!Number.isSafeInteger(limit) || limit < 1 || limit > MAX_RENDER_RESOURCE_REQUESTS_PER_PAGE) {
+    throw new RangeError(
+      `render resource request limit must be an integer between 1 and ${MAX_RENDER_RESOURCE_REQUESTS_PER_PAGE}`,
+    );
+  }
+  const generation = bridgeGeneration;
+  const documentHandle = bridgeDocumentHandle;
+  synchronizeBridgeIdentity(generation, documentHandle);
+  const page = validateRenderResourceRequestPage(
+    syncCall(api.renderResourceRequests, width, height, offset, limit),
+    offset,
+    limit,
+  );
+  const identity = synchronizeBridgeIdentity(generation, documentHandle);
+  return {
+    generation,
+    documentHandle: identity.documentHandle,
+    revision: identity.revision,
+    ...page,
+  };
+}
+
+async function seedRenderImageResource({ url, profile, bytes, expectedPage } = {}) {
+  requireExpectedPage(expectedPage);
+  requireBridgeCore();
+  const api = bridgeApi();
+  await requireRenderResourceCompatibility(api, "seedRenderImageResource");
+  requireBoundedString(url, MAX_RENDER_URL_BYTES, "render resource URL");
+  profile = requireRenderImageRequestProfile(profile);
+  bytes = requireBoundedBytes(bytes, MAX_RENDER_RESOURCE_BYTES, "render resource bytes");
+  const generation = bridgeGeneration;
+  const documentHandle = bridgeDocumentHandle;
+  synchronizeBridgeIdentity(generation, documentHandle);
+  syncCall(api.seedRenderImageResource, url, profile, bytes);
+  const identity = synchronizeBridgeIdentity(generation, documentHandle);
+  return { generation, documentHandle: identity.documentHandle, revision: identity.revision };
+}
+
+async function seedMissingRenderImageResource({ url, profile, expectedPage } = {}) {
+  requireExpectedPage(expectedPage);
+  requireBridgeCore();
+  const api = bridgeApi();
+  await requireRenderResourceCompatibility(api, "seedMissingRenderImageResource");
+  requireBoundedString(url, MAX_RENDER_URL_BYTES, "render resource URL");
+  profile = requireRenderImageRequestProfile(profile);
+  const generation = bridgeGeneration;
+  const documentHandle = bridgeDocumentHandle;
+  synchronizeBridgeIdentity(generation, documentHandle);
+  syncCall(api.seedMissingRenderImageResource, url, profile);
+  const identity = synchronizeBridgeIdentity(generation, documentHandle);
+  return { generation, documentHandle: identity.documentHandle, revision: identity.revision };
 }
 
 async function screenshotPng({ width, height, scrollX, scrollY, expectedPage } = {}) {
@@ -1770,6 +1965,12 @@ async function dispatch(operation, payload) {
       return await seedRenderResource(payload);
     case "seedMissingRenderResource":
       return await seedMissingRenderResource(payload);
+    case "renderResourceRequests":
+      return await renderResourceRequests(payload);
+    case "seedRenderImageResource":
+      return await seedRenderImageResource(payload);
+    case "seedMissingRenderImageResource":
+      return await seedMissingRenderImageResource(payload);
     case "screenshotPng":
       return await screenshotPng(payload);
     case "bootstrapEvaluate":
