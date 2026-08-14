@@ -484,3 +484,93 @@ The active portability prerequisite is now browser task scheduling: host
 `queueUserTimer`/`cancelTimer`, posted-task wakeups, cancellation, reset and
 close behavior, task/microtask ordering, and deadline-aware Worker teardown.
 Only after that should parser and dynamic script execution be ported.
+
+## Portable renderer and screenshot bridge (2026-08-14)
+
+Implementation commit: `24cffdb648fd8736761d7a49350dd1fc821066c4`
+(`feat: render screenshots in portable WASM`) on
+`wasm-node-migration`, pushed to `origin/wasm-node-migration`.
+
+### Implemented boundary
+
+- `obscura-render/paint` is now the target-neutral raster stack. The native
+  compatibility HTTP loader is isolated behind
+  `obscura-render/native-resource-loader`; native
+  `obscura-js/render` enables it explicitly.
+- The wasm32 render graph retains layout, `tiny-skia`, text shaping,
+  image/SVG decoding, paint, and PNG encoding, but contains no `ureq`,
+  `mio`, `ring`, `rustls`, or `tokio`.
+- WASM-safe timing and negative-cache stamps avoid calling unsupported
+  `std::time::Instant` APIs in `wasm32-unknown-unknown`.
+- `obscura-wasm` feature `render` exposes render ABI v1:
+  `seedRenderResource`, `seedMissingRenderResource`, and
+  `screenshotPng`. The live Rust DOM is laid out, painted, and PNG-encoded
+  inside the WASM module. Node supplies only resource outcomes and persists
+  returned bytes.
+- The Node Worker/client bridge negotiates render ABI v1, enforces page
+  generation/document-handle/revision compare-and-swap identity, copies byte
+  inputs and outputs, validates limits and the PNG signature at both client
+  and Worker boundaries, and never advertises a partial render method set as
+  a complete renderer.
+- Screenshot limits are 32,768 pixels per axis, 16,777,216 total pixels,
+  16 MiB per seeded resource, 64 KiB per resource URL, and 128 MiB returned
+  PNG. Scroll offsets must remain finite after conversion to the WASM `f32`
+  ABI.
+
+This is a real Node-V8 + Rust-WASM screenshot vertical slice. It is not yet a
+complete browser migration: Node-owned navigation/fetch, parser and dynamic
+script orchestration, remaining browser ops, PDF, CDP WebSocket transport,
+Playwright, and the final `@obscura/browser` package remain.
+
+### Artifact evidence
+
+- Raw release WASM:
+  `target/wasm32-unknown-unknown/release/obscura_wasm.wasm`,
+  15,326,025 bytes, SHA-256
+  `87da705b567df0095e4072996a2ed809dc688d0967ff4b2de1f5275cea78db2e`.
+- Disposable Node wasm-bindgen package:
+  `/workspaces/obscura-wasm-render-pkg.ulrWBl/`.
+  - `obscura_wasm.js`: 22,194 bytes, SHA-256
+    `b7034f42bd79ffd5a114e2b9af932bfd24b48273488fa66165a46a8650de5832`.
+  - `obscura_wasm_bg.wasm`: 14,949,399 bytes, SHA-256
+    `62d1b63a7a69fbbbbfd109c83425ee853205457fb0cef84fc265e5d80ff24af3`.
+- Real Node Worker proof created a valid PNG from a styled live WASM document,
+  verified its eight-byte signature and IHDR width/height, and used no native
+  Obscura binary or addon.
+
+### Verification evidence
+
+- `cargo check --release -p obscura-render --target
+  wasm32-unknown-unknown --features paint`: PASS.
+- `cargo check --release -p obscura-wasm --target
+  wasm32-unknown-unknown --features render`: PASS.
+- `cargo check --release -p obscura-js --features render`: PASS, preserving
+  the existing native resource-loader path.
+- `cargo tree -p obscura-wasm --target wasm32-unknown-unknown --features
+  render`: no `ureq`, `mio`, `ring`, `rustls`, or `tokio`.
+- Focused release nextest:
+  - `obscura-wasm --features render`: **43/43 passed**, run
+    `f551aa18-5307-47de-b476-4bd4e612a04b`.
+  - `obscura-render --features native-resource-loader`: **575/575 passed**,
+    one configured skip, run `580d88a3-1e4f-4a79-9b76-d64916a316bf`.
+- Node mock suite: **54 passed, 4 optional artifact skips, 0 failed**.
+- Node suite with the real WASM wrapper: **56 passed, 2 legacy native-addon
+  skips, 0 failed**. Both real-WASM direct ABI and full Worker screenshot
+  paths ran.
+- Full repository gate:
+  `cargo-nextest nextest run --release --features render --no-fail-fast`:
+  **1,450/1,450 passed, 4 configured skips, 0 failed**, run
+  `e23ce170-50e1-4762-a87d-a13b03ad6091`; compile 25m42s, execution 51.246s.
+- Exact required release build:
+  `CARGO_INCREMENTAL=0 CARGO_BUILD_JOBS=2 cargo build --release
+  -p obscura-cli --bins --features render`: PASS in 3m15s.
+  `target/release/obscura` is 93,575,920 bytes, SHA-256
+  `602ea479a3012e3654e52d3d646adc42a2a851f055a4323a08bca200d6656105`.
+- The companion `obscura-benchmark` repository is absent, so the 33/33
+  obstacle course remains an unavailable external gate, not a pass.
+
+Gemini 3.7 Flash was delegated a test-only render-bridge task with strict
+single-file ownership. Codex independently reviewed its output, rejected
+duplicated coverage and a second 128 MiB allocation, and retained only three
+additive tests: partial-method capability reporting, result anti-aliasing, and
+the real WASM-through-Worker screenshot path.
