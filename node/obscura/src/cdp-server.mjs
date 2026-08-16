@@ -237,6 +237,7 @@ class PageTarget {
     this.worker = null;
     this.sessions = new Set();
     this.remoteObjects = new Map();
+    this.portableCdpConnections = new Map();
     this.nextRemoteId = 1;
     this.viewport = { width: 800, height: 600, deviceScaleFactor: 1 };
     this.closed = false;
@@ -264,6 +265,10 @@ class PageTarget {
     for (const session of this.sessions) session.target = null;
     this.sessions.clear();
     this.remoteObjects.clear();
+    for (const record of this.portableCdpConnections.values()) {
+      try { await this.worker?.portableCdpClose(record.connectionId); } catch {}
+    }
+    this.portableCdpConnections.clear();
     if (this.worker) await this.worker.close();
     this.worker = null;
   }
@@ -356,6 +361,55 @@ class PageTarget {
   async status() {
     await this.start();
     return this.worker.bridgeStatus();
+  }
+
+  async portableCdpCommand(connectionId, command) {
+    await this.start();
+    if (typeof this.worker.portableCdpAbiVersion !== "function" ||
+        typeof this.worker.portableCdpOpen !== "function" ||
+        typeof this.worker.portableCdpRequest !== "function") return null;
+    let record = this.portableCdpConnections.get(connectionId);
+    if (!record) {
+      let abi;
+      try { abi = await this.worker.portableCdpAbiVersion({ requestTimeoutMs: this.server.requestTimeoutMs }); } catch { return null; }
+      if (abi !== 1) return null;
+      let coreConnectionId;
+      try {
+        coreConnectionId = await this.worker.portableCdpOpen({ requestTimeoutMs: this.server.requestTimeoutMs });
+        const attached = await this.worker.portableCdpRequest(
+          coreConnectionId,
+          JSON.stringify({ id: 0, method: "Target.attachToTarget", params: { targetId: this.id, flatten: true } }),
+          { requestTimeoutMs: this.server.requestTimeoutMs },
+        );
+        if (attached?.error || typeof attached?.result?.sessionId !== "string") {
+          await this.worker.portableCdpClose(coreConnectionId, { requestTimeoutMs: this.server.requestTimeoutMs });
+          return null;
+        }
+        record = { connectionId: coreConnectionId, sessionId: attached.result.sessionId };
+        this.portableCdpConnections.set(connectionId, record);
+      } catch {
+        try { if (coreConnectionId !== undefined) await this.worker.portableCdpClose(coreConnectionId); } catch {}
+        return null;
+      }
+    }
+    const request = { ...command, sessionId: record.sessionId };
+    const response = await this.worker.portableCdpRequest(
+      record.connectionId,
+      JSON.stringify(request),
+      { requestTimeoutMs: this.server.requestTimeoutMs },
+    );
+    if (response?.error?.code === -32601 || response?.error?.code === -32602) return null;
+    if (response && typeof response === "object") response.sessionId = command.sessionId;
+    return { record, response };
+  }
+
+  async portableCdpComplete(record, actionId, result) {
+    if (!record || typeof this.worker.portableCdpComplete !== "function") return null;
+    return this.worker.portableCdpComplete(
+      actionId,
+      JSON.stringify(result),
+      { requestTimeoutMs: this.server.requestTimeoutMs },
+    );
   }
 
   async cookies(operation, payload = {}) {
@@ -680,8 +734,40 @@ export class ObscuraCdpServer {
       return this.#dispatchBrowser(connection, command, method, params);
     }
     if (command.sessionId && !target) throw cdpError(-32000, `No target for session ${command.sessionId}`);
-    if (target) return this.#dispatchPage(connection, command.sessionId, target, method, params);
+    if (target) {
+      const portable = await this.#portablePageDispatch(connection, command, target, method);
+      if (portable !== undefined) return portable;
+      return this.#dispatchPage(connection, command.sessionId, target, method, params);
+    }
     return this.#dispatchBrowser(connection, command, method, params);
+  }
+
+  async #portablePageDispatch(connection, command, target, method) {
+    // Keep the initial migration route deliberately narrow. These commands
+    // already have a host action boundary in Rust; all other domains continue
+    // through the existing adapter until their portable state is extracted.
+    if (!new Set(["Runtime.evaluate", "Page.navigate", "Page.captureScreenshot", "Page.printToPDF"]).has(method)) {
+      return undefined;
+    }
+    const routed = await target.portableCdpCommand(connection.id, command);
+    if (!routed) return undefined;
+    const response = routed.response;
+    if (response?.error) {
+      throw cdpError(response.error.code ?? -32603, response.error.message ?? "Portable CDP command failed", response.error.data);
+    }
+    const action = response?.result?.obscuraAction;
+    if (!action) return response?.result ?? {};
+    let hostResult;
+    try {
+      hostResult = await this.#dispatchPage(connection, command.sessionId, target, method, command.params ?? {});
+    } catch (error) {
+      hostResult = { error: { code: Number.isInteger(error?.code) ? error.code : -32603, message: error?.message ?? "Portable host action failed" } };
+    }
+    const completed = await target.portableCdpComplete(routed.record, action.actionId, hostResult);
+    if (completed?.error) {
+      throw cdpError(completed.error.code ?? -32603, completed.error.message ?? "Portable CDP action failed", completed.error.data);
+    }
+    return completed?.result ?? hostResult;
   }
 
   async #dispatchBrowser(connection, command, method, params) {
@@ -785,7 +871,7 @@ export class ObscuraCdpServer {
       case "Browser.resetPermissions":
         return {};
       case "Storage.getCookies":
-        return { cookies: this.defaultTarget ? await this.defaultTarget.cookies("getAll") : [] };
+        return { cookies: this.defaultTarget ? (await this.defaultTarget.cookies("getAll")).map(cdpCookie) : [] };
       case "Storage.setCookies": {
         const target = this.defaultTarget;
         if (!target) return {};
