@@ -19,6 +19,8 @@ test("Playwright connects over CDP to the portable WASM browser", { skip: !playw
     assert.equal(await page.title(), "Obscura");
     assert.equal(await page.locator("h1").textContent(), "Portable");
     assert.equal(await page.evaluate(() => document.querySelector("h1").textContent), "Portable");
+    await page.context().addCookies([{ name: "portable", value: "yes", url: "https://example.test/" }]);
+    assert.equal((await page.context().cookies("https://example.test/")).find((cookie) => cookie.name === "portable")?.value, "yes");
     const png = await page.screenshot();
     assert.equal(Buffer.from(png).subarray(0, 8).toString("hex"), "89504e470d0a1a0a");
     const pdf = await page.pdf();

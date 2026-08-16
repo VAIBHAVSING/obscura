@@ -632,6 +632,21 @@ export class WasmV8Worker {
     return this.request("bridgeStatus");
   }
 
+  allCookies(options = {}) {
+    return this.request("allCookies", undefined, options.requestTimeoutMs);
+  }
+
+  setCookie(cookie, options = {}) {
+    if (!cookie || typeof cookie !== "object" || Array.isArray(cookie)) {
+      return Promise.reject(new TypeError("cookie must be an object"));
+    }
+    return this.request("setCookie", { cookie, url: options.url }, options.requestTimeoutMs);
+  }
+
+  deleteCookies(options = {}) {
+    return this.request("deleteCookies", options, options.requestTimeoutMs);
+  }
+
   bridgeStress(iterations, options = {}) {
     try {
       if (options.html !== undefined) {

@@ -1130,6 +1130,48 @@ function cookieOperation(command, value = "") {
   throw new TypeError(`Unknown portable cookie operation ${command}`);
 }
 
+function cookieCdpOperation(payload = {}) {
+  const api = bridgeApi();
+  if (!api.allCookies || !api.setCookieFromResponse || !api.deleteCookies) {
+    throw new Error("ObscuraCore does not expose the complete cookie ABI");
+  }
+  const now = cookieNowSeconds();
+  const operation = payload.operation;
+  if (operation === "getAll") return JSON.parse(syncCall(api.allCookies, now));
+  if (operation === "clear") {
+    syncCall(api.deleteCookies, "", "", null);
+    return {};
+  }
+  if (operation === "delete") {
+    const name = typeof payload.name === "string" ? payload.name : "";
+    const domain = typeof payload.domain === "string" ? payload.domain : "";
+    const path = payload.path == null ? null : String(payload.path);
+    syncCall(api.deleteCookies, name, domain, path);
+    return {};
+  }
+  if (operation === "set") {
+    const cookie = payload.cookie;
+    if (!cookie || typeof cookie !== "object" || Array.isArray(cookie)) {
+      throw new TypeError("cookie must be an object");
+    }
+    const name = String(cookie.name ?? "");
+    const value = String(cookie.value ?? "");
+    const url = String(cookie.url ?? payload.url ?? documentUrlForCookies());
+    let line = `${name}=${value}`;
+    if (cookie.domain) line += `; Domain=${String(cookie.domain)}`;
+    if (cookie.path) line += `; Path=${String(cookie.path)}`;
+    if (cookie.secure) line += "; Secure";
+    if (cookie.httpOnly) line += "; HttpOnly";
+    if (cookie.sameSite) line += `; SameSite=${String(cookie.sameSite)}`;
+    if (Number.isFinite(cookie.expires) && cookie.expires > 0) {
+      line += `; Expires=${new Date(cookie.expires * 1_000).toUTCString()}`;
+    }
+    syncCall(api.setCookieFromResponse, line, url, now);
+    return {};
+  }
+  throw new TypeError(`Unknown cookie operation ${JSON.stringify(operation)}`);
+}
+
 function cookieHeaderForUrl(url, credentials = "include") {
   const api = bridgeApi();
   if (!api.cookieHeader || credentials === "omit") return "";
@@ -2913,6 +2955,14 @@ async function dispatch(operation, payload) {
       return await bootstrapEvaluate(payload);
     case "bridgeStatus":
       return await bridgeStatus();
+    case "allCookies":
+      return cookieCdpOperation({ operation: "getAll" });
+    case "setCookie":
+      return cookieCdpOperation({ operation: "set", ...(payload ?? {}) });
+    case "deleteCookies":
+      return cookieCdpOperation({ operation: "delete", ...(payload ?? {}) });
+    case "clearCookies":
+      return cookieCdpOperation({ operation: "clear" });
     case "bridgeRelease":
       return { dispose: await disposeBridgeCore(), ...(await bridgeStatus()) };
     case "moduleEvaluate":

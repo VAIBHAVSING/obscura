@@ -86,6 +86,14 @@ function targetInfo(target) {
   };
 }
 
+function cdpCookie(value) {
+  return {
+    ...value,
+    expires: Number.isFinite(value?.expires) ? Number(value.expires) : -1,
+    sameSite: value?.sameSite === "Strict" || value?.sameSite === "None" ? value.sameSite : "Lax",
+  };
+}
+
 function frameTree(target) {
   return {
     frameTree: {
@@ -348,6 +356,15 @@ class PageTarget {
   async status() {
     await this.start();
     return this.worker.bridgeStatus();
+  }
+
+  async cookies(operation, payload = {}) {
+    await this.start();
+    if (operation === "getAll") return this.worker.allCookies({ requestTimeoutMs: this.server.requestTimeoutMs });
+    if (operation === "set") return this.worker.setCookie(payload.cookie, { url: payload.url, requestTimeoutMs: this.server.requestTimeoutMs });
+    if (operation === "delete") return this.worker.deleteCookies({ ...payload, requestTimeoutMs: this.server.requestTimeoutMs });
+    if (operation === "clear") return this.worker.request("clearCookies", undefined, this.server.requestTimeoutMs);
+    throw cdpError(-32602, `Unknown cookie operation ${operation}`);
   }
 }
 
@@ -767,6 +784,18 @@ export class ObscuraCdpServer {
       case "Browser.grantPermissions":
       case "Browser.resetPermissions":
         return {};
+      case "Storage.getCookies":
+        return { cookies: this.defaultTarget ? await this.defaultTarget.cookies("getAll") : [] };
+      case "Storage.setCookies": {
+        const target = this.defaultTarget;
+        if (!target) return {};
+        const cookies = Array.isArray(params.cookies) ? params.cookies : [];
+        for (const cookie of cookies) await target.cookies("set", { cookie, url: cookie?.url || target.url });
+        return {};
+      }
+      case "Storage.clearDataForOrigin":
+        if (this.defaultTarget) await this.defaultTarget.cookies("clear");
+        return {};
       default:
         throw cdpError(-32601, `Method ${method} is not implemented`);
     }
@@ -982,11 +1011,39 @@ export class ObscuraCdpServer {
       case "DOM.requestChildNodes":
         return {};
       case "Network.getAllCookies":
-        return { cookies: [] };
-      case "Network.setCookies":
+        return { cookies: (await target.cookies("getAll")).map(cdpCookie) };
+      case "Network.setCookies": {
+        const cookies = Array.isArray(params.cookies) ? params.cookies : [];
+        for (const cookie of cookies) {
+          if (!cookie || typeof cookie !== "object") throw cdpError(-32602, "Network.setCookies contains an invalid cookie");
+          await target.cookies("set", { cookie, url: cookie.url || target.url });
+        }
+        return {};
+      }
       case "Network.deleteCookies":
+        await target.cookies("delete", {
+          name: params.name,
+          domain: params.domain || (params.url ? new URL(params.url).hostname : ""),
+          path: params.path,
+        });
+        return {};
       case "Network.clearBrowserCookies":
+        await target.cookies("clear");
+        return {};
       case "Network.clearBrowserCache":
+        return {};
+      case "Storage.getCookies":
+        return { cookies: (await target.cookies("getAll")).map(cdpCookie) };
+      case "Storage.setCookies": {
+        const cookies = Array.isArray(params.cookies) ? params.cookies : [];
+        for (const cookie of cookies) {
+          if (!cookie || typeof cookie !== "object") throw cdpError(-32602, "Storage.setCookies contains an invalid cookie");
+          await target.cookies("set", { cookie, url: cookie.url || target.url });
+        }
+        return {};
+      }
+      case "Storage.clearDataForOrigin":
+        await target.cookies("clear");
         return {};
       default:
         throw cdpError(-32601, `Method ${method} is not implemented`);
