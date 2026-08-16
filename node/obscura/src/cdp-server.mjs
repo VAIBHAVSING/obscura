@@ -94,6 +94,15 @@ function cdpCookie(value) {
   };
 }
 
+function portableCookieUrl(cookie, target) {
+  if (typeof cookie?.url === "string" && cookie.url.length > 0) return cookie.url;
+  if (typeof target?.url === "string" && /^https?:/u.test(target.url)) return target.url;
+  if (typeof cookie?.domain === "string" && cookie.domain.length > 0) {
+    return `https://${cookie.domain.replace(/^\.+/u, "")}/`;
+  }
+  return target?.url || "https://localhost/";
+}
+
 function frameTree(target) {
   return {
     frameTree: {
@@ -870,6 +879,20 @@ export class ObscuraCdpServer {
     }
     if (response?.error) {
       throw cdpError(response.error.code ?? -32603, response.error.message ?? "Portable CDP command failed", response.error.data);
+    }
+    if (method === "Network.setCookies" || method === "Storage.setCookies") {
+      const cookies = Array.isArray(command.params?.cookies) ? command.params.cookies : [];
+      for (const cookie of cookies) {
+        await target.cookies("set", { cookie, url: portableCookieUrl(cookie, target) });
+      }
+    } else if (method === "Network.deleteCookies") {
+      await target.cookies("delete", {
+        name: command.params?.name,
+        domain: command.params?.domain || (command.params?.url ? new URL(command.params.url).hostname : ""),
+        path: command.params?.path,
+      });
+    } else if (method === "Network.clearBrowserCookies" || method === "Storage.clearDataForOrigin") {
+      await target.cookies("clear");
     }
     const action = response?.result?.obscuraAction;
     if (!action) return response?.result ?? {};
