@@ -70,6 +70,22 @@ fn cdp_error_response(id: &Value, code: i32, message: impl Into<String>, session
     Value::Object(response)
 }
 
+fn cdp_error_response_with_data(
+    id: &Value,
+    code: i32,
+    message: impl Into<String>,
+    data: Option<&Value>,
+    session: Option<&str>,
+) -> Value {
+    let mut response = cdp_error_response(id, code, message, session);
+    if let Some(data) = data {
+        if let Some(error) = response.get_mut("error").and_then(Value::as_object_mut) {
+            error.insert("data".to_string(), data.clone());
+        }
+    }
+    response
+}
+
 fn cdp_result_response(id: &Value, result: Value, session: Option<&str>) -> Value {
     let mut response = Map::new();
     response.insert("id".to_string(), id.clone());
@@ -107,6 +123,8 @@ struct Target {
     loader_id: String,
     url: String,
     title: String,
+    document_handle: u32,
+    revision: u32,
     core: ObscuraCore,
     sessions: BTreeSet<String>,
 }
@@ -142,6 +160,8 @@ impl PortableCdp {
     #[wasm_bindgen(constructor)]
     pub fn new(html: &str) -> Result<Self, JsValue> {
         let core = ObscuraCore::new(html)?;
+        let document_handle = core.document_handle();
+        let revision = core.page_revision();
         let mut targets = BTreeMap::new();
         targets.insert(
             "page-1".to_string(),
@@ -152,6 +172,8 @@ impl PortableCdp {
                 loader_id: "loader-blank-page-1".to_string(),
                 url: "about:blank".to_string(),
                 title: String::new(),
+                document_handle,
+                revision,
                 core,
                 sessions: BTreeSet::new(),
             },
@@ -245,9 +267,17 @@ impl PortableCdp {
     #[wasm_bindgen(js_name = completeAction)]
     pub fn complete_action(&mut self, action_id: u32, result_json: &str) -> Result<String, JsValue> {
         bounded(result_json, MAX_ACTION_RESULT_BYTES, "CDP action result")?;
-        let Some(action) = self.actions.remove(&action_id) else {
+        let Some(action) = self.actions.get(&action_id).cloned() else {
             return Err(js_error("stale or unknown CDP action"));
         };
+        // Actions are capabilities for a live target session, not durable work
+        // items. A host can race a completion with detach/close, so validate
+        // the ownership again immediately before accepting its result.
+        if !self.action_is_live(&action) {
+            self.actions.remove(&action_id);
+            return Err(js_error("CDP action target session is no longer live"));
+        }
+        self.actions.remove(&action_id);
         let result: Value = serde_json::from_str(result_json)
             .map_err(|error| js_error(&format!("invalid CDP action result: {error}")))?;
         if action.kind == "navigate" {
@@ -261,9 +291,46 @@ impl PortableCdp {
                 if let Some(title) = result.get("title").and_then(Value::as_str) {
                     target.title = title.to_string();
                 }
+                if let Some(state) = result.get("__obscuraState").and_then(Value::as_object) {
+                    if let Some(url) = state.get("url").and_then(Value::as_str) {
+                        target.url = url.to_string();
+                    }
+                    if let Some(loader_id) = state.get("loaderId").and_then(Value::as_str) {
+                        target.loader_id = loader_id.to_string();
+                    }
+                    if let Some(title) = state.get("title").and_then(Value::as_str) {
+                        target.title = title.to_string();
+                    }
+                    if let Some(document_handle) = state.get("documentHandle").and_then(Value::as_u64) {
+                        target.document_handle = u32::try_from(document_handle).map_err(|_| js_error("document handle exceeds u32"))?;
+                    }
+                    if let Some(revision) = state.get("revision").and_then(Value::as_u64) {
+                        target.revision = u32::try_from(revision).map_err(|_| js_error("page revision exceeds u32"))?;
+                    }
+                }
             }
         }
-        let response = cdp_result_response(&action.request_id, result, action.session_id.as_deref());
+        let response = if let Value::Object(mut object) = result {
+            object.remove("__obscuraState");
+            if let Some(error) = object.get("error").and_then(Value::as_object) {
+                let code = error.get("code").and_then(Value::as_i64).and_then(|value| i32::try_from(value).ok()).unwrap_or(-32603);
+                let message = error
+                    .get("message")
+                    .and_then(Value::as_str)
+                    .unwrap_or("Portable host action failed");
+                cdp_error_response_with_data(
+                    &action.request_id,
+                    code,
+                    message,
+                    error.get("data"),
+                    action.session_id.as_deref(),
+                )
+            } else {
+                cdp_result_response(&action.request_id, Value::Object(object), action.session_id.as_deref())
+            }
+        } else {
+            cdp_result_response(&action.request_id, result, action.session_id.as_deref())
+        };
         Ok(serde_json::to_string(&response)
             .map_err(|error| js_error(&format!("CDP response serialization failed: {error}")))?)
     }
@@ -408,6 +475,12 @@ impl PortableCdp {
                 if let Some(connection) = self.connections.get_mut(&connection_id) {
                     connection.auto_attach = auto_attach;
                 }
+                // Target auto-attachment is an ongoing subscription. Enabling
+                // it must also attach the targets which were already alive,
+                // otherwise a client can miss its initial page forever.
+                if auto_attach {
+                    self.auto_attach_existing_targets(connection_id);
+                }
                 cdp_result_response(&request.id, json!({}), session)
             }
             "Target.attachToBrowserTarget" => {
@@ -437,7 +510,9 @@ impl PortableCdp {
                 let Some(session_id) = request.params.get("sessionId").and_then(Value::as_str) else {
                     return cdp_error_response(&request.id, -32602, "sessionId is required", session);
                 };
-                self.detach_session(connection_id, session_id);
+                if self.detach_session(connection_id, session_id).is_none() {
+                    return cdp_error_response(&request.id, -32000, "target session is not known", session);
+                }
                 cdp_result_response(&request.id, json!({}), session)
             }
             "Target.closeTarget" => {
@@ -497,7 +572,7 @@ impl PortableCdp {
                 let Some(target) = self.targets.get(&target_id) else {
                     return cdp_error_response(&request.id, -32000, "target is not known", session);
                 };
-                let document_handle = target.core.document_handle();
+                let document_handle = target.document_handle;
                 cdp_result_response(&request.id, json!({"root": {
                     "nodeId": document_handle,
                     "backendNodeId": document_handle,
@@ -564,10 +639,81 @@ impl PortableCdp {
             loader_id,
             url: url.to_string(),
             title: String::new(),
+            document_handle: core.document_handle(),
+            revision: core.page_revision(),
             core,
             sessions: BTreeSet::new(),
         });
+        self.announce_target_created(&target_id);
         target_id
+    }
+
+    /// Send target discovery and automatic-attachment notifications for a
+    /// newly created target. Connections and targets are BTree maps, so the
+    /// order is deterministic for hosts which drain their event queues later.
+    fn announce_target_created(&mut self, target_id: &str) {
+        let Some(info) = self.targets.get(target_id).map(Self::target_info) else {
+            return;
+        };
+        let connection_ids: Vec<u32> = self.connections.keys().copied().collect();
+        for connection_id in connection_ids {
+            let (discover, auto_attach, already_attached) = self
+                .connections
+                .get(&connection_id)
+                .map(|connection| {
+                    (
+                        connection.discover_targets,
+                        connection.auto_attach,
+                        connection.sessions.values().any(|id| id == target_id),
+                    )
+                })
+                .unwrap_or((false, false, true));
+            if discover {
+                if let Some(connection) = self.connections.get_mut(&connection_id) {
+                    queue_event(connection, "Target.targetCreated", json!({"targetInfo": info}), None);
+                }
+            }
+            if auto_attach && !already_attached {
+                let session_id = self.allocate_session(connection_id, target_id);
+                if let Some(connection) = self.connections.get_mut(&connection_id) {
+                    queue_event(
+                        connection,
+                        "Target.attachedToTarget",
+                        json!({"sessionId": session_id, "targetInfo": info, "waitingForDebugger": false}),
+                        None,
+                    );
+                }
+            }
+        }
+    }
+
+    /// Attach every currently-live target which is not already attached on
+    /// this connection. This intentionally never duplicates an existing
+    /// automatic session when a client repeats `Target.setAutoAttach`.
+    fn auto_attach_existing_targets(&mut self, connection_id: u32) {
+        let target_ids: Vec<String> = self.targets.keys().cloned().collect();
+        for target_id in target_ids {
+            let attached = self
+                .connections
+                .get(&connection_id)
+                .map(|connection| connection.sessions.values().any(|id| id == &target_id))
+                .unwrap_or(true);
+            if attached {
+                continue;
+            }
+            let Some(info) = self.targets.get(&target_id).map(Self::target_info) else {
+                continue;
+            };
+            let session_id = self.allocate_session(connection_id, &target_id);
+            if let Some(connection) = self.connections.get_mut(&connection_id) {
+                queue_event(
+                    connection,
+                    "Target.attachedToTarget",
+                    json!({"sessionId": session_id, "targetInfo": info, "waitingForDebugger": false}),
+                    None,
+                );
+            }
+        }
     }
 
     fn allocate_session(&mut self, connection_id: u32, target_id: &str) -> String {
@@ -582,28 +728,63 @@ impl PortableCdp {
         session_id
     }
 
-    fn detach_session(&mut self, connection_id: u32, session_id: &str) {
-        let target_id = self.connections.get_mut(&connection_id).and_then(|connection| connection.sessions.remove(session_id));
-        if let Some(target_id) = target_id {
-            if let Some(target) = self.targets.get_mut(&target_id) {
-                target.sessions.remove(session_id);
-            }
+    /// Invalidate one session. Any already queued page-domain event is no
+    /// longer useful once the session is detached, while lifecycle events are
+    /// preserved so a client observes attachment followed by detachment.
+    fn detach_session(&mut self, connection_id: u32, session_id: &str) -> Option<String> {
+        let target_id = self
+            .connections
+            .get_mut(&connection_id)
+            .and_then(|connection| connection.sessions.remove(session_id))?;
+        if let Some(target) = self.targets.get_mut(&target_id) {
+            target.sessions.remove(session_id);
         }
+        self.actions.retain(|_, action| {
+            action.connection_id != connection_id || action.session_id.as_deref() != Some(session_id)
+        });
+        if let Some(connection) = self.connections.get_mut(&connection_id) {
+            discard_session_events(connection, session_id);
+            queue_event(
+                connection,
+                "Target.detachedFromTarget",
+                json!({"sessionId": session_id, "targetId": target_id}),
+                None,
+            );
+        }
+        Some(target_id)
     }
 
     fn destroy_target(&mut self, target_id: &str) {
         let Some(target) = self.targets.remove(target_id) else { return; };
+        // A target close can arrive while its host operation is in flight.
+        // Completing one of those actions must be rejected, not applied to a
+        // subsequent page with a coincidentally similar identifier.
+        self.actions.retain(|_, action| action.target_id != target.id);
         for connection in self.connections.values_mut() {
             let doomed: Vec<String> = connection.sessions.iter().filter(|(_, id)| *id == &target.id).map(|(session, _)| session.clone()).collect();
             for session_id in doomed {
                 connection.sessions.remove(&session_id);
+                discard_session_events(connection, &session_id);
                 queue_event(connection, "Target.detachedFromTarget", json!({"sessionId": session_id, "targetId": target.id}), None);
             }
             if connection.discover_targets {
                 queue_event(connection, "Target.targetDestroyed", json!({"targetId": target.id}), None);
             }
         }
-        self.actions.retain(|_, action| action.target_id != target.id);
+    }
+
+    fn action_is_live(&self, action: &Action) -> bool {
+        let Some(connection) = self.connections.get(&action.connection_id) else {
+            return false;
+        };
+        let Some(session_id) = action.session_id.as_deref() else {
+            return false;
+        };
+        connection.sessions.get(session_id).is_some_and(|target_id| target_id == &action.target_id)
+            && self
+                .targets
+                .get(&action.target_id)
+                .is_some_and(|target| target.sessions.contains(session_id))
     }
 
     fn target_info(target: &Target) -> Value {
@@ -631,6 +812,18 @@ fn queue_event(connection: &mut Connection, method: &str, params: Value, session
         event.insert("sessionId".to_string(), Value::String(session_id.to_string()));
     }
     connection.events.push_back(Value::Object(event));
+}
+
+/// Remove queued page-domain events for a session which has just been
+/// invalidated. Target lifecycle notifications intentionally do not carry a
+/// top-level `sessionId`, so they remain in order around the detach event.
+fn discard_session_events(connection: &mut Connection, session_id: &str) {
+    connection.events.retain(|event| {
+        event
+            .get("sessionId")
+            .and_then(Value::as_str)
+            .is_none_or(|queued_session| queued_session != session_id)
+    });
 }
 
 #[cfg(test)]
@@ -684,6 +877,29 @@ mod tests {
     }
 
     #[test]
+    fn host_action_errors_remain_cdp_errors() {
+        let mut cdp = PortableCdp::new("").unwrap();
+        let connection = cdp.open_connection().unwrap();
+        let attached = json(&cdp.cdp_request(
+            connection,
+            r#"{"id":1,"method":"Target.attachToTarget","params":{"targetId":"page-1"}}"#,
+        ).unwrap());
+        let session = attached["result"]["sessionId"].as_str().unwrap();
+        let request = format!(r#"{{"id":2,"sessionId":"{session}","method":"Runtime.evaluate","params":{{"expression":"1"}}}}"#);
+        let queued = json(&cdp.cdp_request(connection, &request).unwrap());
+        let action_id = queued["result"]["obscuraAction"]["actionId"].as_u64().unwrap() as u32;
+        let failed = json(&cdp.complete_action(
+            action_id,
+            r#"{"error":{"code":-32001,"message":"host timeout","data":{"retryable":true}}}"#,
+        ).unwrap());
+        assert_eq!(failed["id"], 2);
+        assert_eq!(failed["sessionId"], session);
+        assert_eq!(failed["error"]["code"], -32001);
+        assert_eq!(failed["error"]["message"], "host timeout");
+        assert_eq!(failed["error"]["data"]["retryable"], true);
+    }
+
+    #[test]
     fn malformed_messages_and_unknown_sessions_are_cdp_errors() {
         let mut cdp = PortableCdp::new("").unwrap();
         let connection = cdp.open_connection().unwrap();
@@ -713,5 +929,108 @@ mod tests {
         assert!(cdp.complete_action(action_id, r#"{"url":"https://example.test/"}"#).is_err());
         let closed = json(&cdp.cdp_request(connection, r#"{"id":3,"method":"Browser.getVersion"}"#).unwrap());
         assert_eq!(closed["error"]["code"], -32000);
+    }
+
+    #[test]
+    fn auto_attach_existing_targets_is_ordered_and_idempotent() {
+        let mut cdp = PortableCdp::new("").unwrap();
+        let connection = cdp.open_connection().unwrap();
+
+        let enabled = json(&cdp.cdp_request(
+            connection,
+            r#"{"id":1,"method":"Target.setAutoAttach","params":{"autoAttach":true,"flatten":true}}"#,
+        ).unwrap());
+        assert_eq!(enabled["result"], json!({}));
+        let events = json(&cdp.poll_cdp_events(connection, 8).unwrap());
+        assert_eq!(events.as_array().unwrap().len(), 1);
+        assert_eq!(events[0]["method"], "Target.attachedToTarget");
+        assert_eq!(events[0]["params"]["targetInfo"]["targetId"], "page-1");
+
+        let repeated = json(&cdp.cdp_request(
+            connection,
+            r#"{"id":2,"method":"Target.setAutoAttach","params":{"autoAttach":true,"flatten":true}}"#,
+        ).unwrap());
+        assert_eq!(repeated["result"], json!({}));
+        let events = json(&cdp.poll_cdp_events(connection, 8).unwrap());
+        assert!(events.as_array().unwrap().is_empty());
+    }
+
+    #[test]
+    fn created_targets_emit_discovery_then_auto_attach() {
+        let mut cdp = PortableCdp::new("").unwrap();
+        let connection = cdp.open_connection().unwrap();
+        cdp.cdp_request(
+            connection,
+            r#"{"id":1,"method":"Target.setDiscoverTargets","params":{"discover":true}}"#,
+        ).unwrap();
+        // Discovery emits a snapshot of the initial page. The test below is
+        // about lifecycle order for the subsequently-created target.
+        cdp.poll_cdp_events(connection, 8).unwrap();
+        cdp.cdp_request(
+            connection,
+            r#"{"id":2,"method":"Target.setAutoAttach","params":{"autoAttach":true,"flatten":true}}"#,
+        ).unwrap();
+        cdp.poll_cdp_events(connection, 8).unwrap();
+
+        let created = json(&cdp.cdp_request(
+            connection,
+            r#"{"id":3,"method":"Target.createTarget","params":{"url":"https://example.test/new"}}"#,
+        ).unwrap());
+        let target_id = created["result"]["targetId"].as_str().unwrap().to_string();
+        let events = json(&cdp.poll_cdp_events(connection, 8).unwrap());
+        assert_eq!(events.as_array().unwrap().len(), 2);
+        assert_eq!(events[0]["method"], "Target.targetCreated");
+        assert_eq!(events[0]["params"]["targetInfo"]["targetId"], target_id);
+        assert_eq!(events[1]["method"], "Target.attachedToTarget");
+        assert_eq!(events[1]["params"]["targetInfo"]["targetId"], target_id);
+        assert!(events[1]["params"]["sessionId"].as_str().is_some());
+    }
+
+    #[test]
+    fn detach_and_close_invalidate_actions_and_page_events() {
+        let mut cdp = PortableCdp::new("").unwrap();
+        let connection = cdp.open_connection().unwrap();
+        let attached = json(&cdp.cdp_request(
+            connection,
+            r#"{"id":1,"method":"Target.attachToTarget","params":{"targetId":"page-1","flatten":true}}"#,
+        ).unwrap());
+        let session = attached["result"]["sessionId"].as_str().unwrap().to_string();
+        cdp.poll_cdp_events(connection, 8).unwrap();
+
+        let enable = format!(r#"{{"id":2,"sessionId":"{session}","method":"Runtime.enable"}}"#);
+        cdp.cdp_request(connection, &enable).unwrap();
+        let navigate = format!(r#"{{"id":3,"sessionId":"{session}","method":"Page.navigate","params":{{"url":"https://example.test/"}}}}"#);
+        let queued = json(&cdp.cdp_request(connection, &navigate).unwrap());
+        let action_id = queued["result"]["obscuraAction"]["actionId"].as_u64().unwrap() as u32;
+
+        let detach = format!(r#"{{"id":4,"method":"Target.detachFromTarget","params":{{"sessionId":"{session}"}}}}"#);
+        assert_eq!(json(&cdp.cdp_request(connection, &detach).unwrap())["result"], json!({}));
+        assert!(cdp.complete_action(action_id, r#"{"url":"https://example.test/"}"#).is_err());
+        let events = json(&cdp.poll_cdp_events(connection, 8).unwrap());
+        assert_eq!(events.as_array().unwrap().len(), 1);
+        assert_eq!(events[0]["method"], "Target.detachedFromTarget");
+        assert_eq!(events[0]["params"]["sessionId"], session);
+
+        // A closed target likewise rejects an in-flight action even when its
+        // session is still attached at close time.
+        let again = json(&cdp.cdp_request(
+            connection,
+            r#"{"id":5,"method":"Target.attachToTarget","params":{"targetId":"page-1","flatten":true}}"#,
+        ).unwrap());
+        let session = again["result"]["sessionId"].as_str().unwrap().to_string();
+        cdp.poll_cdp_events(connection, 8).unwrap();
+        let evaluate = format!(r#"{{"id":6,"sessionId":"{session}","method":"Runtime.evaluate","params":{{"expression":"1"}}}}"#);
+        let queued = json(&cdp.cdp_request(connection, &evaluate).unwrap());
+        let action_id = queued["result"]["obscuraAction"]["actionId"].as_u64().unwrap() as u32;
+        let close = json(&cdp.cdp_request(
+            connection,
+            r#"{"id":7,"method":"Target.closeTarget","params":{"targetId":"page-1"}}"#,
+        ).unwrap());
+        assert_eq!(close["result"]["success"], true);
+        assert!(cdp.complete_action(action_id, r#"{}"#).is_err());
+        let events = json(&cdp.poll_cdp_events(connection, 8).unwrap());
+        assert_eq!(events.as_array().unwrap().len(), 1);
+        assert_eq!(events[0]["method"], "Target.detachedFromTarget");
+        assert_eq!(events[0]["params"]["sessionId"], session);
     }
 }

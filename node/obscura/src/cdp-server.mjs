@@ -387,6 +387,7 @@ class PageTarget {
         }
         record = { connectionId: coreConnectionId, sessionId: attached.result.sessionId };
         this.portableCdpConnections.set(connectionId, record);
+        try { await this.worker.portableCdpPoll(coreConnectionId, 512, { requestTimeoutMs: this.server.requestTimeoutMs }); } catch {}
       } catch {
         try { if (coreConnectionId !== undefined) await this.worker.portableCdpClose(coreConnectionId); } catch {}
         return null;
@@ -400,7 +401,15 @@ class PageTarget {
     );
     if (response?.error?.code === -32601 || response?.error?.code === -32602) return null;
     if (response && typeof response === "object") response.sessionId = command.sessionId;
-    return { record, response };
+    let events = [];
+    try {
+      events = await this.worker.portableCdpPoll(record.connectionId, 512, { requestTimeoutMs: this.server.requestTimeoutMs });
+      if (!Array.isArray(events)) events = [];
+      for (const event of events) {
+        if (typeof event?.sessionId === "string") event.sessionId = command.sessionId;
+      }
+    } catch {}
+    return { record, response, events };
   }
 
   async portableCdpComplete(record, actionId, result) {
@@ -746,12 +755,24 @@ export class ObscuraCdpServer {
     // Keep the initial migration route deliberately narrow. These commands
     // already have a host action boundary in Rust; all other domains continue
     // through the existing adapter until their portable state is extracted.
-    if (!new Set(["Runtime.evaluate", "Page.navigate", "Page.captureScreenshot", "Page.printToPDF"]).has(method)) {
+    if (!new Set([
+      "Runtime.enable",
+      "Page.enable",
+      "Page.getFrameTree",
+      "DOM.getDocument",
+      "Runtime.evaluate",
+      "Page.navigate",
+      "Page.captureScreenshot",
+      "Page.printToPDF",
+    ]).has(method)) {
       return undefined;
     }
     const routed = await target.portableCdpCommand(connection.id, command);
     if (!routed) return undefined;
     const response = routed.response;
+    for (const event of routed.events ?? []) {
+      if (typeof event?.method === "string") connection.event(event.method, event.params ?? {}, command.sessionId);
+    }
     if (response?.error) {
       throw cdpError(response.error.code ?? -32603, response.error.message ?? "Portable CDP command failed", response.error.data);
     }
@@ -763,7 +784,22 @@ export class ObscuraCdpServer {
     } catch (error) {
       hostResult = { error: { code: Number.isInteger(error?.code) ? error.code : -32603, message: error?.message ?? "Portable host action failed" } };
     }
-    const completed = await target.portableCdpComplete(routed.record, action.actionId, hostResult);
+    let completion = hostResult;
+    if (method === "Page.navigate") {
+      let page = {};
+      try { page = (await target.status()).page ?? {}; } catch {}
+      completion = {
+        ...hostResult,
+        __obscuraState: {
+          url: target.url,
+          loaderId: target.loaderId,
+          title: target.title,
+          documentHandle: page.documentHandle,
+          revision: page.revision,
+        },
+      };
+    }
+    const completed = await target.portableCdpComplete(routed.record, action.actionId, completion);
     if (completed?.error) {
       throw cdpError(completed.error.code ?? -32603, completed.error.message ?? "Portable CDP action failed", completed.error.data);
     }
