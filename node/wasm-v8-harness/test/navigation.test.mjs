@@ -30,6 +30,20 @@ test("portable navigation owns redirects, document identity, history, and HTML c
       response.end('{"answer":42}');
       return;
     }
+    if (request.url === "/set-cookie") {
+      response.writeHead(200, {
+        "content-type": "text/html; charset=UTF-8",
+        "set-cookie": ["sid=abc; Path=/"],
+      });
+      response.end("<html><body>cookie set</body></html>");
+      return;
+    }
+    if (request.url === "/cookie-page") {
+      const requestCookie = request.headers.cookie || "";
+      response.writeHead(200, { "content-type": "text/html; charset=UTF-8" });
+      response.end(`<html><body data-request-cookie="${requestCookie}"><script>document.body.setAttribute('data-document-cookie', document.cookie)</script></body></html>`);
+      return;
+    }
     if (request.url === "/module-page") {
       response.writeHead(200, { "content-type": "text/html; charset=UTF-8" });
       response.end(`<!doctype html><html><head><script type="importmap">{"imports":{"dep":"/dep.js"}}</script><script type="module">import { value } from "dep"; document.body.setAttribute("data-module", value);</script></head><body><h1>modules</h1></body></html>`);
@@ -80,6 +94,14 @@ test("portable navigation owns redirects, document identity, history, and HTML c
     await worker.bootstrapEvaluate("globalThis.__xhrValue = null; const request = new XMLHttpRequest(); request.open('GET', '/api'); request.onload = () => { globalThis.__xhrValue = request.responseText; }; request.onerror = () => { globalThis.__xhrValue = 'error'; }; request.send(); undefined");
     await new Promise((resolve) => setTimeout(resolve, 100));
     assert.equal(await worker.bootstrapEvaluate("globalThis.__xhrValue"), '{"answer":42}');
+
+    await worker.navigate(`http://127.0.0.1:${port}/set-cookie`, { allowPrivateNetwork: true });
+    await worker.bootstrapEvaluate("document.cookie = 'client=ok; Path=/'; undefined");
+    await worker.navigate(`http://127.0.0.1:${port}/cookie-page`, { allowPrivateNetwork: true });
+    assert.match(await worker.bootstrapEvaluate("document.body.getAttribute('data-request-cookie')"), /sid=abc/);
+    assert.match(await worker.bootstrapEvaluate("document.body.getAttribute('data-request-cookie')"), /client=ok/);
+    assert.match(await worker.bootstrapEvaluate("document.body.getAttribute('data-document-cookie')"), /sid=abc/);
+    assert.match(await worker.bootstrapEvaluate("document.body.getAttribute('data-document-cookie')"), /client=ok/);
 
     const modules = await worker.navigate(`http://127.0.0.1:${port}/module-page`, {
       allowPrivateNetwork: true,

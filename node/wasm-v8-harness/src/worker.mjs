@@ -87,11 +87,20 @@ const CANCEL_NAVIGATION_NAMES = ["cancelNavigation", "cancel_navigation"];
 const NAVIGATION_STATUS_NAMES = ["navigationStatus", "navigation_status"];
 const PLATFORM_OP_ABI_VERSION_NAME = "platformOpAbiVersion";
 const PLATFORM_OP_NAME = "platformOp";
+const COOKIE_ABI_VERSION_NAME = "cookieAbiVersion";
+const COOKIE_HEADER_NAMES = ["cookieHeader", "cookie_header"];
+const VISIBLE_COOKIES_NAMES = ["visibleCookies", "visible_cookies"];
+const SET_COOKIE_RESPONSE_NAMES = ["setCookieFromResponse", "set_cookie_from_response"];
+const SET_COOKIE_SCRIPT_NAMES = ["setCookieFromScript", "set_cookie_from_script"];
+const ALL_COOKIES_NAMES = ["allCookies", "all_cookies"];
+const IMPORT_COOKIES_NAMES = ["importCookies", "import_cookies"];
+const DELETE_COOKIES_NAMES = ["deleteCookies", "delete_cookies"];
 const REQUIRED_CORE_ABI_VERSION = 1;
 const REQUIRED_DOM_OP_ABI_VERSION = 1;
 const REQUIRED_DOM_BATCH_ABI_VERSION = 1;
 const REQUIRED_DOCUMENT_METADATA_ABI_VERSION = 1;
 const REQUIRED_PLATFORM_OP_ABI_VERSION = 1;
+const REQUIRED_COOKIE_ABI_VERSION = 1;
 const REQUIRED_RENDER_ABI_VERSION = 1;
 const REQUIRED_RENDER_RESOURCE_REQUEST_ABI_VERSION = 1;
 const REQUIRED_PDF_ABI_VERSION = 1;
@@ -654,6 +663,7 @@ function describeApi() {
       runtimeFactory: factory?.name ?? constructor?.name ?? null,
       moduleEvaluate: evaluate?.name ?? null,
       obscuraCore: member(target, ["ObscuraCore"])?.name ?? null,
+      cookieAbiVersion: member(target, [COOKIE_ABI_VERSION_NAME])?.name ?? null,
       platformOpAbiVersion: member(target, [PLATFORM_OP_ABI_VERSION_NAME])?.name ?? null,
       platformOp: member(target, [PLATFORM_OP_NAME])?.name ?? null,
     },
@@ -798,6 +808,13 @@ function bridgeApi(core = bridgeCore) {
     seedMissingRenderImageResource: member(core, SEED_MISSING_RENDER_IMAGE_RESOURCE_NAMES),
     screenshotPng: member(core, SCREENSHOT_PNG_NAMES),
     pdf: member(core, PDF_NAMES),
+    cookieHeader: member(core, COOKIE_HEADER_NAMES),
+    visibleCookies: member(core, VISIBLE_COOKIES_NAMES),
+    setCookieFromResponse: member(core, SET_COOKIE_RESPONSE_NAMES),
+    setCookieFromScript: member(core, SET_COOKIE_SCRIPT_NAMES),
+    allCookies: member(core, ALL_COOKIES_NAMES),
+    importCookies: member(core, IMPORT_COOKIES_NAMES),
+    deleteCookies: member(core, DELETE_COOKIES_NAMES),
     navigationAbiVersion: member(target, [NAVIGATION_ABI_VERSION_NAME]),
     beginNavigation: member(core, BEGIN_NAVIGATION_NAMES),
     navigationResponseHeaders: member(core, NAVIGATION_RESPONSE_HEADERS_NAMES),
@@ -1086,6 +1103,49 @@ function platformOperation(command, requestJson) {
     );
   }
   return value;
+}
+
+function cookieNowSeconds() {
+  return Math.floor(Date.now() / 1_000);
+}
+
+function documentUrlForCookies() {
+  try {
+    return decodeWireString(domOperation("document_url", "", ""), "document URL") || "about:blank";
+  } catch {
+    return "about:blank";
+  }
+}
+
+function cookieOperation(command, value = "") {
+  const api = bridgeApi();
+  if (!api.visibleCookies || !api.setCookieFromScript) {
+    if (command === "get") return "";
+    return undefined;
+  }
+  const url = documentUrlForCookies();
+  const now = cookieNowSeconds();
+  if (command === "get") return syncCall(api.visibleCookies, url, now);
+  if (command === "set") return syncCall(api.setCookieFromScript, value, url, now);
+  throw new TypeError(`Unknown portable cookie operation ${command}`);
+}
+
+function cookieHeaderForUrl(url, credentials = "include") {
+  const api = bridgeApi();
+  if (!api.cookieHeader || credentials === "omit") return "";
+  return syncCall(api.cookieHeader, String(url), cookieNowSeconds());
+}
+
+function storeResponseCookies(url, response) {
+  const api = bridgeApi();
+  if (!api.setCookieFromResponse || !response?.headers) return;
+  const values = typeof response.headers.getSetCookie === "function"
+    ? response.headers.getSetCookie()
+    : (response.headers.get("set-cookie") ? [response.headers.get("set-cookie")] : []);
+  for (const value of values) {
+    if (typeof value !== "string" || value.length === 0) continue;
+    try { syncCall(api.setCookieFromResponse, value, String(url), cookieNowSeconds()); } catch {}
+  }
 }
 
 async function getBridgeCapabilityProbe() {
@@ -1722,9 +1782,20 @@ function startBootstrapFetch(url, method, headersJson, body, pageOrigin, mode, c
   bootstrapFetches.set(id, record);
   void (async () => {
     try {
+      const requestHeaders = { ...headers };
+      const requestOrigin = (() => {
+        try { return new URL(pageOrigin).origin; } catch { return ""; }
+      })();
+      const targetOrigin = targetUrl.origin;
+      const sameRequestOrigin = requestOrigin !== "" && requestOrigin === targetOrigin;
+      if ((credentials === "include" || (credentials === "same-origin" && sameRequestOrigin)) &&
+          !Object.keys(requestHeaders).some((name) => name.toLowerCase() === "cookie")) {
+        const cookie = cookieHeaderForUrl(targetUrl, credentials);
+        if (cookie) requestHeaders.Cookie = cookie;
+      }
       const response = await fetch(targetUrl, {
         method,
-        headers,
+        headers: requestHeaders,
         body: method === "GET" || method === "HEAD" ? undefined : binaryStringToBytes(body),
         redirect: "follow",
         signal: controller.signal,
@@ -1733,6 +1804,9 @@ function startBootstrapFetch(url, method, headersJson, body, pageOrigin, mode, c
       const sameOrigin = (() => {
         try { return new URL(pageOrigin).origin === new URL(response.url || targetUrl).origin; } catch { return false; }
       })();
+      if (credentials !== "omit" && (sameOrigin || credentials === "include")) {
+        storeResponseCookies(response.url || targetUrl, response);
+      }
       if (mode === "cors" && !sameOrigin) {
         const allowedOrigin = responseHeaders["access-control-allow-origin"];
         const allowedCredentials = responseHeaders["access-control-allow-credentials"]?.toLowerCase() === "true";
@@ -1781,7 +1855,11 @@ async function fetchClassicScript(url, requestTimeoutMs, allowPrivateNetwork) {
   const timer = setTimeout(() => controller.abort(new Error("script fetch timed out")), requestTimeoutMs);
   timer.unref?.();
   try {
-    const response = await fetch(url, { redirect: "follow", signal: controller.signal });
+    const headers = {};
+    const cookie = cookieHeaderForUrl(url, "include");
+    if (cookie) headers.Cookie = cookie;
+    const response = await fetch(url, { headers, redirect: "follow", signal: controller.signal });
+    storeResponseCookies(response.url || url, response);
     if (!response.ok) throw new Error(`script fetch returned HTTP ${response.status}`);
     return await readBoundedResponseBytes(response);
   } finally {
@@ -2069,6 +2147,7 @@ async function executeDocumentScripts({ requestTimeoutMs, allowPrivateNetwork })
       failed.push({ nid: script.nid, url: sourceUrl, error: serializeError(error) });
     }
   }
+  const modules = await executeDocumentModules(records, base, requestTimeoutMs, allowPrivateNetwork);
   // Parser-blocking and module scripts complete before DOMContentLoaded in
   // this bounded navigation path. Async/defer scheduling remains represented
   // by the ordered document result rather than exposing host Promises.
@@ -2080,7 +2159,6 @@ async function executeDocumentScripts({ requestTimeoutMs, allowPrivateNetwork })
   } catch (error) {
       failed.push({ nid: 0, url: base, error: serializeError(error) });
   }
-  const modules = await executeDocumentModules(records, base, requestTimeoutMs, allowPrivateNetwork);
   return { executed, failed, skipped, modules };
 }
 
@@ -2134,13 +2212,18 @@ async function navigatePortable({ url, options = {}, allowPrivateNetwork = false
         return { ...commit, navigation: JSON.parse(syncCall(api.navigationStatus)), scripts };
       }
       const targetUrl = validateNavigationUrl(action.url, allowPrivateNetwork);
+      const navigationHeaders = {};
+      const navigationCookie = cookieHeaderForUrl(targetUrl, "include");
+      if (navigationCookie) navigationHeaders.Cookie = navigationCookie;
       const response = await fetch(targetUrl, {
         method: action.method,
+        headers: navigationHeaders,
         body: action.method === "GET" || action.method === "HEAD" ? undefined : action.body,
         redirect: "manual",
         signal: controller.signal,
         referrer: action.referrer || undefined,
       });
+      storeResponseCookies(response.url || targetUrl, response);
       const { headers, serialized } = responseHeadersObject(response);
       action = JSON.parse(syncCall(api.navigationResponseHeaders, navigationId, response.status, serialized));
       if (action.kind === "redirect") {
@@ -2214,6 +2297,9 @@ async function bridgeStatus() {
     Boolean(api.beginNavigation) && Boolean(api.navigationResponseHeaders) &&
     Boolean(api.navigationResponseChunk) && Boolean(api.navigationResponseEnd) &&
     Boolean(api.cancelNavigation) && Boolean(api.navigationStatus);
+  const hasCookieAbi = capabilities?.cookieAbiVersion === REQUIRED_COOKIE_ABI_VERSION &&
+    Boolean(api.cookieHeader) && Boolean(api.visibleCookies) &&
+    Boolean(api.setCookieFromResponse) && Boolean(api.setCookieFromScript);
   let navigation = null;
   if (hasNavigationAbi) {
     try {
@@ -2244,6 +2330,13 @@ async function bridgeStatus() {
       seedMissingRenderImageResource: api.seedMissingRenderImageResource?.name ?? null,
       screenshotPng: api.screenshotPng?.name ?? null,
       pdf: api.pdf?.name ?? null,
+      cookieHeader: api.cookieHeader?.name ?? null,
+      visibleCookies: api.visibleCookies?.name ?? null,
+      setCookieFromResponse: api.setCookieFromResponse?.name ?? null,
+      setCookieFromScript: api.setCookieFromScript?.name ?? null,
+      allCookies: api.allCookies?.name ?? null,
+      importCookies: api.importCookies?.name ?? null,
+      deleteCookies: api.deleteCookies?.name ?? null,
       beginNavigation: api.beginNavigation?.name ?? null,
       navigationResponseHeaders: api.navigationResponseHeaders?.name ?? null,
       navigationResponseChunk: api.navigationResponseChunk?.name ?? null,
@@ -2271,6 +2364,10 @@ async function bridgeStatus() {
       available: hasNavigationAbi,
       abiVersion: hasNavigationAbi ? REQUIRED_NAVIGATION_ABI_VERSION : null,
       state: navigation,
+    },
+    cookies: {
+      available: hasCookieAbi,
+      abiVersion: hasCookieAbi ? REQUIRED_COOKIE_ABI_VERSION : null,
     },
     bootstrap: {
       host: "node-vm",
@@ -2594,6 +2691,7 @@ async function installBootstrapRealm(timeoutMs = 5_000) {
       opPlatform: platformOperation,
       opTask: (command, argument) => taskHost.operation(command, argument),
       opFetch: (...args) => startBootstrapFetch(...args),
+      opCookie: (command, value) => cookieOperation(command, value),
     });
     taskHost.attach(taskDispatcher);
     bootstrapRuntime = taskDispatcher;

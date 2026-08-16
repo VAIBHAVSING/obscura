@@ -6,6 +6,7 @@ import { translateTaskDispatchError } from "./task-runtime.mjs";
 const HOST_DOM_OP_BINDING = "__obscuraHostDomOpBridge__";
 const HOST_PLATFORM_OP_BINDING = "__obscuraHostPlatformOpBridge__";
 const HOST_FETCH_OP_BINDING = "__obscuraHostFetchOpBridge__";
+const HOST_COOKIE_OP_BINDING = "__obscuraHostCookieOpBridge__";
 const HOST_TASK_OP_BINDING = "__obscuraHostTaskOpBridge__";
 const HOST_TASK_DISPATCH_SLOT_BINDING = "__obscuraHostTaskDispatchSlot__";
 const HOST_FETCH_DISPATCH_SLOT_BINDING = "__obscuraHostFetchDispatchSlot__";
@@ -109,6 +110,7 @@ const installDomBridgeScript = new vm.Script(
     const hostDomOp = globalThis.${HOST_DOM_OP_BINDING};
     const hostPlatformOp = globalThis.${HOST_PLATFORM_OP_BINDING};
     const hostFetchOp = globalThis.${HOST_FETCH_OP_BINDING};
+    const hostCookieOp = globalThis.${HOST_COOKIE_OP_BINDING};
     const hostTaskOp = globalThis.${HOST_TASK_OP_BINDING};
     const taskDispatchSlot = globalThis.${HOST_TASK_DISPATCH_SLOT_BINDING};
     const fetchDispatchSlot = globalThis.${HOST_FETCH_DISPATCH_SLOT_BINDING};
@@ -414,6 +416,17 @@ const installDomBridgeScript = new vm.Script(
     };
     [opFetchUrl, resolveFetch].forEach(Object.freeze);
 
+    const opGetCookies = function op_get_cookies() {
+      if (typeof hostCookieOp !== "function") return "";
+      const value = safeApply(hostCookieOp, undefined, ["get", ""]);
+      return typeof value === "string" ? value : "";
+    };
+    const opSetCookie = function op_set_cookie(value) {
+      if (typeof hostCookieOp !== "function") return;
+      safeApply(hostCookieOp, undefined, ["set", stringValue(value)]);
+    };
+    [opGetCookies, opSetCookie].forEach(Object.freeze);
+
     const taskEntries = new ContextMap();
     const callTaskHost = (command, argument) => {
       const response = safeApply(hostTaskOp, undefined, [command, argument]);
@@ -492,6 +505,8 @@ const installDomBridgeScript = new vm.Script(
       op_subtle_pbkdf2: { value: opSubtlePbkdf2, enumerable: true },
       op_subtle_hkdf: { value: opSubtleHkdf, enumerable: true },
       op_fetch_url: { value: opFetchUrl, enumerable: true },
+      op_get_cookies: { value: opGetCookies, enumerable: true },
+      op_set_cookie: { value: opSetCookie, enumerable: true },
     });
     Object.freeze(ops);
 
@@ -661,7 +676,7 @@ export function compileBootstrapRuntime(source, { filename = "<obscura:bootstrap
     { filename: "obscura-portable-fetch-dispatch.js" },
   );
   return Object.freeze({
-    install(context, { opDom, opPlatform, opTask, opFetch, timeoutMs } = {}) {
+    install(context, { opDom, opPlatform, opTask, opFetch, opCookie, timeoutMs } = {}) {
       if (!vm.isContext(context)) {
         throw new TypeError("Obscura bootstrap requires a Node vm context");
       }
@@ -710,6 +725,10 @@ export function compileBootstrapRuntime(source, { filename = "<obscura:bootstrap
         },
         configurable: true,
       });
+      Object.defineProperty(context, HOST_COOKIE_OP_BINDING, {
+        value: (...args) => (typeof opCookie === "function" ? opCookie(...args) : ""),
+        configurable: true,
+      });
       Object.defineProperty(context, HOST_TASK_OP_BINDING, {
         value: (command, argument) => taskHostResponse(opTask, command, argument),
         configurable: true,
@@ -728,6 +747,7 @@ export function compileBootstrapRuntime(source, { filename = "<obscura:bootstrap
         Reflect.deleteProperty(context, HOST_DOM_OP_BINDING);
         Reflect.deleteProperty(context, HOST_PLATFORM_OP_BINDING);
         Reflect.deleteProperty(context, HOST_FETCH_OP_BINDING);
+        Reflect.deleteProperty(context, HOST_COOKIE_OP_BINDING);
         Reflect.deleteProperty(context, HOST_TASK_OP_BINDING);
         Reflect.deleteProperty(context, HOST_TASK_DISPATCH_SLOT_BINDING);
         Reflect.deleteProperty(context, HOST_FETCH_DISPATCH_SLOT_BINDING);

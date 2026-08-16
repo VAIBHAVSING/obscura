@@ -13,6 +13,7 @@ use serde::{Deserialize, Serialize};
 
 mod platform;
 mod navigation;
+mod cookies;
 
 const ABI_VERSION: u32 = 1;
 const DOM_OP_ABI_VERSION: u32 = 1;
@@ -51,6 +52,13 @@ fn require_max_bytes(value: &str, maximum: usize, label: &str) -> Result<(), JsV
 fn bounded_return(value: String, label: &str) -> Result<String, JsValue> {
     require_max_bytes(&value, MAX_RETURNED_STRING_BYTES, label)?;
     Ok(value)
+}
+
+fn cookie_now(value: f64) -> Result<u64, JsValue> {
+    if !value.is_finite() || value < 0.0 || value.fract() != 0.0 || value > u64::MAX as f64 {
+        return Err(js_sys::RangeError::new("cookie clock must be a non-negative integer").into());
+    }
+    Ok(value as u64)
 }
 
 fn panic_message(operation: &str, payload: Box<dyn Any + Send>) -> String {
@@ -240,6 +248,7 @@ struct PdfOptionsWire {
 pub struct ObscuraCore {
     dom: DomTree,
     navigation: navigation::NavigationState,
+    cookies: cookies::CookieJar,
     #[cfg(feature = "render")]
     render_resources: obscura_render::RenderResourceCache,
     /// Opaque handles are never recycled, even when `set_html` replaces the
@@ -269,6 +278,7 @@ impl ObscuraCore {
         Ok(Self {
             dom,
             navigation: navigation::NavigationState::new(),
+            cookies: cookies::CookieJar::new(),
             #[cfg(feature = "render")]
             render_resources: portable_render_resources(),
             handle_to_node,
@@ -450,6 +460,86 @@ impl ObscuraCore {
         self.document_url = url.to_string();
         self.document_referrer = referrer.to_string();
         self.document_encoding = encoding.to_string();
+        Ok(())
+    }
+
+    /// Return the Cookie header selected by the portable jar for a request.
+    /// The host supplies wall-clock seconds so the WASM core remains
+    /// deterministic and does not depend on an unavailable target clock.
+    #[wasm_bindgen(js_name = cookieHeader)]
+    pub fn cookie_header(&self, url: &str, now_secs: f64) -> Result<String, JsValue> {
+        require_max_bytes(url, MAX_DOCUMENT_METADATA_BYTES, "cookie URL")?;
+        let now_secs = cookie_now(now_secs)?;
+        boundary_result("cookie_header", || self.cookies.request_header(url, now_secs))
+            .and_then(|value| bounded_return(value, "cookie header"))
+    }
+
+    /// Return the non-HttpOnly document.cookie view for the current page.
+    #[wasm_bindgen(js_name = visibleCookies)]
+    pub fn visible_cookies(&self, url: &str, now_secs: f64) -> Result<String, JsValue> {
+        require_max_bytes(url, MAX_DOCUMENT_METADATA_BYTES, "cookie URL")?;
+        let now_secs = cookie_now(now_secs)?;
+        boundary_result("visible_cookies", || self.cookies.visible_cookie_string(url, now_secs))
+            .and_then(|value| bounded_return(value, "visible cookies"))
+    }
+
+    #[wasm_bindgen(js_name = setCookieFromResponse)]
+    pub fn set_cookie_from_response(
+        &mut self,
+        value: &str,
+        url: &str,
+        now_secs: f64,
+    ) -> Result<bool, JsValue> {
+        require_max_bytes(value, 64 * 1024, "Set-Cookie value")?;
+        require_max_bytes(url, MAX_DOCUMENT_METADATA_BYTES, "cookie URL")?;
+        let now_secs = cookie_now(now_secs)?;
+        boundary_result("set_cookie_from_response", || {
+            self.cookies.set_from_response(value, url, now_secs)
+        })
+    }
+
+    #[wasm_bindgen(js_name = setCookieFromScript)]
+    pub fn set_cookie_from_script(
+        &mut self,
+        value: &str,
+        url: &str,
+        now_secs: f64,
+    ) -> Result<bool, JsValue> {
+        require_max_bytes(value, 64 * 1024, "document.cookie value")?;
+        require_max_bytes(url, MAX_DOCUMENT_METADATA_BYTES, "cookie URL")?;
+        let now_secs = cookie_now(now_secs)?;
+        boundary_result("set_cookie_from_script", || {
+            self.cookies.set_from_script(value, url, now_secs)
+        })
+    }
+
+    #[wasm_bindgen(js_name = allCookies)]
+    pub fn all_cookies(&self, now_secs: f64) -> Result<String, JsValue> {
+        let now_secs = cookie_now(now_secs)?;
+        boundary_result("all_cookies", || self.cookies.all_json(now_secs))
+            .and_then(|value| bounded_return(value, "all cookies"))
+    }
+
+    #[wasm_bindgen(js_name = importCookies)]
+    pub fn import_cookies(&mut self, value: &str, now_secs: f64) -> Result<(), JsValue> {
+        require_max_bytes(value, 64 * 1024, "cookie import")?;
+        let now_secs = cookie_now(now_secs)?;
+        boundary_result("import_cookies", || self.cookies.import_json(value, now_secs))
+    }
+
+    #[wasm_bindgen(js_name = deleteCookies)]
+    pub fn delete_cookies(
+        &mut self,
+        name: &str,
+        domain: &str,
+        path: Option<String>,
+    ) -> Result<(), JsValue> {
+        require_max_bytes(name, MAX_DOM_COMMAND_BYTES, "cookie name")?;
+        require_max_bytes(domain, MAX_DOCUMENT_METADATA_BYTES, "cookie domain")?;
+        if let Some(path) = &path {
+            require_max_bytes(path, MAX_DOCUMENT_METADATA_BYTES, "cookie path")?;
+        }
+        self.cookies.delete(name, domain, path.as_deref());
         Ok(())
     }
 
@@ -1941,6 +2031,13 @@ pub fn navigation_abi_version() -> u32 {
     navigation::NAVIGATION_ABI_VERSION
 }
 
+/// Versioned portable cookie state ABI. Cookie selection remains in WASM;
+/// hosts provide only the current wall-clock value and transport headers.
+#[wasm_bindgen(js_name = cookieAbiVersion)]
+pub fn cookie_abi_version() -> u32 {
+    cookies::COOKIE_ABI_VERSION
+}
+
 #[cfg(feature = "render")]
 #[wasm_bindgen(js_name = pdfAbiVersion)]
 pub fn pdf_abi_version() -> u32 {
@@ -1953,11 +2050,12 @@ pub fn probe() -> String {
     boundary_value("probe", || {
         #[cfg(feature = "render")]
         return format!(
-            r#"{{"abiVersion":{},"dom":true,"selectors":true,"javascript":"host","embeddedV8":false,"domOpAbiVersion":{},"domBatchAbiVersion":{},"documentMetadataAbiVersion":1,"navigationAbiVersion":{},"platformOpAbiVersion":{},"renderAbiVersion":{},"renderResourceRequestAbiVersion":{},"renderResourceRequests":true,"screenshotPng":true,"pdfAbiVersion":{},"pdf":true,"stableNodeHandles":true}}"#,
+            r#"{{"abiVersion":{},"dom":true,"selectors":true,"javascript":"host","embeddedV8":false,"domOpAbiVersion":{},"domBatchAbiVersion":{},"documentMetadataAbiVersion":1,"navigationAbiVersion":{},"cookieAbiVersion":{},"platformOpAbiVersion":{},"renderAbiVersion":{},"renderResourceRequestAbiVersion":{},"renderResourceRequests":true,"screenshotPng":true,"pdfAbiVersion":{},"pdf":true,"stableNodeHandles":true}}"#,
             ABI_VERSION,
             DOM_OP_ABI_VERSION,
             DOM_BATCH_ABI_VERSION,
             navigation::NAVIGATION_ABI_VERSION,
+            cookies::COOKIE_ABI_VERSION,
             platform::PLATFORM_OP_ABI_VERSION,
             RENDER_ABI_VERSION,
             RENDER_RESOURCE_REQUEST_ABI_VERSION,
@@ -1965,11 +2063,12 @@ pub fn probe() -> String {
         );
         #[cfg(not(feature = "render"))]
         format!(
-            r#"{{"abiVersion":{},"dom":true,"selectors":true,"javascript":"host","embeddedV8":false,"domOpAbiVersion":{},"domBatchAbiVersion":{},"documentMetadataAbiVersion":1,"navigationAbiVersion":{},"platformOpAbiVersion":{},"stableNodeHandles":true}}"#,
+            r#"{{"abiVersion":{},"dom":true,"selectors":true,"javascript":"host","embeddedV8":false,"domOpAbiVersion":{},"domBatchAbiVersion":{},"documentMetadataAbiVersion":1,"navigationAbiVersion":{},"cookieAbiVersion":{},"platformOpAbiVersion":{},"stableNodeHandles":true}}"#,
             ABI_VERSION,
             DOM_OP_ABI_VERSION,
             DOM_BATCH_ABI_VERSION,
             navigation::NAVIGATION_ABI_VERSION,
+            cookies::COOKIE_ABI_VERSION,
             platform::PLATFORM_OP_ABI_VERSION,
         )
     })
@@ -2013,6 +2112,7 @@ mod tests {
         assert!(probe().contains(r#""domOpAbiVersion":1"#));
         assert!(probe().contains(r#""domBatchAbiVersion":1"#));
         assert!(probe().contains(r#""navigationAbiVersion":1"#));
+        assert!(probe().contains(r#""cookieAbiVersion":1"#));
         assert!(probe().contains(r#""platformOpAbiVersion":1"#));
         assert!(probe().contains(r#""stableNodeHandles":true"#));
     }
