@@ -5,6 +5,7 @@
 - Commit: `30c8b0e` (`feat: add portable Rust CDP state ABI`)
 - Node host exposure: `b5a3bc1` (`feat: expose portable CDP core through Node worker`)
 - Package action routing: `e3f740b` (`feat: route package page actions through WASM CDP core`)
+- Lifecycle hardening: `0e36ec7` (`feat: harden portable CDP target lifecycle`)
 - Crate: `crates/obscura-wasm/src/cdp.rs`
 - The existing Tokio/TCP/WebSocket server remains native-only. This module is
   transport-independent and is compiled into the portable WASM artifact.
@@ -28,7 +29,8 @@
 - `cargo check -p obscura-wasm`: passed.
 - `cargo check --release -p obscura-wasm --target wasm32-unknown-unknown`:
   passed.
-- Release `obscura-wasm` nextest: 52/52 passed, including four CDP tests.
+- Release `obscura-wasm` nextest: 56/56 passed, including nine CDP tests and
+  action-error preservation.
 - Release wasm-bindgen output exported `PortableCdp`, `cdpAbiVersion`,
   `openConnection`, `cdpRequest`, `completeAction`, and `pollCdpEvents`.
 - Direct Node smoke against the generated wrapper passed browser version,
@@ -43,11 +45,15 @@
 - With an external `playwright-core` 1.62.1 installation, the full package
   suite passed 7/7, including Playwright CDP navigation, evaluation, cookie,
   screenshot, and PDF coverage after the WASM action route was enabled.
+- Lifecycle coverage now proves deterministic auto-attach snapshots, target
+  creation discovery ordering, detach/close event invalidation, stale action
+  rejection, and preservation of host action errors as CDP error responses.
 
 ## Remaining integration
 
 The package WebSocket adapter still owns its current JavaScript target/session
-dispatch. The next step is to route one connection/page action path through
-this ABI, then move the remaining CDP domains and page ownership into the
-shared WASM state. The current checkpoint is an implemented core slice, not
-full CDP or full browser parity.
+dispatch for domains not listed in the initial portable route. The next step
+is to move DOM tree responses/mutations, Network/Fetch/IO, Input/Emulation,
+and full page/context/session ownership into the shared WASM state. The
+current checkpoint is an implemented and hardened core slice, not full CDP or
+full browser parity.
