@@ -3,6 +3,7 @@
 ## Source
 
 - Commit: `30c8b0e` (`feat: add portable Rust CDP state ABI`)
+- Node host exposure: `b5a3bc1` (`feat: expose portable CDP core through Node worker`)
 - Crate: `crates/obscura-wasm/src/cdp.rs`
 - The existing Tokio/TCP/WebSocket server remains native-only. This module is
   transport-independent and is compiled into the portable WASM artifact.
@@ -31,6 +32,9 @@
   `openConnection`, `cdpRequest`, `completeAction`, and `pollCdpEvents`.
 - Direct Node smoke against the generated wrapper passed browser version,
   target discovery, attachment, and event polling.
+- The Node Worker now exposes bounded `portableCdpOpen`, `portableCdpRequest`,
+  `portableCdpComplete`, `portableCdpPoll`, and `portableCdpClose` methods;
+  the real generated wrapper test passed the full action round trip.
 
 ## Remaining integration
 
