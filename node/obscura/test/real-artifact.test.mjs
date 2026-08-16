@@ -15,6 +15,14 @@ test("real WASM artifact is reachable through package CDP", { skip: !modulePath 
     const { sessionId } = await client.command("Target.attachToTarget", { targetId, flatten: true });
     await client.command("Runtime.enable", {}, sessionId);
     await client.command("Page.enable", {}, sessionId);
+    await client.command("Emulation.setDeviceMetricsOverride", {
+      width: 640,
+      height: 480,
+      deviceScaleFactor: 2,
+    }, sessionId);
+    const metrics = await client.command("Page.getLayoutMetrics", {}, sessionId);
+    assert.equal(metrics.layoutViewport.clientWidth, 640);
+    assert.equal(metrics.layoutViewport.clientHeight, 480);
     await client.command("Page.navigate", {
       url: "data:text/html,<html><body><h1>Portable</h1></body></html>",
     }, sessionId);

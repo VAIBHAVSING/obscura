@@ -117,6 +117,18 @@ struct Action {
     kind: String,
 }
 
+#[derive(Clone, Copy)]
+struct Viewport {
+    width: u32,
+    height: u32,
+}
+
+impl Default for Viewport {
+    fn default() -> Self {
+        Self { width: 800, height: 600 }
+    }
+}
+
 struct Target {
     id: String,
     context_id: String,
@@ -126,6 +138,9 @@ struct Target {
     title: String,
     document_handle: u32,
     revision: u32,
+    viewport: Viewport,
+    emulated_media: String,
+    focus_emulation: bool,
     core: ObscuraCore,
     sessions: BTreeSet<String>,
 }
@@ -175,6 +190,9 @@ impl PortableCdp {
                 title: String::new(),
                 document_handle,
                 revision,
+                viewport: Viewport::default(),
+                emulated_media: String::new(),
+                focus_emulation: false,
                 core,
                 sessions: BTreeSet::new(),
             },
@@ -567,6 +585,62 @@ impl PortableCdp {
             "Page.enable" | "Network.enable" | "DOM.enable" | "Runtime.disable" | "Page.disable" | "Network.disable" | "DOM.disable" => {
                 cdp_result_response(&request.id, json!({}), session)
             }
+            "Page.getLayoutMetrics" => {
+                let Some(target) = self.targets.get(&target_id) else {
+                    return cdp_error_response(&request.id, -32000, "target is not known", session);
+                };
+                cdp_result_response(&request.id, layout_metrics(target), session)
+            }
+            "Emulation.setDeviceMetricsOverride" => {
+                let Some(target) = self.targets.get_mut(&target_id) else {
+                    return cdp_error_response(&request.id, -32000, "target is not known", session);
+                };
+                let width = match request.params.get("width").and_then(Value::as_u64) {
+                    Some(value) if (1..=4096).contains(&value) => value as u32,
+                    Some(_) => return cdp_error_response(&request.id, -32602, "width must be between 1 and 4096", session),
+                    None => return cdp_error_response(&request.id, -32602, "width is required", session),
+                };
+                let height = match request.params.get("height").and_then(Value::as_u64) {
+                    Some(value) if (1..=4096).contains(&value) => value as u32,
+                    Some(_) => return cdp_error_response(&request.id, -32602, "height must be between 1 and 4096", session),
+                    None => return cdp_error_response(&request.id, -32602, "height is required", session),
+                };
+                let device_scale_factor = request
+                    .params
+                    .get("deviceScaleFactor")
+                    .and_then(Value::as_f64)
+                    .unwrap_or(1.0);
+                if !device_scale_factor.is_finite() || !(0.0..=8.0).contains(&device_scale_factor) {
+                    return cdp_error_response(&request.id, -32602, "deviceScaleFactor must be between 0 and 8", session);
+                }
+                target.viewport = Viewport { width, height };
+                cdp_result_response(&request.id, json!({}), session)
+            }
+            "Emulation.clearDeviceMetricsOverride" => {
+                let Some(target) = self.targets.get_mut(&target_id) else {
+                    return cdp_error_response(&request.id, -32000, "target is not known", session);
+                };
+                target.viewport = Viewport::default();
+                cdp_result_response(&request.id, json!({}), session)
+            }
+            "Emulation.setEmulatedMedia" => {
+                let Some(target) = self.targets.get_mut(&target_id) else {
+                    return cdp_error_response(&request.id, -32000, "target is not known", session);
+                };
+                let media = request.params.get("media").and_then(Value::as_str).unwrap_or("");
+                if media.len() > 256 {
+                    return cdp_error_response(&request.id, -32602, "media exceeds the 256-byte limit", session);
+                }
+                target.emulated_media = media.to_string();
+                cdp_result_response(&request.id, json!({}), session)
+            }
+            "Emulation.setFocusEmulationEnabled" => {
+                let Some(target) = self.targets.get_mut(&target_id) else {
+                    return cdp_error_response(&request.id, -32000, "target is not known", session);
+                };
+                target.focus_emulation = request.params.get("enabled").and_then(Value::as_bool).unwrap_or(false);
+                cdp_result_response(&request.id, json!({}), session)
+            }
             "Network.getAllCookies" | "Storage.getCookies" => {
                 let Some(target) = self.targets.get_mut(&target_id) else {
                     return cdp_error_response(&request.id, -32000, "target is not known", session);
@@ -808,6 +882,9 @@ impl PortableCdp {
             title: String::new(),
             document_handle: core.document_handle(),
             revision: core.page_revision(),
+            viewport: Viewport::default(),
+            emulated_media: String::new(),
+            focus_emulation: false,
             core,
             sessions: BTreeSet::new(),
         });
@@ -966,6 +1043,25 @@ impl PortableCdp {
             "browserContextId": target.context_id,
         })
     }
+}
+
+fn layout_metrics(target: &Target) -> Value {
+    let width = target.viewport.width;
+    let height = target.viewport.height;
+    json!({
+        "layoutViewport": {"pageX": 0, "pageY": 0, "clientWidth": width, "clientHeight": height},
+        "visualViewport": {
+            "offsetX": 0,
+            "offsetY": 0,
+            "pageX": 0,
+            "pageY": 0,
+            "scale": 1,
+            "zoom": 1,
+            "clientWidth": width,
+            "clientHeight": height,
+        },
+        "contentSize": {"x": 0, "y": 0, "width": width, "height": height},
+    })
 }
 
 const MAX_CDP_COOKIE_COUNT: usize = 4096;
@@ -1329,6 +1425,33 @@ mod tests {
         assert_eq!(json(&cdp.cdp_request(connection, &delete).unwrap())["result"], json!({}));
         let empty = json(&cdp.cdp_request(connection, &get).unwrap());
         assert!(empty["result"]["cookies"].as_array().unwrap().is_empty());
+    }
+
+    #[test]
+    fn portable_emulation_state_drives_layout_metrics() {
+        let mut cdp = PortableCdp::new("").unwrap();
+        let connection = cdp.open_connection().unwrap();
+        let attached = json(&cdp.cdp_request(
+            connection,
+            r#"{"id":1,"method":"Target.attachToTarget","params":{"targetId":"page-1"}}"#,
+        ).unwrap());
+        let session = attached["result"]["sessionId"].as_str().unwrap();
+        let set = format!(
+            r#"{{"id":2,"sessionId":"{session}","method":"Emulation.setDeviceMetricsOverride","params":{{"width":640,"height":480,"deviceScaleFactor":2}}}}"#
+        );
+        let set_result = json(&cdp.cdp_request(connection, &set).unwrap());
+        assert_eq!(set_result["result"], json!({}));
+        let metrics = json(&cdp.cdp_request(
+            connection,
+            &format!(r#"{{"id":3,"sessionId":"{session}","method":"Page.getLayoutMetrics"}}"#),
+        ).unwrap());
+        assert_eq!(metrics["result"]["layoutViewport"]["clientWidth"], 640);
+        assert_eq!(metrics["result"]["layoutViewport"]["clientHeight"], 480);
+        let invalid = json(&cdp.cdp_request(
+            connection,
+            &format!(r#"{{"id":4,"sessionId":"{session}","method":"Emulation.setDeviceMetricsOverride","params":{{"width":0,"height":480}}}}"#),
+        ).unwrap());
+        assert_eq!(invalid["error"]["code"], -32602);
     }
 
     #[test]

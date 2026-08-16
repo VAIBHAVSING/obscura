@@ -450,6 +450,16 @@ class PageTarget {
       { requestTimeoutMs: this.server.requestTimeoutMs },
     );
     if (response?.error?.code === -32601 || response?.error?.code === -32602) return null;
+    if (command.method === "Emulation.setDeviceMetricsOverride") {
+      const width = command.params?.width;
+      const height = command.params?.height;
+      const deviceScaleFactor = command.params?.deviceScaleFactor;
+      if (Number.isSafeInteger(width) && width > 0) this.viewport.width = Math.min(width, 4096);
+      if (Number.isSafeInteger(height) && height > 0) this.viewport.height = Math.min(height, 4096);
+      if (typeof deviceScaleFactor === "number" && Number.isFinite(deviceScaleFactor)) this.viewport.deviceScaleFactor = deviceScaleFactor;
+    } else if (command.method === "Emulation.clearDeviceMetricsOverride") {
+      this.viewport = { width: 800, height: 600, deviceScaleFactor: 1 };
+    }
     if (response && typeof response === "object") {
       response.sessionId = command.sessionId;
       rewritePortableTargetIds(response, "page-1", this.frameId);
@@ -813,6 +823,7 @@ export class ObscuraCdpServer {
       "Runtime.enable",
       "Page.enable",
       "Page.getFrameTree",
+      "Page.getLayoutMetrics",
       "DOM.getDocument",
       "DOM.querySelector",
       "DOM.querySelectorAll",
@@ -833,6 +844,10 @@ export class ObscuraCdpServer {
       "Storage.getCookies",
       "Storage.setCookies",
       "Storage.clearDataForOrigin",
+      "Emulation.setDeviceMetricsOverride",
+      "Emulation.clearDeviceMetricsOverride",
+      "Emulation.setEmulatedMedia",
+      "Emulation.setFocusEmulationEnabled",
     ]).has(method)) {
       return undefined;
     }
