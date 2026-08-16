@@ -231,7 +231,7 @@ function boundedNavigationOptions(options = {}) {
   if (options === null || typeof options !== "object" || Array.isArray(options)) {
     throw new TypeError("navigation options must be an object");
   }
-  const allowed = new Set(["method", "body", "referrer", "replaceHistory", "maxRedirects", "allowPrivateNetwork", "requestTimeoutMs"]);
+  const allowed = new Set(["method", "body", "referrer", "replaceHistory", "maxRedirects", "executeScripts", "allowPrivateNetwork", "requestTimeoutMs"]);
   for (const key of Reflect.ownKeys(options)) {
     if (typeof key !== "string" || !allowed.has(key)) throw new TypeError(`unknown navigation option ${String(key)}`);
   }
@@ -255,6 +255,7 @@ function boundedNavigationOptions(options = {}) {
     referrer,
     replaceHistory: Boolean(options.replaceHistory),
     maxRedirects,
+    executeScripts: options.executeScripts !== false,
     allowPrivateNetwork: Boolean(options.allowPrivateNetwork),
     requestTimeoutMs: options.requestTimeoutMs,
   };
@@ -577,6 +578,7 @@ export class WasmV8Worker {
             referrer: normalized.referrer,
             replaceHistory: normalized.replaceHistory,
             maxRedirects: normalized.maxRedirects,
+            executeScripts: normalized.executeScripts,
           },
           allowPrivateNetwork: normalized.allowPrivateNetwork,
         },

@@ -102,6 +102,8 @@ const MAX_NAVIGATION_HEADERS_BYTES = 128 * 1024;
 const MAX_NAVIGATION_RESPONSE_BYTES = 32 * 1024 * 1024;
 const MAX_NAVIGATION_REDIRECTS = 10;
 const MAX_NAVIGATION_REQUEST_TIMEOUT_MS = 120_000;
+const MAX_SCRIPT_SOURCE_BYTES = 16 * 1024 * 1024;
+const MAX_DOCUMENT_SCRIPTS = 512;
 const PLATFORM_OP_COMMAND_SET = new Set(BOOTSTRAP_PLATFORM_OP_COMMANDS);
 const PLATFORM_BYTE_FIELDS = Object.freeze({
   op_text_decode: ["bytes"],
@@ -1614,6 +1616,136 @@ async function readNavigationBody(response, api, navigationId, signal) {
   }
 }
 
+function decodeWireString(value, label) {
+  requireBoundedString(value, MAX_RETURNED_STRING_BYTES, label);
+  const decoded = JSON.parse(value);
+  if (decoded !== null && typeof decoded !== "string") {
+    throw new TypeError(`${label} did not return a JSON string or null`);
+  }
+  return decoded;
+}
+
+async function readBoundedResponseBytes(response) {
+  if (!response.body) return new Uint8Array();
+  const reader = response.body.getReader();
+  const chunks = [];
+  let total = 0;
+  try {
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      const chunk = value instanceof Uint8Array ? value : new Uint8Array(value);
+      total += chunk.byteLength;
+      if (total > MAX_SCRIPT_SOURCE_BYTES) {
+        throw new RangeError(`script source exceeds the ${MAX_SCRIPT_SOURCE_BYTES}-byte limit`);
+      }
+      chunks.push(chunk);
+    }
+  } finally {
+    try { await reader.cancel(); } catch {}
+  }
+  const result = new Uint8Array(total);
+  let offset = 0;
+  for (const chunk of chunks) {
+    result.set(chunk, offset);
+    offset += chunk.byteLength;
+  }
+  return result;
+}
+
+async function fetchClassicScript(url, requestTimeoutMs, allowPrivateNetwork) {
+  validateNavigationUrl(url, allowPrivateNetwork);
+  if (url.startsWith("data:")) {
+    return decodeInlineNavigation(url).bytes;
+  }
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(new Error("script fetch timed out")), requestTimeoutMs);
+  timer.unref?.();
+  try {
+    const response = await fetch(url, { redirect: "follow", signal: controller.signal });
+    if (!response.ok) throw new Error(`script fetch returned HTTP ${response.status}`);
+    return await readBoundedResponseBytes(response);
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+function scriptElementRecords() {
+  const handles = JSON.parse(domOperation("query_selector_all", "script", ""));
+  if (!Array.isArray(handles)) throw new TypeError("query_selector_all(script) returned a non-array");
+  if (handles.length > MAX_DOCUMENT_SCRIPTS) {
+    throw new RangeError(`document contains more than ${MAX_DOCUMENT_SCRIPTS} script elements`);
+  }
+  const records = [];
+  for (const handle of handles) {
+    const nid = requireUnsignedU32(handle, "script node handle");
+    let type = decodeWireString(domOperation("get_attribute", String(nid), "type"), "script type") ?? "";
+    let src = decodeWireString(domOperation("get_attribute", String(nid), "src"), "script src");
+    const code = decodeWireString(domOperation("text_content", String(nid), ""), "script text") ?? "";
+    const normalizedType = type.trim().toLowerCase();
+    const module = normalizedType === "module" || normalizedType === "text/module";
+    const importMap = normalizedType === "importmap" || normalizedType === "application/importmap+json";
+    const classic = normalizedType === "" || normalizedType === "text/javascript" ||
+      normalizedType === "application/javascript" || normalizedType === "text/ecmascript" ||
+      normalizedType === "application/ecmascript";
+    records.push({
+      nid,
+      type: normalizedType,
+      src,
+      code,
+      module,
+      importMap,
+      classic,
+      noModule: domOperation("get_attribute", String(nid), "nomodule") !== "null",
+    });
+  }
+  return records;
+}
+
+async function executeDocumentScripts({ requestTimeoutMs, allowPrivateNetwork }) {
+  const records = scriptElementRecords();
+  const base = decodeWireString(domOperation("document_url", "", ""), "document URL") ?? "about:blank";
+  const executed = [];
+  const failed = [];
+  const skipped = [];
+  await installBootstrapRealm();
+  for (const script of records) {
+    if (!script.classic || script.module || script.importMap || script.noModule) {
+      skipped.push({ nid: script.nid, type: script.type || "classic" });
+      continue;
+    }
+    let source = script.code;
+    let sourceUrl = base;
+    try {
+      if (script.src) {
+        sourceUrl = new URL(script.src, base).href;
+        const bytes = await fetchClassicScript(sourceUrl, requestTimeoutMs, allowPrivateNetwork);
+        source = new TextDecoder("utf-8", { fatal: false }).decode(bytes);
+      }
+      requireBoundedString(source, MAX_SCRIPT_SOURCE_BYTES, "script source");
+      await hostEvaluate(`globalThis.__currentScriptNid = ${script.nid}; undefined`, 1_000);
+      await hostEvaluate(source, 1_000);
+      await hostEvaluate(`globalThis.__currentScriptNid = 0; undefined`, 1_000);
+      executed.push({ nid: script.nid, url: sourceUrl });
+    } catch (error) {
+      try { await hostEvaluate("globalThis.__currentScriptNid = 0; undefined", 1_000); } catch {}
+      failed.push({ nid: script.nid, url: sourceUrl, error: serializeError(error) });
+    }
+  }
+  // Parser-blocking/defer scripts complete before DOMContentLoaded. Async and
+  // module queues are deliberately reported as skipped until S2 adds their
+  // common module graph and task ordering semantics.
+  try {
+    await hostEvaluate(
+      "globalThis.__documentReadyState__ = 'interactive'; try { document.dispatchEvent(new Event('DOMContentLoaded')); window.dispatchEvent(new Event('DOMContentLoaded')); } catch {} globalThis.__documentReadyState__ = 'complete'; try { window.dispatchEvent(new Event('load')); } catch {}",
+      1_000,
+    );
+  } catch (error) {
+    failed.push({ nid: 0, url: base, error: serializeError(error) });
+  }
+  return { executed, failed, skipped };
+}
+
 async function navigatePortable({ url, options = {}, allowPrivateNetwork = false, requestTimeoutMs = 30_000 } = {}) {
   if (!Number.isSafeInteger(requestTimeoutMs) || requestTimeoutMs < 1) {
     throw new RangeError("navigation request timeout must be a positive safe integer");
@@ -1625,7 +1757,7 @@ async function navigatePortable({ url, options = {}, allowPrivateNetwork = false
   if (options === null || typeof options !== "object" || Array.isArray(options)) {
     throw new TypeError("navigation options must be an object");
   }
-  const allowedOptions = new Set(["method", "body", "referrer", "replaceHistory", "maxRedirects"]);
+  const allowedOptions = new Set(["method", "body", "referrer", "replaceHistory", "maxRedirects", "executeScripts"]);
   for (const key of Reflect.ownKeys(options)) {
     if (typeof key !== "string" || !allowedOptions.has(key)) throw new TypeError(`unknown navigation option ${String(key)}`);
   }
@@ -1658,7 +1790,10 @@ async function navigatePortable({ url, options = {}, allowPrivateNetwork = false
         syncCall(api.navigationResponseChunk, navigationId, inline.bytes);
         const commit = JSON.parse(syncCall(api.navigationResponseEnd, navigationId, action.url, inline.encoding));
         resetBridgeRealmAfterNavigation();
-        return { ...commit, navigation: JSON.parse(syncCall(api.navigationStatus)) };
+        const scripts = options.executeScripts === false
+          ? null
+          : await executeDocumentScripts({ requestTimeoutMs, allowPrivateNetwork });
+        return { ...commit, navigation: JSON.parse(syncCall(api.navigationStatus)), scripts };
       }
       const targetUrl = validateNavigationUrl(action.url, allowPrivateNetwork);
       const response = await fetch(targetUrl, {
@@ -1682,7 +1817,10 @@ async function navigatePortable({ url, options = {}, allowPrivateNetwork = false
       await readNavigationBody(response, api, navigationId, controller.signal);
       const commit = JSON.parse(syncCall(api.navigationResponseEnd, navigationId, targetUrl.toString(), responseEncoding(headers)));
       resetBridgeRealmAfterNavigation();
-      return { ...commit, navigation: JSON.parse(syncCall(api.navigationStatus)) };
+      const scripts = options.executeScripts === false
+        ? null
+        : await executeDocumentScripts({ requestTimeoutMs, allowPrivateNetwork });
+      return { ...commit, navigation: JSON.parse(syncCall(api.navigationStatus)), scripts };
     }
   } catch (error) {
     try { if (api.cancelNavigation) syncCall(api.cancelNavigation, Number(action.navigationId)); } catch {}

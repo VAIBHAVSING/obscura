@@ -17,7 +17,12 @@ test("portable navigation owns redirects, document identity, history, and HTML c
     }
     if (request.url === "/page") {
       response.writeHead(200, { "content-type": "text/html; charset=UTF-8" });
-      response.end("<!doctype html><html><head><title>portable navigation</title></head><body><h1>Node host only</h1></body></html>");
+      response.end("<!doctype html><html><head><title>portable navigation</title></head><body><h1>Node host only</h1><script>document.body.setAttribute('data-inline', 'yes')</script><script src='/script.js'></script></body></html>");
+      return;
+    }
+    if (request.url === "/script.js") {
+      response.writeHead(200, { "content-type": "text/javascript" });
+      response.end("document.querySelector('h1').textContent = document.body.getAttribute('data-inline') === 'yes' ? 'script order ok' : 'script order bad';");
       return;
     }
     response.writeHead(404, { "content-type": "text/html" });
@@ -43,8 +48,9 @@ test("portable navigation owns redirects, document identity, history, and HTML c
     assert.equal(page.navigation.currentUrl, `http://127.0.0.1:${port}/page`);
     assert.equal(page.navigation.pending, null);
     assert.ok(page.navigation.history.length >= 4);
-    assert.equal(await worker.bridgeEvaluate("document.querySelector('title').textContent"), "portable navigation");
-    assert.equal(await worker.bridgeEvaluate("document.querySelector('h1').textContent"), "Node host only");
+    assert.deepEqual(page.scripts.executed.map(({ nid }) => nid).length, 2);
+    assert.equal(await worker.bootstrapEvaluate("document.querySelector('title').textContent"), "portable navigation");
+    assert.equal(await worker.bootstrapEvaluate("document.querySelector('h1').textContent"), "script order ok");
 
     await assert.rejects(
       worker.navigate("http://127.0.0.1:1/blocked"),
