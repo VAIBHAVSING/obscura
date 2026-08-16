@@ -1,9 +1,9 @@
 # Obscura Node and WebAssembly migration memory
 
 Latest verified implementation commit:
-`f248863a2504ea002f38c0530a44462814f15c8e`
-(`feat: discover render resources in portable WASM`). The earlier harness,
-portable rendering, and boundary-hardening milestones remain recorded below.
+`ab36f8e6743b3efc822a4e709585018068ca96aa`
+(`feat: generate portable WASM PDFs`). Earlier harness, portable rendering,
+resource discovery, and boundary-hardening milestones remain recorded below.
 
 ## Decision
 
@@ -645,3 +645,52 @@ yet supply Node-owned navigation/fetch/cookie orchestration, dynamic script
 loading, portable PDF, CDP/WebSocket transport, Playwright compatibility, or
 the final npm/npx package. Those are the remaining packets in
 `.agent/files/remaining/`.
+
+## Portable PDF checkpoint (2026-08-16)
+
+Source commit: `ab36f8e6743b3efc822a4e709585018068ca96aa`
+(`feat: generate portable WASM PDFs`).
+
+### Implemented boundary
+
+- Target-neutral pagination, page-range selection, raster budgets, JPEG image
+  streams, xref construction and bounded PDF output now live in
+  `obscura-render::pdf` and are shared by native `Page::raster_pdf` and the
+  portable WASM path.
+- WASM selects print media, lays out the live DOM with the seeded resource
+  cache, captures bounded virtual page slices, and encodes the complete PDF
+  inside the WASM module. Node only supplies options and transports bytes.
+- PDF ABI v1 exposes `pdfAbiVersion()` and `pdf(optionsJson, documentHandle,
+  revision)`. The Node bridge additionally checks Worker generation and
+  validates identity before and after the call.
+- Options are strict camelCase JSON with bounded viewport, paper, margins,
+  scale and page-range fields. Both client and Worker enforce the 64 KiB
+  options limit, 64 MiB output limit, `%PDF-` header, `%%EOF` trailer and
+  deterministic byte copies.
+
+### Verification evidence
+
+- `obscura-wasm --features render` release nextest: **47/47 passed**, run
+  `ddef262b-10e8-46f4-bd87-d609d6a21fde`.
+- `obscura-browser --features render` release nextest: **63/63 passed**, run
+  `fe231751-902f-4774-b008-2b756e1cd7db`.
+- `obscura-render --features paint` release nextest: **589/589 passed, one
+  configured skip**, run `5612bdf8-0696-4211-84d1-c8e65dc97f13`.
+- Node mock suite: **62 passed, 6 expected skips, 0 failed**.
+- Fresh real wasm-bindgen Node suite: **66 passed, 2 native-addon skips,
+  0 failed**. The real PDF test generated the same three-page PDF twice,
+  checked `%PDF-`, `%%EOF`, `/Count 3`, and a 100x80 point MediaBox after
+  seeding a real image through the Packet R resource bridge.
+- Fresh artifact hashes: raw WASM SHA-256
+  `a46eacf0742912b17d4524fac07d577f784f7c921c809ae00d5ced0e55fe1e48`,
+  wasm-bindgen wrapper SHA-256
+  `3993dff39609e69f87d27134f16e90a78b13bd968ff9fb8d7c9e404f2593bbf9`,
+  background WASM SHA-256
+  `85a9104dfd94ac670126f8e24dd34e84bc59fbe6cc8c641f93ee5023db241239`.
+- The wasm32 render dependency tree contains no `deno_core`, V8, Tokio,
+  sockets, native HTTP client, rustls, ring or reqwest dependency.
+
+This packet supplies portable PDF generation, not navigation/fetch
+orchestration, dynamic script loading, CDP/WebSocket transport, Playwright
+compatibility, or the final npm/npx package. Those remain in the subsequent
+packets.

@@ -186,4 +186,4 @@ R: resource discovery checkpoint
 - `VERIFIED`: focused real-artifact acceptance passed.
 - `SHIPPED`: committed and pushed with evidence recorded.
 
-Current packet states: R is `SHIPPED`; every later packet is `TODO`.
+Current packet states: R and P are `SHIPPED`; every later packet is `TODO`.

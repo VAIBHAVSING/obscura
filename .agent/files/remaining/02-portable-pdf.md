@@ -1,5 +1,8 @@
 # Packet P: portable PDF generation
 
+Status: SHIPPED in source commit `ab36f8e`; evidence is recorded in
+`.agent/files/wasm-node-migration-memory.md`.
+
 ## Goal
 
 Generate bounded PDF bytes inside `obscura-wasm`, using the same retained
