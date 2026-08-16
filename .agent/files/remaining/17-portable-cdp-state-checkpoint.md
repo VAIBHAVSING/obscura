@@ -4,6 +4,7 @@
 
 - Commit: `30c8b0e` (`feat: add portable Rust CDP state ABI`)
 - Node host exposure: `b5a3bc1` (`feat: expose portable CDP core through Node worker`)
+- Package action routing: `e3f740b` (`feat: route package page actions through WASM CDP core`)
 - Crate: `crates/obscura-wasm/src/cdp.rs`
 - The existing Tokio/TCP/WebSocket server remains native-only. This module is
   transport-independent and is compiled into the portable WASM artifact.
@@ -39,6 +40,9 @@
   runnable tests (one Playwright test skipped because no external
   `playwright-core` path was supplied); a non-render wrapper is intentionally
   rejected by the package's render capability gate.
+- With an external `playwright-core` 1.62.1 installation, the full package
+  suite passed 7/7, including Playwright CDP navigation, evaluation, cookie,
+  screenshot, and PDF coverage after the WASM action route was enabled.
 
 ## Remaining integration
 
