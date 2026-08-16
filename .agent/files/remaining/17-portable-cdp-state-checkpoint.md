@@ -6,6 +6,7 @@
 - Node host exposure: `b5a3bc1` (`feat: expose portable CDP core through Node worker`)
 - Package action routing: `e3f740b` (`feat: route package page actions through WASM CDP core`)
 - Lifecycle hardening: `0e36ec7` (`feat: harden portable CDP target lifecycle`)
+- DOM state routing: `7d7af36` (`feat: route portable DOM CDP state through WASM`)
 - Crate: `crates/obscura-wasm/src/cdp.rs`
 - The existing Tokio/TCP/WebSocket server remains native-only. This module is
   transport-independent and is compiled into the portable WASM artifact.
@@ -48,6 +49,11 @@
 - Lifecycle coverage now proves deterministic auto-attach snapshots, target
   creation discovery ordering, detach/close event invalidation, stale action
   rejection, and preservation of host action errors as CDP error responses.
+- Rust now serves `DOM.getDocument`, selector queries, outer HTML, attributes,
+  node descriptions, and `DOM.setChildNodes`; the Node adapter seeds the Rust
+  target from the live WASM document, synchronizes committed navigation and
+  `Page.setDocumentContent`, and translates the worker-local page-1/frame IDs
+  to package target IDs. The real-artifact test covers these paths.
 
 ## Remaining integration
 
