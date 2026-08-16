@@ -9,6 +9,7 @@ import {
   MAX_DOM_BATCH_OPERATIONS,
   MAX_DOM_COMMAND_BYTES,
   MAX_HTML_INPUT_BYTES,
+  PDF_OPTION_NAMES,
   MAX_RENDER_RESOURCE_BYTES,
   MAX_RENDER_RESOURCE_REQUESTS_PER_PAGE,
   MAX_RENDER_URL_BYTES,
@@ -16,6 +17,7 @@ import {
   MAX_SCREENSHOT_PIXELS,
   requireBoundedBytes,
   requireBoundedString,
+  requirePdfOptions,
   requireRenderImageRequestProfile,
 } from "./limits.mjs";
 import { resolveModulePath } from "./module-loader.mjs";
@@ -165,6 +167,33 @@ function boundedScreenshotOptions(options = {}) {
 
   const expectedPage = boundedPageExpectation(options);
   return { width, height, scrollX, scrollY, expectedPage };
+}
+
+const PDF_CLIENT_CONTROL_FIELDS = new Set([
+  "expectedPage",
+  "expectedGeneration",
+  "expectedDocumentHandle",
+  "expectedRevision",
+  "requestTimeoutMs",
+]);
+
+function boundedPdfOptions(options = {}) {
+  if (options === null || typeof options !== "object" || Array.isArray(options)) {
+    throw new TypeError("PDF options must be an object");
+  }
+  for (const name of Reflect.ownKeys(options)) {
+    if (
+      typeof name !== "string" ||
+      (!PDF_OPTION_NAMES.includes(name) && !PDF_CLIENT_CONTROL_FIELDS.has(name))
+    ) {
+      throw new TypeError(`PDF options contain an unknown field ${String(name)}`);
+    }
+  }
+  const pdfOptions = {};
+  for (const name of PDF_OPTION_NAMES) {
+    if (Object.hasOwn(options, name)) pdfOptions[name] = options[name];
+  }
+  return { pdfOptions: requirePdfOptions(pdfOptions), expectedPage: boundedPageExpectation(options) };
 }
 
 function boundedRenderResourceRequestOptions(options = {}) {
@@ -473,6 +502,19 @@ export class WasmV8Worker {
       return this.request(
         "screenshotPng",
         { width, height, scrollX, scrollY, expectedPage },
+        options.requestTimeoutMs,
+      );
+    } catch (error) {
+      return Promise.reject(error);
+    }
+  }
+
+  pdf(options = {}) {
+    try {
+      const { pdfOptions, expectedPage } = boundedPdfOptions(options);
+      return this.request(
+        "pdf",
+        { options: pdfOptions, expectedPage },
         options.requestTimeoutMs,
       );
     } catch (error) {

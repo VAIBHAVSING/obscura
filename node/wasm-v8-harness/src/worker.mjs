@@ -24,6 +24,7 @@ import {
   MAX_PLATFORM_RANDOM_BYTES,
   MAX_PLATFORM_REQUEST_BYTES,
   MAX_PLATFORM_RESPONSE_BYTES,
+  MAX_PDF_OPTIONS_BYTES,
   MAX_RENDER_RESOURCE_BYTES,
   MAX_RENDER_RESOURCE_REQUESTS_PER_PAGE,
   MAX_RENDER_URL_BYTES,
@@ -33,8 +34,10 @@ import {
   MAX_SELECTOR_BYTES,
   requireBoundedBytes,
   requireBoundedString,
+  requirePdfOptions,
   requireRenderImageRequestProfile,
   requireValidPngBytes,
+  requireValidPdfBytes,
 } from "./limits.mjs";
 
 if (!parentPort) throw new Error("The WASM V8 harness worker must run as a Worker");
@@ -73,6 +76,8 @@ const SEED_MISSING_RENDER_IMAGE_RESOURCE_NAMES = [
   "seedMissingRenderImageResource",
 ];
 const SCREENSHOT_PNG_NAMES = ["screenshot_png", "screenshotPng"];
+const PDF_NAMES = ["pdf"];
+const PDF_ABI_VERSION_NAME = "pdfAbiVersion";
 const PLATFORM_OP_ABI_VERSION_NAME = "platformOpAbiVersion";
 const PLATFORM_OP_NAME = "platformOp";
 const REQUIRED_CORE_ABI_VERSION = 1;
@@ -82,6 +87,7 @@ const REQUIRED_DOCUMENT_METADATA_ABI_VERSION = 1;
 const REQUIRED_PLATFORM_OP_ABI_VERSION = 1;
 const REQUIRED_RENDER_ABI_VERSION = 1;
 const REQUIRED_RENDER_RESOURCE_REQUEST_ABI_VERSION = 1;
+const REQUIRED_PDF_ABI_VERSION = 1;
 const PLATFORM_OP_COMMAND_SET = new Set(BOOTSTRAP_PLATFORM_OP_COMMANDS);
 const PLATFORM_BYTE_FIELDS = Object.freeze({
   op_text_decode: ["bytes"],
@@ -767,6 +773,7 @@ function bridgeApi(core = bridgeCore) {
     seedRenderImageResource: member(core, SEED_RENDER_IMAGE_RESOURCE_NAMES),
     seedMissingRenderImageResource: member(core, SEED_MISSING_RENDER_IMAGE_RESOURCE_NAMES),
     screenshotPng: member(core, SCREENSHOT_PNG_NAMES),
+    pdf: member(core, PDF_NAMES),
     dispose: member(core, DISPOSE_NAMES),
   };
 }
@@ -817,6 +824,45 @@ function renderAbiError(message) {
   const error = new Error(message);
   error.code = "ERR_OBSCURA_WASM_RENDER_ABI";
   return error;
+}
+
+function pdfAbiError(message) {
+  const error = new Error(message);
+  error.code = "ERR_OBSCURA_WASM_PDF_ABI";
+  return error;
+}
+
+function modulePdfAbiVersion() {
+  const version = member(target, [PDF_ABI_VERSION_NAME]);
+  if (!version) return null;
+  const value = syncCall(version);
+  return Number.isSafeInteger(value) ? value : null;
+}
+
+async function requirePdfCompatibility(api) {
+  const capabilities = await getBridgeCapabilityProbe();
+  if (!capabilities) {
+    throw pdfAbiError("ObscuraCore PDF ABI requires a machine-readable capability probe");
+  }
+  if (capabilities.pdfAbiVersion !== REQUIRED_PDF_ABI_VERSION) {
+    throw pdfAbiError(
+      `ObscuraCore PDF requires ABI version ${REQUIRED_PDF_ABI_VERSION}, but the probe exposes ${String(capabilities.pdfAbiVersion)}`,
+    );
+  }
+  if (capabilities.pdf !== true) {
+    throw pdfAbiError("ObscuraCore PDF requires pdf=true");
+  }
+  const version = member(target, [PDF_ABI_VERSION_NAME]);
+  if (!version) {
+    throw pdfAbiError(`Obscura WASM module does not expose ${PDF_ABI_VERSION_NAME}()`);
+  }
+  const actual = syncCall(version);
+  if (!Number.isSafeInteger(actual) || actual !== REQUIRED_PDF_ABI_VERSION) {
+    throw pdfAbiError(
+      `Obscura WASM ${PDF_ABI_VERSION_NAME}() must return ${REQUIRED_PDF_ABI_VERSION}, but returned ${String(actual)}`,
+    );
+  }
+  if (!api.pdf) throw pdfAbiError("ObscuraCore does not expose pdf()");
 }
 
 async function requireRenderCompatibility(api, requiredMethod) {
@@ -1441,6 +1487,16 @@ async function bridgeStatus() {
     Boolean(api.seedRenderResource) &&
     Boolean(api.seedMissingRenderResource) &&
     Boolean(api.screenshotPng);
+  let exportedPdfAbiVersion = null;
+  try {
+    exportedPdfAbiVersion = modulePdfAbiVersion();
+  } catch {
+    exportedPdfAbiVersion = null;
+  }
+  const hasValidPdfAbi =
+    capabilities?.pdfAbiVersion === REQUIRED_PDF_ABI_VERSION &&
+    capabilities?.pdf === true &&
+    exportedPdfAbiVersion === REQUIRED_PDF_ABI_VERSION;
   return {
     loaded: Boolean(bridgeCore),
     generation: bridgeGeneration,
@@ -1462,6 +1518,7 @@ async function bridgeStatus() {
       seedRenderImageResource: api.seedRenderImageResource?.name ?? null,
       seedMissingRenderImageResource: api.seedMissingRenderImageResource?.name ?? null,
       screenshotPng: api.screenshotPng?.name ?? null,
+      pdf: api.pdf?.name ?? null,
       dispose: api.dispose?.name ?? null,
     },
     page: {
@@ -1476,6 +1533,8 @@ async function bridgeStatus() {
         ? REQUIRED_RENDER_RESOURCE_REQUEST_ABI_VERSION
         : null,
       screenshotPng: Boolean(hasScreenshotPng),
+      pdfAvailable: hasValidPdfAbi && Boolean(api.pdf),
+      pdfAbiVersion: hasValidPdfAbi ? REQUIRED_PDF_ABI_VERSION : null,
     },
     bootstrap: {
       host: "node-vm",
@@ -1738,6 +1797,33 @@ async function screenshotPng({ width, height, scrollX, scrollY, expectedPage } =
   };
 }
 
+async function pdf({ options, expectedPage } = {}) {
+  requireExpectedPage(expectedPage);
+  requireBridgeCore();
+  const api = bridgeApi();
+  await requirePdfCompatibility(api);
+  options = requirePdfOptions(options);
+  const optionsJson = JSON.stringify(options);
+  requireBoundedString(optionsJson, MAX_PDF_OPTIONS_BYTES, "PDF options");
+
+  const generation = bridgeGeneration;
+  const before = synchronizeBridgeIdentity(generation, bridgeDocumentHandle);
+  const rawBytes = syncCall(api.pdf, optionsJson, before.documentHandle, before.revision);
+  const after = synchronizeBridgeIdentity(generation, before.documentHandle);
+  if (after.revision !== before.revision) {
+    throw stalePageError(
+      `Obscura page revision changed during PDF generation from ${before.revision} to ${after.revision}`,
+    );
+  }
+  const data = requireValidPdfBytes(rawBytes, "PDF output");
+  return {
+    generation,
+    documentHandle: after.documentHandle,
+    revision: after.revision,
+    data,
+  };
+}
+
 async function installBootstrapRealm(timeoutMs = 5_000) {
   requireBridgeCore();
   statefulBridgeApi();
@@ -1973,6 +2059,8 @@ async function dispatch(operation, payload) {
       return await seedMissingRenderImageResource(payload);
     case "screenshotPng":
       return await screenshotPng(payload);
+    case "pdf":
+      return await pdf(payload);
     case "bootstrapEvaluate":
       return await bootstrapEvaluate(payload);
     case "bridgeStatus":

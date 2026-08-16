@@ -9,7 +9,7 @@ use obscura_dom::{
 };
 use wasm_bindgen::prelude::*;
 #[cfg(feature = "render")]
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
 mod platform;
 
@@ -20,6 +20,8 @@ const DOM_BATCH_ABI_VERSION: u32 = 1;
 const RENDER_ABI_VERSION: u32 = 1;
 #[cfg(feature = "render")]
 const RENDER_RESOURCE_REQUEST_ABI_VERSION: u32 = 1;
+#[cfg(feature = "render")]
+const PDF_ABI_VERSION: u32 = 1;
 const MAX_HTML_INPUT_BYTES: usize = 8 * 1024 * 1024;
 const MAX_SELECTOR_BYTES: usize = 64 * 1024;
 const MAX_RETURNED_STRING_BYTES: usize = 4 * 1024 * 1024;
@@ -32,6 +34,8 @@ const MAX_DOCUMENT_METADATA_BYTES: usize = 64 * 1024;
 const MAX_RENDER_RESOURCE_BYTES: usize = 16 * 1024 * 1024;
 #[cfg(feature = "render")]
 const MAX_RENDER_RESOURCE_REQUESTS_PER_PAGE: usize = 32;
+#[cfg(feature = "render")]
+const MAX_PDF_OPTIONS_BYTES: usize = 64 * 1024;
 
 fn require_max_bytes(value: &str, maximum: usize, label: &str) -> Result<(), JsValue> {
     if value.len() > maximum {
@@ -154,6 +158,76 @@ struct RenderResourceRequestPage {
     requests: Vec<RenderResourceRequest>,
     next_offset: usize,
     done: bool,
+}
+
+#[cfg(feature = "render")]
+fn default_pdf_viewport_width() -> u32 {
+    800
+}
+
+#[cfg(feature = "render")]
+fn default_pdf_viewport_height() -> u32 {
+    600
+}
+
+#[cfg(feature = "render")]
+fn default_pdf_scale() -> f32 {
+    1.0
+}
+
+#[cfg(feature = "render")]
+fn default_pdf_paper_width() -> f32 {
+    8.5
+}
+
+#[cfg(feature = "render")]
+fn default_pdf_paper_height() -> f32 {
+    11.0
+}
+
+#[cfg(feature = "render")]
+fn default_pdf_margin() -> f32 {
+    0.3937
+}
+
+#[cfg(feature = "render")]
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct PdfPageRangeWire {
+    #[serde(default)]
+    start: Option<u32>,
+    #[serde(default)]
+    end: Option<u32>,
+}
+
+#[cfg(feature = "render")]
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct PdfOptionsWire {
+    #[serde(default = "default_pdf_viewport_width")]
+    viewport_width: u32,
+    #[serde(default = "default_pdf_viewport_height")]
+    viewport_height: u32,
+    #[serde(default)]
+    landscape: bool,
+    #[serde(default)]
+    print_background: bool,
+    #[serde(default = "default_pdf_scale")]
+    scale: f32,
+    #[serde(default)]
+    page_ranges: Vec<PdfPageRangeWire>,
+    #[serde(default = "default_pdf_paper_width")]
+    paper_width: f32,
+    #[serde(default = "default_pdf_paper_height")]
+    paper_height: f32,
+    #[serde(default = "default_pdf_margin")]
+    margin_top: f32,
+    #[serde(default = "default_pdf_margin")]
+    margin_bottom: f32,
+    #[serde(default = "default_pdf_margin")]
+    margin_left: f32,
+    #[serde(default = "default_pdf_margin")]
+    margin_right: f32,
 }
 
 /// Portable part of an Obscura page.
@@ -414,6 +488,111 @@ impl ObscuraCore {
             )
             .ok_or_else(|| "unable to encode document screenshot".to_string())
         })
+    }
+
+    /// Generate a bounded multi-page PDF entirely inside the portable module.
+    /// Node supplies only validated options and persists the returned bytes.
+    #[cfg(feature = "render")]
+    #[wasm_bindgen(js_name = pdf)]
+    pub fn pdf(
+        &mut self,
+        options_json: &str,
+        expected_document_handle: u32,
+        expected_revision: u32,
+    ) -> Result<Vec<u8>, JsValue> {
+        require_max_bytes(options_json, MAX_PDF_OPTIONS_BYTES, "PDF options")?;
+        if expected_document_handle == 0
+            || expected_document_handle != self.document_handle
+            || expected_revision != self.page_revision
+        {
+            return Err(js_sys::Error::new("stale portable PDF page identity").into());
+        }
+        boundary_result("pdf", || self.pdf_inner(options_json))
+    }
+
+    #[cfg(feature = "render")]
+    fn pdf_inner(&mut self, options_json: &str) -> Result<Vec<u8>, String> {
+        let wire: PdfOptionsWire = serde_json::from_str(options_json)
+            .map_err(|error| format!("invalid PDF options: {error}"))?;
+        if wire.viewport_width == 0
+            || wire.viewport_height == 0
+            || wire.viewport_width > obscura_render::MAX_CAPTURE_DIMENSION
+            || wire.viewport_height > obscura_render::MAX_CAPTURE_DIMENSION
+            || (wire.viewport_width as u64).saturating_mul(wire.viewport_height as u64)
+                > obscura_render::MAX_CAPTURE_PIXELS
+        {
+            return Err("PDF viewport exceeds render limits".to_string());
+        }
+        if wire.page_ranges.len() > obscura_render::MAX_PDF_PAGES {
+            return Err(format!(
+                "PDF page ranges exceed the {}-entry safety limit",
+                obscura_render::MAX_PDF_PAGES
+            ));
+        }
+
+        let options = obscura_render::RasterPdfOptions {
+            landscape: wire.landscape,
+            print_background: wire.print_background,
+            scale: wire.scale,
+            page_ranges: wire
+                .page_ranges
+                .into_iter()
+                .map(|range| obscura_render::RasterPdfPageRange {
+                    start: range.start.map(|value| value as usize),
+                    end: range.end.map(|value| value as usize),
+                })
+                .collect(),
+            paper_width_in: wire.paper_width,
+            paper_height_in: wire.paper_height,
+            margin_top_in: wire.margin_top,
+            margin_bottom_in: wire.margin_bottom,
+            margin_left_in: wire.margin_left,
+            margin_right_in: wire.margin_right,
+        };
+
+        let viewport = (wire.viewport_width as f32, wire.viewport_height as f32);
+        let base_url = obscura_render::resolve_document_base_url(&self.dom, &self.document_url);
+        let mut stylesheet_cache = obscura_render::StylesheetCache::default();
+        let mut animation_timeline = obscura_render::AnimationTimelineState::default();
+        let mut prepared =
+            obscura_render::prepare_dom_with_dynamic_fonts_and_stylesheet_cache_for_media_with_animation_state(
+                &self.dom,
+                viewport,
+                base_url.as_ref().map(url::Url::as_str),
+                &mut self.render_resources,
+                &[],
+                &mut stylesheet_cache,
+                obscura_render::CssMediaType::Print,
+                obscura_render::AnimationSample::default(),
+                &mut animation_timeline,
+            )
+            .ok_or_else(|| "unable to prepare document PDF render".to_string())?;
+        let (content_width, content_height) = prepared.content_size();
+        let element_scroll = HashMap::new();
+
+        obscura_render::raster_pdf_from_png_capture(
+            &options,
+            content_width,
+            content_height,
+            |region, print_background| {
+                let scroll = prepared.resolve_scroll_state_for_viewport(
+                    &self.dom,
+                    (region.x, region.y),
+                    &element_scroll,
+                    (region.width, region.height),
+                );
+                obscura_render::screenshot_prepared_region_with_scroll_and_backgrounds(
+                    &self.dom,
+                    &mut prepared,
+                    &mut self.render_resources,
+                    &scroll,
+                    region,
+                    print_background,
+                )
+                .map_err(|error| obscura_render::RasterPdfError::CaptureFailed(format!("{error:?}")))
+            },
+        )
+        .map_err(|error| error.to_string())
     }
 
     #[cfg(feature = "render")]
@@ -1638,19 +1817,26 @@ pub fn abi_version() -> u32 {
     ABI_VERSION
 }
 
+#[cfg(feature = "render")]
+#[wasm_bindgen(js_name = pdfAbiVersion)]
+pub fn pdf_abi_version() -> u32 {
+    PDF_ABI_VERSION
+}
+
 /// Machine-readable capability probe used by the Node Worker harness.
 #[wasm_bindgen]
 pub fn probe() -> String {
     boundary_value("probe", || {
         #[cfg(feature = "render")]
         return format!(
-            r#"{{"abiVersion":{},"dom":true,"selectors":true,"javascript":"host","embeddedV8":false,"domOpAbiVersion":{},"domBatchAbiVersion":{},"documentMetadataAbiVersion":1,"platformOpAbiVersion":{},"renderAbiVersion":{},"renderResourceRequestAbiVersion":{},"renderResourceRequests":true,"screenshotPng":true,"stableNodeHandles":true}}"#,
+            r#"{{"abiVersion":{},"dom":true,"selectors":true,"javascript":"host","embeddedV8":false,"domOpAbiVersion":{},"domBatchAbiVersion":{},"documentMetadataAbiVersion":1,"platformOpAbiVersion":{},"renderAbiVersion":{},"renderResourceRequestAbiVersion":{},"renderResourceRequests":true,"screenshotPng":true,"pdfAbiVersion":{},"pdf":true,"stableNodeHandles":true}}"#,
             ABI_VERSION,
             DOM_OP_ABI_VERSION,
             DOM_BATCH_ABI_VERSION,
             platform::PLATFORM_OP_ABI_VERSION,
             RENDER_ABI_VERSION,
             RENDER_RESOURCE_REQUEST_ABI_VERSION,
+            PDF_ABI_VERSION,
         );
         #[cfg(not(feature = "render"))]
         format!(
@@ -1722,6 +1908,47 @@ mod tests {
         let replacement = core.screenshot_png(16, 16, 0.0, 0.0).unwrap();
         assert!(replacement.starts_with(b"\x89PNG\r\n\x1a\n"));
         assert_ne!(png, replacement);
+    }
+
+    #[cfg(feature = "render")]
+    #[test]
+    fn generates_a_bounded_print_media_pdf_from_the_live_wasm_dom() {
+        let mut core = ObscuraCore::new(
+            r#"<!doctype html><style>
+                html,body{margin:0;width:100px}
+                body{height:200px;background:#001122}
+                @media print{body{background:#cc2200}}
+            </style><body></body>"#,
+        )
+        .unwrap();
+        let options = serde_json::json!({
+            "viewportWidth": 100,
+            "viewportHeight": 80,
+            "printBackground": true,
+            "paperWidth": 100.0 / 72.0,
+            "paperHeight": 80.0 / 72.0,
+            "marginTop": 0.0,
+            "marginBottom": 0.0,
+            "marginLeft": 0.0,
+            "marginRight": 0.0
+        })
+        .to_string();
+        let pdf = core.pdf_inner(&options).expect("portable PDF");
+        assert!(pdf.starts_with(b"%PDF-1.4"));
+        assert!(pdf.ends_with(b"%%EOF\n"));
+        let text = String::from_utf8_lossy(&pdf);
+        assert!(text.contains("/Count 3"));
+        assert!(text.contains("/MediaBox [0 0 100.000 80.000]"));
+        assert_eq!(text.matches("/Subtype /Image").count(), 3);
+
+        assert!(core
+            .pdf_inner(r#"{"viewportWidth":100,"unknown":true}"#)
+            .unwrap_err()
+            .contains("unknown field"));
+        assert!(core
+            .pdf_inner(r#"{"viewportWidth":0}"#)
+            .unwrap_err()
+            .contains("viewport"));
     }
 
     #[cfg(feature = "render")]
@@ -2264,6 +2491,9 @@ mod tests {
             );
             assert_eq!(probe["renderResourceRequests"], true);
             assert_eq!(probe["screenshotPng"], true);
+            assert_eq!(pdf_abi_version(), PDF_ABI_VERSION);
+            assert_eq!(probe["pdfAbiVersion"], PDF_ABI_VERSION);
+            assert_eq!(probe["pdf"], true);
         }
     }
 

@@ -133,6 +133,14 @@ pub use paint::{
     MAX_CAPTURE_DIMENSION, MAX_CAPTURE_PIXELS,
 };
 
+#[cfg(feature = "paint")]
+pub mod pdf;
+#[cfg(feature = "paint")]
+pub use pdf::{
+    raster_pdf_from_png_capture, RasterPdfError, RasterPdfOptions, RasterPdfPageRange,
+    MAX_PDF_OUTPUT_BYTES, MAX_PDF_PAGES,
+};
+
 // Real inline text layout (cosmic-text) lives behind the paint feature; the
 // layout-only build keeps the lighter word-split geometry. The stub lets
 // `dom.rs` name `inline::TextEngine` and call `try_build` unconditionally.

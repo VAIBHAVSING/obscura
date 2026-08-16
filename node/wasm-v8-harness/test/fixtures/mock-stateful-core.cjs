@@ -183,6 +183,18 @@ class ObscuraCore {
     return png;
   }
 
+  pdf(optionsJson, expectedDocumentHandle, expectedRevision) {
+    this.#assertOpen();
+    if (expectedDocumentHandle !== this.document.handle || expectedRevision !== this.revision) {
+      throw new Error("stale portable PDF page identity");
+    }
+    const options = JSON.parse(optionsJson);
+    if (options === null || typeof options !== "object" || Array.isArray(options)) {
+      throw new TypeError("invalid PDF options");
+    }
+    return Buffer.from("%PDF-1.4\n% mock portable PDF\n%%EOF\n");
+  }
+
   free() {
     if (this.freed) throw new Error("core freed twice");
     this.freed = true;
@@ -410,9 +422,14 @@ module.exports = {
       renderResourceRequestAbiVersion: 1,
       renderResourceRequests: true,
       screenshotPng: true,
+      pdfAbiVersion: 1,
+      pdf: true,
       stableNodeHandles: true,
       javascript: "host",
     });
+  },
+  pdfAbiVersion() {
+    return 1;
   },
   ObscuraCore,
 };

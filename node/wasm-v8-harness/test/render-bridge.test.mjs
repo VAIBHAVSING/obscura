@@ -119,6 +119,8 @@ test(
         resourcesAvailable: true,
         resourceRequestAbiVersion: 1,
         screenshotPng: true,
+        pdfAvailable: true,
+        pdfAbiVersion: 1,
       });
 
       await worker.seedMissingRenderResource("https://example.test/missing.png", {

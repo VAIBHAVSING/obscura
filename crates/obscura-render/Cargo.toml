@@ -20,6 +20,7 @@ native-resource-loader = ["paint", "dep:ureq"]
 [dependencies]
 taffy = { workspace = true }
 obscura-dom = { workspace = true }
+thiserror = { workspace = true }
 tiny-skia = { workspace = true, optional = true }
 ab_glyph = { workspace = true, optional = true }
 # Real inline text layout: HarfBuzz-class shaping (rustybuzz) + UAX#14 line
