@@ -305,7 +305,13 @@ export class WasmV8Worker {
       this.#readyResolve = resolve;
       this.#readyReject = reject;
     });
-    this.#worker = new Worker(workerUrl, { workerData });
+    // VM modules are an optional Node flag and the test runner injects
+    // several process-only flags that Worker rejects. Pass only the one
+    // portable flag needed by the page module loader.
+    this.#worker = new Worker(workerUrl, {
+      workerData,
+      execArgv: ["--experimental-vm-modules"],
+    });
     this.#worker.on("message", (message) => this.#onMessage(message));
     this.#worker.on("error", (error) => this.#fail(error, true));
     this.#worker.on("exit", (code) => {

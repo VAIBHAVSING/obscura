@@ -30,6 +30,21 @@ test("portable navigation owns redirects, document identity, history, and HTML c
       response.end('{"answer":42}');
       return;
     }
+    if (request.url === "/module-page") {
+      response.writeHead(200, { "content-type": "text/html; charset=UTF-8" });
+      response.end(`<!doctype html><html><head><script type="importmap">{"imports":{"dep":"/dep.js"}}</script><script type="module">import { value } from "dep"; document.body.setAttribute("data-module", value);</script></head><body><h1>modules</h1></body></html>`);
+      return;
+    }
+    if (request.url === "/dep.js") {
+      response.writeHead(200, { "content-type": "text/javascript" });
+      response.end("export const value = 'dep-ok';");
+      return;
+    }
+    if (request.url === "/dynamic.js") {
+      response.writeHead(200, { "content-type": "text/javascript" });
+      response.end("export default 'dynamic-ok';");
+      return;
+    }
     response.writeHead(404, { "content-type": "text/html" });
     response.end("<h1>missing</h1>");
   });
@@ -62,6 +77,15 @@ test("portable navigation owns redirects, document identity, history, and HTML c
     await worker.bootstrapEvaluate("globalThis.__fetchError = null; fetch('http://127.0.0.1:1/unreachable').catch((error) => { globalThis.__fetchError = error.name; }); undefined");
     await new Promise((resolve) => setTimeout(resolve, 100));
     assert.equal(await worker.bootstrapEvaluate("globalThis.__fetchError"), "TypeError");
+    await worker.bootstrapEvaluate("globalThis.__xhrValue = null; const request = new XMLHttpRequest(); request.open('GET', '/api'); request.onload = () => { globalThis.__xhrValue = request.responseText; }; request.onerror = () => { globalThis.__xhrValue = 'error'; }; request.send(); undefined");
+    await new Promise((resolve) => setTimeout(resolve, 100));
+    assert.equal(await worker.bootstrapEvaluate("globalThis.__xhrValue"), '{"answer":42}');
+
+    const modules = await worker.navigate(`http://127.0.0.1:${port}/module-page`, {
+      allowPrivateNetwork: true,
+    });
+    assert.equal(modules.scripts.modules.executed.length, 1);
+    assert.equal(await worker.bootstrapEvaluate("document.body.getAttribute('data-module')"), "dep-ok");
 
     await assert.rejects(
       worker.navigate("http://127.0.0.1:1/blocked"),

@@ -414,6 +414,10 @@ let bootstrapRuntime;
 let nextBootstrapFetchId = 1;
 const bootstrapFetches = new Map();
 let activeAllowPrivateNetwork = false;
+const MAX_MODULES_PER_DOCUMENT = 256;
+const MAX_IMPORT_MAP_ENTRIES = 1_024;
+let moduleRecords = new Map();
+let moduleImportMap = { imports: Object.create(null), scopes: Object.create(null) };
 let enqueueSerializedWork;
 let shuttingDown = false;
 
@@ -1419,6 +1423,8 @@ async function disposeBridgeCore() {
   bridgeCore = null;
   cancelBootstrapFetches();
   bootstrapRuntime = null;
+  moduleRecords = new Map();
+  moduleImportMap = { imports: Object.create(null), scopes: Object.create(null) };
   activeAllowPrivateNetwork = false;
   bridgeDocumentHandle = null;
   bridgePageRevision = null;
@@ -1527,6 +1533,8 @@ async function replaceBridgeCore(html, documentMetadata) {
 function resetBridgeRealmAfterNavigation() {
   cancelBootstrapFetches();
   bootstrapRuntime = null;
+  moduleRecords = new Map();
+  moduleImportMap = { imports: Object.create(null), scopes: Object.create(null) };
   if (bridgeTaskHost) {
     bridgeTaskHost.close();
     bridgeTaskLastStatus = bridgeTaskHost.status();
@@ -1781,6 +1789,224 @@ async function fetchClassicScript(url, requestTimeoutMs, allowPrivateNetwork) {
   }
 }
 
+function importMapTable(value, baseUrl, label) {
+  if (value === null || typeof value !== "object" || Array.isArray(value)) {
+    throw new TypeError(`${label} must be an object`);
+  }
+  const entries = Object.create(null);
+  const names = Object.keys(value);
+  if (names.length > MAX_IMPORT_MAP_ENTRIES) {
+    throw new RangeError(`${label} exceeds the ${MAX_IMPORT_MAP_ENTRIES}-entry limit`);
+  }
+  for (const specifier of names) {
+    if (typeof specifier !== "string" || specifier.length === 0) {
+      throw new TypeError(`${label} contains an invalid specifier`);
+    }
+    const target = value[specifier];
+    if (target === null) {
+      entries[specifier] = null;
+      continue;
+    }
+    if (typeof target !== "string" || target.length === 0) {
+      throw new TypeError(`${label} target for ${specifier} must be a string or null`);
+    }
+    const resolved = new URL(target, baseUrl).href;
+    validateNavigationUrl(resolved, activeAllowPrivateNetwork);
+    entries[specifier] = resolved;
+  }
+  return entries;
+}
+
+function installImportMap(source, baseUrl) {
+  requireBoundedString(source, MAX_SCRIPT_SOURCE_BYTES, "import map source");
+  let parsed;
+  try {
+    parsed = JSON.parse(source);
+  } catch (error) {
+    throw new SyntaxError(`invalid import map JSON: ${error.message}`);
+  }
+  if (parsed === null || typeof parsed !== "object" || Array.isArray(parsed)) {
+    throw new TypeError("import map must be an object");
+  }
+  if (Object.keys(moduleImportMap.imports).length > 0 || Object.keys(moduleImportMap.scopes).length > 0) {
+    throw new Error("only one import map is supported per document");
+  }
+  const imports = importMapTable(parsed.imports ?? {}, baseUrl, "import map imports");
+  const scopesValue = parsed.scopes ?? {};
+  if (scopesValue === null || typeof scopesValue !== "object" || Array.isArray(scopesValue)) {
+    throw new TypeError("import map scopes must be an object");
+  }
+  const scopes = Object.create(null);
+  const scopeNames = Object.keys(scopesValue);
+  if (scopeNames.length > MAX_IMPORT_MAP_ENTRIES) {
+    throw new RangeError(`import map scopes exceed the ${MAX_IMPORT_MAP_ENTRIES}-entry limit`);
+  }
+  for (const scope of scopeNames) {
+    const scopeUrl = new URL(scope, baseUrl).href;
+    validateNavigationUrl(scopeUrl, activeAllowPrivateNetwork);
+    scopes[scopeUrl] = importMapTable(scopesValue[scope], scopeUrl, `import map scope ${scope}`);
+  }
+  moduleImportMap = { imports, scopes };
+}
+
+function importMapLookup(table, specifier) {
+  if (!table) return undefined;
+  if (Object.hasOwn(table, specifier)) return table[specifier];
+  let best;
+  for (const key of Object.keys(table)) {
+    if (!key.endsWith("/") || !specifier.startsWith(key)) continue;
+    if (!best || key.length > best.length) best = key;
+  }
+  if (!best) return undefined;
+  const target = table[best];
+  if (target === null) return null;
+  return `${target}${specifier.slice(best.length)}`;
+}
+
+function resolveModuleSpecifier(specifier, referrer) {
+  if (typeof specifier !== "string" || specifier.length === 0) {
+    throw new TypeError("module specifier must be a non-empty string");
+  }
+  let resolved = importMapLookup(moduleImportMap.imports, specifier);
+  if (resolved === undefined) {
+    const scopes = Object.keys(moduleImportMap.scopes)
+      .filter((scope) => referrer.startsWith(scope))
+      .sort((a, b) => b.length - a.length);
+    for (const scope of scopes) {
+      resolved = importMapLookup(moduleImportMap.scopes[scope], specifier);
+      if (resolved !== undefined) break;
+    }
+  }
+  if (resolved === null) throw new TypeError(`module specifier ${specifier} is blocked by the import map`);
+  if (resolved === undefined) {
+    try {
+      resolved = new URL(specifier, referrer).href;
+    } catch {
+      throw new TypeError(`bare module specifier ${specifier} is not mapped`);
+    }
+  }
+  validateNavigationUrl(resolved, activeAllowPrivateNetwork);
+  return resolved;
+}
+
+function rejectDynamicImportSyntax(source) {
+  if (/\bimport\s*\(/.test(source)) {
+    throw new TypeError("dynamic import() is not yet supported in the bounded VM module loader");
+  }
+}
+
+async function loadModuleRecord(url, requestTimeoutMs, allowPrivateNetwork) {
+  const existing = moduleRecords.get(url);
+  if (existing) return existing;
+  if (typeof vm.SourceTextModule !== "function") {
+    throw new Error("Node VM modules are unavailable; launch the Worker with --experimental-vm-modules");
+  }
+  if (moduleRecords.size >= MAX_MODULES_PER_DOCUMENT) {
+    throw new RangeError(`module graph exceeds the ${MAX_MODULES_PER_DOCUMENT}-module limit`);
+  }
+  validateNavigationUrl(url, allowPrivateNetwork);
+  const sourceBytes = await fetchClassicScript(url, requestTimeoutMs, allowPrivateNetwork);
+  const source = new TextDecoder("utf-8", { fatal: false }).decode(sourceBytes);
+  requireBoundedString(source, MAX_SCRIPT_SOURCE_BYTES, "module source");
+  rejectDynamicImportSyntax(source);
+  const record = { url, module: null, linkPromise: null, evaluatePromise: null };
+  moduleRecords.set(url, record);
+  try {
+    record.module = new vm.SourceTextModule(source, {
+      context: getHostContext(),
+      identifier: url,
+      initializeImportMeta(meta) {
+        meta.url = url;
+      },
+      importModuleDynamically: () => {
+        throw new TypeError("dynamic import() is not yet supported in the bounded VM module loader");
+      },
+    });
+    record.linkPromise = record.module.link(async (specifier, referencingModule) => {
+      const targetUrl = resolveModuleSpecifier(specifier, referencingModule.identifier);
+      const dependency = await loadModuleRecord(targetUrl, requestTimeoutMs, allowPrivateNetwork);
+      return dependency.module;
+    });
+    await record.linkPromise;
+    return record;
+  } catch (error) {
+    moduleRecords.delete(url);
+    throw error;
+  }
+}
+
+async function loadAndEvaluateModule(url, requestTimeoutMs, allowPrivateNetwork) {
+  const record = await loadModuleRecord(url, requestTimeoutMs, allowPrivateNetwork);
+  if (record.module.status === "unlinked") await record.linkPromise;
+  if (record.module.status === "linked" || record.module.status === "evaluating-async") {
+    if (!record.evaluatePromise) {
+      record.evaluatePromise = record.module.evaluate({ timeout: vmTimeout(1_000) });
+    }
+    await record.evaluatePromise;
+    // VM contexts created with microtaskMode=afterEvaluate do not run the
+    // page module's dynamic-import continuation when a host Promise resolves.
+    // Enter the realm once after each module evaluation so TLA/import()
+    // continuations are delivered without disabling the synchronous VM
+    // deadline used by ordinary page evaluation.
+    try { vm.runInContext("0", getHostContext(), { timeout: 1 }); } catch {}
+  }
+  if (record.module.status === "errored") throw record.module.error;
+  return record.module;
+}
+
+async function executeDocumentModules(records, base, requestTimeoutMs, allowPrivateNetwork) {
+  const executed = [];
+  const failed = [];
+  const skipped = [];
+  for (const script of records) {
+    if (!script.importMap) continue;
+    try {
+      if (script.src) throw new Error("external import maps are not supported");
+      installImportMap(script.code, base);
+    } catch (error) {
+      failed.push({ nid: script.nid, url: base, error: serializeError(error) });
+    }
+  }
+  for (const script of records) {
+    if (!script.module || script.noModule) continue;
+    let sourceUrl = base;
+    try {
+      sourceUrl = script.src ? new URL(script.src, base).href : `${base}#module-${script.nid}`;
+      if (!script.src) {
+        const source = script.code;
+        requireBoundedString(source, MAX_SCRIPT_SOURCE_BYTES, "module source");
+        rejectDynamicImportSyntax(source);
+        if (typeof vm.SourceTextModule !== "function") {
+          throw new Error("Node VM modules are unavailable; launch the Worker with --experimental-vm-modules");
+        }
+        const record = { url: sourceUrl, module: null, linkPromise: null, evaluatePromise: null };
+        moduleRecords.set(sourceUrl, record);
+        record.module = new vm.SourceTextModule(source, {
+          context: getHostContext(),
+          identifier: sourceUrl,
+          initializeImportMeta(meta) { meta.url = sourceUrl; },
+          importModuleDynamically: () => {
+            throw new TypeError("dynamic import() is not yet supported in the bounded VM module loader");
+          },
+        });
+        record.linkPromise = record.module.link(async (specifier, referencingModule) => {
+          const targetUrl = resolveModuleSpecifier(specifier, referencingModule.identifier);
+          return (await loadModuleRecord(targetUrl, requestTimeoutMs, allowPrivateNetwork)).module;
+        });
+        await record.linkPromise;
+        await loadAndEvaluateModule(sourceUrl, requestTimeoutMs, allowPrivateNetwork);
+      } else {
+        await loadAndEvaluateModule(sourceUrl, requestTimeoutMs, allowPrivateNetwork);
+      }
+      executed.push({ nid: script.nid, url: sourceUrl });
+    } catch (error) {
+      moduleRecords.delete(sourceUrl);
+      failed.push({ nid: script.nid, url: sourceUrl, error: serializeError(error) });
+    }
+  }
+  return { executed, failed, skipped };
+}
+
 function scriptElementRecords() {
   const handles = JSON.parse(domOperation("query_selector_all", "script", ""));
   if (!Array.isArray(handles)) throw new TypeError("query_selector_all(script) returned a non-array");
@@ -1843,18 +2069,19 @@ async function executeDocumentScripts({ requestTimeoutMs, allowPrivateNetwork })
       failed.push({ nid: script.nid, url: sourceUrl, error: serializeError(error) });
     }
   }
-  // Parser-blocking/defer scripts complete before DOMContentLoaded. Async and
-  // module queues are deliberately reported as skipped until S2 adds their
-  // common module graph and task ordering semantics.
+  // Parser-blocking and module scripts complete before DOMContentLoaded in
+  // this bounded navigation path. Async/defer scheduling remains represented
+  // by the ordered document result rather than exposing host Promises.
   try {
     await hostEvaluate(
       "globalThis.__documentReadyState__ = 'interactive'; try { document.dispatchEvent(new Event('DOMContentLoaded')); window.dispatchEvent(new Event('DOMContentLoaded')); } catch {} globalThis.__documentReadyState__ = 'complete'; try { window.dispatchEvent(new Event('load')); } catch {}",
       1_000,
     );
   } catch (error) {
-    failed.push({ nid: 0, url: base, error: serializeError(error) });
+      failed.push({ nid: 0, url: base, error: serializeError(error) });
   }
-  return { executed, failed, skipped };
+  const modules = await executeDocumentModules(records, base, requestTimeoutMs, allowPrivateNetwork);
+  return { executed, failed, skipped, modules };
 }
 
 async function navigatePortable({ url, options = {}, allowPrivateNetwork = false, requestTimeoutMs = 30_000 } = {}) {
