@@ -855,6 +855,41 @@ impl PortableCdp {
                 "expression": request.params.get("expression").and_then(Value::as_str).unwrap_or(""),
                 "returnByValue": request.params.get("returnByValue").and_then(Value::as_bool).unwrap_or(false),
             })),
+            "Runtime.callFunctionOn" => self.queue_action(
+                connection_id,
+                request.clone(),
+                target_id,
+                "callFunctionOn",
+                Value::Object(request.params.clone()),
+            ),
+            "Runtime.releaseObject" => self.queue_action(
+                connection_id,
+                request.clone(),
+                target_id,
+                "releaseObject",
+                Value::Object(request.params.clone()),
+            ),
+            "Runtime.releaseObjectGroup" => self.queue_action(
+                connection_id,
+                request.clone(),
+                target_id,
+                "releaseObjectGroup",
+                Value::Object(request.params.clone()),
+            ),
+            "Runtime.getProperties" => self.queue_action(
+                connection_id,
+                request.clone(),
+                target_id,
+                "getProperties",
+                Value::Object(request.params.clone()),
+            ),
+            "Runtime.getIsolateId" => self.queue_action(
+                connection_id,
+                request.clone(),
+                target_id,
+                "getIsolateId",
+                Value::Object(request.params.clone()),
+            ),
             "Page.captureScreenshot" => self.queue_action(connection_id, request.clone(), target_id, "screenshot", json!({
                 "format": request.params.get("format").and_then(Value::as_str).unwrap_or("png"),
             })),
@@ -1494,6 +1529,30 @@ mod tests {
             &format!(r#"{{"id":3,"sessionId":"{session}","method":"Page.reload"}}"#),
         ).unwrap());
         assert_eq!(reload["result"]["obscuraAction"]["kind"], "reload");
+    }
+
+    #[test]
+    fn portable_runtime_remote_object_commands_are_host_actions() {
+        let mut cdp = PortableCdp::new("").unwrap();
+        let connection = cdp.open_connection().unwrap();
+        let attached = json(&cdp.cdp_request(
+            connection,
+            r#"{"id":1,"method":"Target.attachToTarget","params":{"targetId":"page-1"}}"#,
+        ).unwrap());
+        let session = attached["result"]["sessionId"].as_str().unwrap();
+        for (id, method, kind) in [
+            (2, "Runtime.callFunctionOn", "callFunctionOn"),
+            (3, "Runtime.getProperties", "getProperties"),
+            (4, "Runtime.releaseObject", "releaseObject"),
+            (5, "Runtime.releaseObjectGroup", "releaseObjectGroup"),
+            (6, "Runtime.getIsolateId", "getIsolateId"),
+        ] {
+            let request = format!(
+                r#"{{"id":{id},"sessionId":"{session}","method":"{method}","params":{{}}}}"#
+            );
+            let queued = json(&cdp.cdp_request(connection, &request).unwrap());
+            assert_eq!(queued["result"]["obscuraAction"]["kind"], kind);
+        }
     }
 
     #[test]
