@@ -10,7 +10,8 @@ operations cross the bounded WASM bridge.
 
 ## Source checkpoint
 
-- Commit: `8538aa0` (`feat: add portable WASM npm browser package`)
+- Package checkpoint commit: `8538aa0` (`feat: add portable WASM npm browser package`)
+- Cookie/storage CDP checkpoint: `a2df759` (`feat: expose portable cookies through package CDP`)
 - Branch: `wasm-node-migration`
 - Package source: `node/obscura/`
 - Pushed to `origin/wasm-node-migration`.
@@ -27,6 +28,10 @@ Node Worker lifecycle, ESM API, TypeScript declarations, and the
 - Real Playwright `connectOverCDP` against the current WASM wrapper: passed
   context/page creation, `goto(..., waitUntil: "load")`, title and locator
   text, `page.evaluate`, PNG screenshot signature, and PDF signature.
+- Direct real-WASM CDP cookie round trip: `Network.setCookies`,
+  `Network.getAllCookies`, and `Network.deleteCookies` passed with the cookie
+  absent after deletion. Playwright cookie coverage is present and requires a
+  supplied `playwright-core` module at test time.
 - Fresh tarball install with `npm install --ignore-scripts`: passed.
 - Fresh tarball `npx --no-install obscura-browser`: version, eval, screenshot,
   and PDF passed.
@@ -39,8 +44,9 @@ This is a usable portable package milestone, not proof of full Chromium or
 full Playwright parity. The CDP state/session implementation is currently in
 the Node adapter, the WASM ABI still needs to own the complete CDP domain
 state, and broader browser behavior remains: full network interception/cache
-policy, dynamic import, complete XHR/events, input/actions, storage/cookies
-through CDP, iframe/worker targets, and complete option/domain matrices.
+ policy, dynamic import, complete XHR/events, input/actions, storage/cookies
+ beyond the current basic CDP round trip, iframe/worker targets, and complete
+ option/domain matrices.
 
 The companion `obscura-benchmark` obstacle course is unavailable in this
 workspace and must not be reported as 33/33. Final repository render gates,
