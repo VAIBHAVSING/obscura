@@ -14,6 +14,7 @@ use serde::{Deserialize, Serialize};
 mod platform;
 mod navigation;
 mod cookies;
+mod cdp;
 
 const ABI_VERSION: u32 = 1;
 const DOM_OP_ABI_VERSION: u32 = 1;
@@ -2038,6 +2039,14 @@ pub fn cookie_abi_version() -> u32 {
     cookies::COOKIE_ABI_VERSION
 }
 
+/// Versioned transport-independent CDP protocol/state ABI. WebSocket and
+/// HTTP transports remain host-owned; this capability is the portable Rust
+/// source of truth for target/session/event ordering.
+#[wasm_bindgen(js_name = cdpAbiVersion)]
+pub fn cdp_abi_version() -> u32 {
+    cdp::CDP_ABI_VERSION
+}
+
 #[cfg(feature = "render")]
 #[wasm_bindgen(js_name = pdfAbiVersion)]
 pub fn pdf_abi_version() -> u32 {
@@ -2050,26 +2059,28 @@ pub fn probe() -> String {
     boundary_value("probe", || {
         #[cfg(feature = "render")]
         return format!(
-            r#"{{"abiVersion":{},"dom":true,"selectors":true,"javascript":"host","embeddedV8":false,"domOpAbiVersion":{},"domBatchAbiVersion":{},"documentMetadataAbiVersion":1,"navigationAbiVersion":{},"cookieAbiVersion":{},"platformOpAbiVersion":{},"renderAbiVersion":{},"renderResourceRequestAbiVersion":{},"renderResourceRequests":true,"screenshotPng":true,"pdfAbiVersion":{},"pdf":true,"stableNodeHandles":true}}"#,
+            r#"{{"abiVersion":{},"dom":true,"selectors":true,"javascript":"host","embeddedV8":false,"domOpAbiVersion":{},"domBatchAbiVersion":{},"documentMetadataAbiVersion":1,"navigationAbiVersion":{},"cookieAbiVersion":{},"platformOpAbiVersion":{},"cdpAbiVersion":{},"renderAbiVersion":{},"renderResourceRequestAbiVersion":{},"renderResourceRequests":true,"screenshotPng":true,"pdfAbiVersion":{},"pdf":true,"stableNodeHandles":true}}"#,
             ABI_VERSION,
             DOM_OP_ABI_VERSION,
             DOM_BATCH_ABI_VERSION,
             navigation::NAVIGATION_ABI_VERSION,
             cookies::COOKIE_ABI_VERSION,
             platform::PLATFORM_OP_ABI_VERSION,
+            cdp::CDP_ABI_VERSION,
             RENDER_ABI_VERSION,
             RENDER_RESOURCE_REQUEST_ABI_VERSION,
             PDF_ABI_VERSION,
         );
         #[cfg(not(feature = "render"))]
         format!(
-            r#"{{"abiVersion":{},"dom":true,"selectors":true,"javascript":"host","embeddedV8":false,"domOpAbiVersion":{},"domBatchAbiVersion":{},"documentMetadataAbiVersion":1,"navigationAbiVersion":{},"cookieAbiVersion":{},"platformOpAbiVersion":{},"stableNodeHandles":true}}"#,
+            r#"{{"abiVersion":{},"dom":true,"selectors":true,"javascript":"host","embeddedV8":false,"domOpAbiVersion":{},"domBatchAbiVersion":{},"documentMetadataAbiVersion":1,"navigationAbiVersion":{},"cookieAbiVersion":{},"platformOpAbiVersion":{},"cdpAbiVersion":{},"stableNodeHandles":true}}"#,
             ABI_VERSION,
             DOM_OP_ABI_VERSION,
             DOM_BATCH_ABI_VERSION,
             navigation::NAVIGATION_ABI_VERSION,
             cookies::COOKIE_ABI_VERSION,
             platform::PLATFORM_OP_ABI_VERSION,
+            cdp::CDP_ABI_VERSION,
         )
     })
 }
@@ -2114,6 +2125,7 @@ mod tests {
         assert!(probe().contains(r#""navigationAbiVersion":1"#));
         assert!(probe().contains(r#""cookieAbiVersion":1"#));
         assert!(probe().contains(r#""platformOpAbiVersion":1"#));
+        assert!(probe().contains(r#""cdpAbiVersion":1"#));
         assert!(probe().contains(r#""stableNodeHandles":true"#));
     }
 
@@ -2704,6 +2716,7 @@ mod tests {
         assert_eq!(probe["domOpAbiVersion"], 1);
         assert_eq!(probe["domBatchAbiVersion"], 1);
         assert_eq!(probe["documentMetadataAbiVersion"], 1);
+        assert_eq!(probe["cdpAbiVersion"], 1);
         assert_eq!(probe["stableNodeHandles"], true);
         assert_eq!(probe["dom"], true);
         assert_eq!(probe["selectors"], true);
