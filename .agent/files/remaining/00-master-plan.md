@@ -63,6 +63,9 @@ envelopes, following the existing harness security design.
 
 ## Current authoritative baseline
 
+The latest pushed package checkpoint is `8538aa0` on
+`wasm-node-migration`.
+
 Pushed baseline: `c860841` on `wasm-node-migration`.
 
 Already implemented and pushed:
@@ -210,7 +213,15 @@ Current packet states:
 - S2 `REVIEW`: static modules/import maps and basic fetch/XHR are shipped
   (`0f3b0a8`), while dynamic import, complete XHR parity and event parity
   remain.
-- C1, C2, C3, K1 and K2 `TODO`: portable CDP state, JavaScript WebSocket
-  transport, Playwright compatibility, npm packaging and npx CLI are not
-  implemented yet.
+- C1 and C2 `REVIEW`: the current package owns a JavaScript CDP/WebSocket
+  subset, but complete CDP state still needs to move into the WASM ABI.
+- C3 `REVIEW`: the packaged artifact passes the tested Playwright workflow
+  (context/page creation, load navigation, title/text locators, evaluate,
+  screenshot and PDF); broader input, storage, network and browser-domain
+  parity remains.
+- K1 `SHIPPED` (`8538aa0`): the relocatable `@obscura/browser` package and
+  WASM-only tarball gate are committed and pushed.
+- K2 `REVIEW`: the package-owned npx CLI passes version/eval/screenshot/PDF
+  from a clean tarball install; signal, collision, invalid-output and full
+  option matrices remain.
 - H `ACTIVE` continuously; V `TODO` until C1 through K2 are complete.
