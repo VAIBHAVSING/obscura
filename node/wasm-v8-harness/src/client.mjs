@@ -632,6 +632,41 @@ export class WasmV8Worker {
     return this.request("bridgeStatus");
   }
 
+  portableCdpAbiVersion(options = {}) {
+    return this.request("portableCdp", { operation: "abi" }, options.requestTimeoutMs);
+  }
+
+  portableCdpOpen(options = {}) {
+    return this.request("portableCdp", { operation: "open", html: options.html }, options.requestTimeoutMs);
+  }
+
+  portableCdpRequest(connectionId, message, options = {}) {
+    if (!Number.isSafeInteger(connectionId) || connectionId < 0 || connectionId > 0xffff_ffff) {
+      return Promise.reject(new TypeError("CDP connection ID must be an unsigned 32-bit integer"));
+    }
+    if (typeof message !== "string") return Promise.reject(new TypeError("CDP message must be a string"));
+    return this.request("portableCdp", { operation: "request", connectionId, message }, options.requestTimeoutMs);
+  }
+
+  portableCdpComplete(actionId, result, options = {}) {
+    if (!Number.isSafeInteger(actionId) || actionId < 0 || actionId > 0xffff_ffff) {
+      return Promise.reject(new TypeError("CDP action ID must be an unsigned 32-bit integer"));
+    }
+    if (typeof result !== "string") return Promise.reject(new TypeError("CDP action result must be a string"));
+    return this.request("portableCdp", { operation: "complete", actionId, result }, options.requestTimeoutMs);
+  }
+
+  portableCdpPoll(connectionId, maxItems = 64, options = {}) {
+    if (!Number.isSafeInteger(connectionId) || connectionId < 0 || connectionId > 0xffff_ffff) {
+      return Promise.reject(new TypeError("CDP connection ID must be an unsigned 32-bit integer"));
+    }
+    return this.request("portableCdp", { operation: "poll", connectionId, maxItems }, options.requestTimeoutMs);
+  }
+
+  portableCdpClose(connectionId, options = {}) {
+    return this.request("portableCdp", { operation: "close", connectionId }, options.requestTimeoutMs);
+  }
+
   allCookies(options = {}) {
     return this.request("allCookies", undefined, options.requestTimeoutMs);
   }

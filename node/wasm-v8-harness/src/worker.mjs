@@ -95,6 +95,8 @@ const SET_COOKIE_SCRIPT_NAMES = ["setCookieFromScript", "set_cookie_from_script"
 const ALL_COOKIES_NAMES = ["allCookies", "all_cookies"];
 const IMPORT_COOKIES_NAMES = ["importCookies", "import_cookies"];
 const DELETE_COOKIES_NAMES = ["deleteCookies", "delete_cookies"];
+const CDP_CONSTRUCTOR_NAMES = ["PortableCdp"];
+const CDP_ABI_VERSION_NAME = "cdpAbiVersion";
 const REQUIRED_CORE_ABI_VERSION = 1;
 const REQUIRED_DOM_OP_ABI_VERSION = 1;
 const REQUIRED_DOM_BATCH_ABI_VERSION = 1;
@@ -419,6 +421,7 @@ let bridgeCapabilityProbePromise;
 let portablePlatformOp;
 let bridgeTaskHost;
 let bridgeTaskLastStatus = null;
+let portableCdpCore = null;
 let bootstrapRuntime;
 let nextBootstrapFetchId = 1;
 const bootstrapFetches = new Map();
@@ -1212,6 +1215,62 @@ async function getBridgeCapabilityProbe() {
   return bridgeCapabilityProbePromise;
 }
 
+function portableCdpError(message) {
+  const error = new Error(message);
+  error.code = "ERR_OBSCURA_CDP_ABI";
+  return error;
+}
+
+function portableCdpInstance(html = "") {
+  if (portableCdpCore) return portableCdpCore;
+  const constructor = member(target, CDP_CONSTRUCTOR_NAMES);
+  if (!constructor) throw portableCdpError("WASM module does not expose PortableCdp");
+  try {
+    portableCdpCore = new constructor.fn(requireBoundedString(html, MAX_HTML_INPUT_BYTES, "CDP HTML input"));
+  } catch (error) {
+    throw portableCdpError(`PortableCdp construction failed: ${error?.message ?? String(error)}`);
+  }
+  return portableCdpCore;
+}
+
+function portableCdpOperation(payload = {}) {
+  const operation = payload.operation;
+  if (operation === "abi") {
+    const exported = target?.[CDP_ABI_VERSION_NAME];
+    return typeof exported === "function" ? Number(exported()) : null;
+  }
+  if (operation === "reset") {
+    portableCdpCore = null;
+    return { reset: true };
+  }
+  const core = portableCdpInstance(payload.html ?? "");
+  if (operation === "open") return requireUnsignedU32(core.openConnection(), "CDP connection ID");
+  if (operation === "close") {
+    core.closeConnection(requireUnsignedU32(payload.connectionId, "CDP connection ID"));
+    return {};
+  }
+  if (operation === "request") {
+    const connectionId = requireUnsignedU32(payload.connectionId, "CDP connection ID");
+    requireBoundedString(payload.message, MAX_PLATFORM_REQUEST_BYTES, "CDP message");
+    return decodeJsonText(core.cdpRequest(connectionId, payload.message));
+  }
+  if (operation === "complete") {
+    const actionId = requireUnsignedU32(payload.actionId, "CDP action ID");
+    requireBoundedString(payload.result, MAX_PLATFORM_RESPONSE_BYTES, "CDP action result");
+    return decodeJsonText(core.completeAction(actionId, payload.result));
+  }
+  if (operation === "poll") {
+    const connectionId = requireUnsignedU32(payload.connectionId, "CDP connection ID");
+    const maxItems = payload.maxItems ?? 64;
+    if (!Number.isSafeInteger(maxItems) || maxItems < 0 || maxItems > 512) {
+      throw new RangeError("CDP event count must be between 0 and 512");
+    }
+    return decodeJsonText(core.pollCdpEvents(connectionId, maxItems));
+  }
+  if (operation === "status") return decodeJsonText(core.cdpStatus());
+  throw new TypeError(`Unknown portable CDP operation ${JSON.stringify(operation)}`);
+}
+
 async function requireStatefulBridgeCompatibility(api) {
   const capabilities = await getBridgeCapabilityProbe();
   if (!capabilities) {
@@ -1523,6 +1582,7 @@ function installDocumentFacade() {
 async function disposeBridgeCore() {
   const core = bridgeCore;
   bridgeCore = null;
+  portableCdpCore = null;
   cancelBootstrapFetches();
   bootstrapRuntime = null;
   moduleRecords = new Map();
@@ -2953,6 +3013,8 @@ async function dispatch(operation, payload) {
     }
     case "bootstrapEvaluate":
       return await bootstrapEvaluate(payload);
+    case "portableCdp":
+      return portableCdpOperation(payload);
     case "bridgeStatus":
       return await bridgeStatus();
     case "allCookies":
