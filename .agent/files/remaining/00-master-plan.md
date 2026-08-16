@@ -63,7 +63,7 @@ envelopes, following the existing harness security design.
 
 ## Current authoritative baseline
 
-Pushed baseline: `cc0e605` on `wasm-node-migration`.
+Pushed baseline: `c860841` on `wasm-node-migration`.
 
 Already implemented and pushed:
 
@@ -82,6 +82,19 @@ Shipped in source commit `f248863` with verification recorded in
 - WASM render-resource discovery and profiled seed/missing APIs.
 - Node resource bridge and tests.
 - Shared document-base resolution and typed font/image classification.
+
+Additional shipped slices after that checkpoint:
+
+- `5634135`: target-neutral navigation transactions and redirect/history state.
+- `e02d105`: bounded classic document-script orchestration.
+- `fbf7b34`: bounded Node fetch/XHR bridge for navigation and page realms.
+- `0f3b0a8`: static ES modules, import maps and bounded module graph loading.
+- `c860841`: target-neutral cookie state with Node request/document adapters.
+
+These slices are real and tested, but they do not yet constitute a complete
+CDP browser or a publishable npm package. Dynamic `import()` remains
+fail-closed, XHR is a compatibility subset, and interception/cache/full SSRF
+policy are not complete.
 
 The user-owned untracked repository-root `index.js` is outside this migration.
 Never edit, delete, stage or commit it.
@@ -186,4 +199,18 @@ R: resource discovery checkpoint
 - `VERIFIED`: focused real-artifact acceptance passed.
 - `SHIPPED`: committed and pushed with evidence recorded.
 
-Current packet states: R and P are `SHIPPED`; every later packet is `TODO`.
+Current packet states:
+
+- R `SHIPPED` (`f248863`), P `SHIPPED` (`ab36f8e`).
+- N1 `SHIPPED` (`5634135`), N2 `SHIPPED` (`fbf7b34`).
+- N3 `REVIEW`: cookie semantics are shipped (`c860841`), but interception,
+  cache, redirect credential policy, recursive resource completion and full
+  SSRF/DNS checks remain.
+- S1 `SHIPPED` (`e02d105`) for the bounded classic-script subset.
+- S2 `REVIEW`: static modules/import maps and basic fetch/XHR are shipped
+  (`0f3b0a8`), while dynamic import, complete XHR parity and event parity
+  remain.
+- C1, C2, C3, K1 and K2 `TODO`: portable CDP state, JavaScript WebSocket
+  transport, Playwright compatibility, npm packaging and npx CLI are not
+  implemented yet.
+- H `ACTIVE` continuously; V `TODO` until C1 through K2 are complete.
