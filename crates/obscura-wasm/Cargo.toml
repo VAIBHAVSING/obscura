@@ -11,7 +11,7 @@ publish = false
 default = []
 # Node supplies V8 and resource bytes; the complete layout, raster paint, and
 # PNG encoder remain inside the portable module.
-render = ["dep:obscura-render", "dep:url", "obscura-render/paint"]
+render = ["dep:obscura-render", "obscura-render/paint"]
 
 [lib]
 crate-type = ["cdylib", "rlib"]
@@ -25,7 +25,7 @@ obscura-platform = { workspace = true }
 obscura-render = { workspace = true, optional = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
-url = { workspace = true, optional = true }
+url = { workspace = true }
 wasm-bindgen = "0.2"
 
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]

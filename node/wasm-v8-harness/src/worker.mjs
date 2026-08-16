@@ -78,6 +78,13 @@ const SEED_MISSING_RENDER_IMAGE_RESOURCE_NAMES = [
 const SCREENSHOT_PNG_NAMES = ["screenshot_png", "screenshotPng"];
 const PDF_NAMES = ["pdf"];
 const PDF_ABI_VERSION_NAME = "pdfAbiVersion";
+const NAVIGATION_ABI_VERSION_NAME = "navigationAbiVersion";
+const BEGIN_NAVIGATION_NAMES = ["beginNavigation", "begin_navigation"];
+const NAVIGATION_RESPONSE_HEADERS_NAMES = ["navigationResponseHeaders", "navigation_response_headers"];
+const NAVIGATION_RESPONSE_CHUNK_NAMES = ["navigationResponseChunk", "navigation_response_chunk"];
+const NAVIGATION_RESPONSE_END_NAMES = ["navigationResponseEnd", "navigation_response_end"];
+const CANCEL_NAVIGATION_NAMES = ["cancelNavigation", "cancel_navigation"];
+const NAVIGATION_STATUS_NAMES = ["navigationStatus", "navigation_status"];
 const PLATFORM_OP_ABI_VERSION_NAME = "platformOpAbiVersion";
 const PLATFORM_OP_NAME = "platformOp";
 const REQUIRED_CORE_ABI_VERSION = 1;
@@ -88,6 +95,13 @@ const REQUIRED_PLATFORM_OP_ABI_VERSION = 1;
 const REQUIRED_RENDER_ABI_VERSION = 1;
 const REQUIRED_RENDER_RESOURCE_REQUEST_ABI_VERSION = 1;
 const REQUIRED_PDF_ABI_VERSION = 1;
+const REQUIRED_NAVIGATION_ABI_VERSION = 1;
+const MAX_NAVIGATION_URL_BYTES = 64 * 1024;
+const MAX_NAVIGATION_OPTIONS_BYTES = 64 * 1024;
+const MAX_NAVIGATION_HEADERS_BYTES = 128 * 1024;
+const MAX_NAVIGATION_RESPONSE_BYTES = 32 * 1024 * 1024;
+const MAX_NAVIGATION_REDIRECTS = 10;
+const MAX_NAVIGATION_REQUEST_TIMEOUT_MS = 120_000;
 const PLATFORM_OP_COMMAND_SET = new Set(BOOTSTRAP_PLATFORM_OP_COMMANDS);
 const PLATFORM_BYTE_FIELDS = Object.freeze({
   op_text_decode: ["bytes"],
@@ -774,6 +788,13 @@ function bridgeApi(core = bridgeCore) {
     seedMissingRenderImageResource: member(core, SEED_MISSING_RENDER_IMAGE_RESOURCE_NAMES),
     screenshotPng: member(core, SCREENSHOT_PNG_NAMES),
     pdf: member(core, PDF_NAMES),
+    navigationAbiVersion: member(target, [NAVIGATION_ABI_VERSION_NAME]),
+    beginNavigation: member(core, BEGIN_NAVIGATION_NAMES),
+    navigationResponseHeaders: member(core, NAVIGATION_RESPONSE_HEADERS_NAMES),
+    navigationResponseChunk: member(core, NAVIGATION_RESPONSE_CHUNK_NAMES),
+    navigationResponseEnd: member(core, NAVIGATION_RESPONSE_END_NAMES),
+    cancelNavigation: member(core, CANCEL_NAVIGATION_NAMES),
+    navigationStatus: member(core, NAVIGATION_STATUS_NAMES),
     dispose: member(core, DISPOSE_NAMES),
   };
 }
@@ -830,6 +851,44 @@ function pdfAbiError(message) {
   const error = new Error(message);
   error.code = "ERR_OBSCURA_WASM_PDF_ABI";
   return error;
+}
+
+function navigationAbiError(message) {
+  const error = new Error(message);
+  error.code = "ERR_OBSCURA_WASM_NAVIGATION_ABI";
+  return error;
+}
+
+async function requireNavigationCompatibility(api) {
+  const capabilities = await getBridgeCapabilityProbe();
+  if (capabilities?.navigationAbiVersion !== REQUIRED_NAVIGATION_ABI_VERSION) {
+    throw navigationAbiError(
+      `Portable navigation requires probe navigationAbiVersion=${REQUIRED_NAVIGATION_ABI_VERSION}, but it exposes ${String(capabilities?.navigationAbiVersion)}`,
+    );
+  }
+  const version = member(target, [NAVIGATION_ABI_VERSION_NAME]);
+  if (!version) {
+    throw navigationAbiError(
+      `Portable navigation requires ${NAVIGATION_ABI_VERSION_NAME}() ABI version ${REQUIRED_NAVIGATION_ABI_VERSION}`,
+    );
+  }
+  const actual = syncCall(version);
+  if (actual !== REQUIRED_NAVIGATION_ABI_VERSION) {
+    throw navigationAbiError(
+      `Portable navigation requires ABI version ${REQUIRED_NAVIGATION_ABI_VERSION}, but the module exposes ${String(actual)}`,
+    );
+  }
+  for (const [name, label] of [
+    ["beginNavigation", "beginNavigation/begin_navigation"],
+    ["navigationResponseHeaders", "navigationResponseHeaders/navigation_response_headers"],
+    ["navigationResponseChunk", "navigationResponseChunk/navigation_response_chunk"],
+    ["navigationResponseEnd", "navigationResponseEnd/navigation_response_end"],
+    ["cancelNavigation", "cancelNavigation/cancel_navigation"],
+    ["navigationStatus", "navigationStatus/navigation_status"],
+  ]) {
+    if (!api[name]) throw navigationAbiError(`ObscuraCore does not expose ${label}`);
+  }
+  return actual;
 }
 
 function modulePdfAbiVersion() {
@@ -1456,6 +1515,183 @@ async function replaceBridgeCore(html, documentMetadata) {
   }
 }
 
+function resetBridgeRealmAfterNavigation() {
+  if (bridgeTaskHost) {
+    bridgeTaskHost.close();
+    bridgeTaskLastStatus = bridgeTaskHost.status();
+    bridgeTaskHost = null;
+  }
+  hostContext = null;
+  bridgeRealmKind = null;
+  bridgeGeneration += 1;
+  if (bridgeCore) {
+    const api = bridgeApi();
+    if (api.pageRevision && api.documentHandle) {
+      const identity = readBridgeIdentity(bridgeCore, api);
+      bridgeDocumentHandle = identity.documentHandle;
+      bridgePageRevision = identity.revision;
+    }
+  }
+}
+
+function validateNavigationUrl(value, allowPrivateNetwork = false) {
+  requireBoundedString(value, MAX_NAVIGATION_URL_BYTES, "navigation URL");
+  let url;
+  try {
+    url = new URL(value);
+  } catch {
+    throw new TypeError("navigation URL must be absolute");
+  }
+  if (!new Set(["about:", "data:", "http:", "https:"]).has(url.protocol)) {
+    throw new TypeError(`navigation scheme ${url.protocol} is not supported`);
+  }
+  if (url.protocol === "http:" || url.protocol === "https:") {
+    const host = url.hostname.toLowerCase();
+    if (!allowPrivateNetwork &&
+        (host === "localhost" || host.endsWith(".localhost") || host === "metadata.google.internal" ||
+         host === "169.254.169.254" || host === "::1" || host === "[::1]" ||
+         /^127\./.test(host) || /^10\./.test(host) || /^192\.168\./.test(host) ||
+         /^172\.(1[6-9]|2\d|3[0-1])\./.test(host))) {
+      const error = new Error(`navigation target is blocked by the portable SSRF policy: ${host}`);
+      error.code = "ERR_OBSCURA_SSRF";
+      throw error;
+    }
+  }
+  return url;
+}
+
+function decodeInlineNavigation(url) {
+  if (url.startsWith("about:blank")) {
+    return { bytes: new TextEncoder().encode("<!doctype html><html><head></head><body></body></html>"), encoding: "UTF-8" };
+  }
+  const comma = url.indexOf(",");
+  if (comma < 0) throw new TypeError("data URL is missing its payload");
+  const meta = url.slice(5, comma);
+  const payload = url.slice(comma + 1);
+  if (meta.split(";").some((part) => part.toLowerCase() === "base64")) {
+    const normalized = payload.replace(/\s+/g, "");
+    const bytes = Buffer.from(normalized, "base64");
+    if (bytes.length > MAX_NAVIGATION_RESPONSE_BYTES) throw new RangeError("data URL exceeds navigation response limit");
+    return { bytes: new Uint8Array(bytes), encoding: "UTF-8" };
+  }
+  const bytes = new TextEncoder().encode(decodeURIComponent(payload));
+  if (bytes.length > MAX_NAVIGATION_RESPONSE_BYTES) throw new RangeError("data URL exceeds navigation response limit");
+  return { bytes, encoding: "UTF-8" };
+}
+
+function responseHeadersObject(response) {
+  const headers = Object.create(null);
+  for (const [name, value] of response.headers) headers[name.toLowerCase()] = value;
+  const serialized = JSON.stringify(headers);
+  requireBoundedString(serialized, MAX_NAVIGATION_HEADERS_BYTES, "navigation response headers");
+  return { headers, serialized };
+}
+
+function responseEncoding(headers) {
+  const contentType = headers["content-type"] ?? "";
+  const match = /(?:^|;)\s*charset\s*=\s*["']?([^;"'\s]+)/i.exec(contentType);
+  return match?.[1] ?? "UTF-8";
+}
+
+async function readNavigationBody(response, api, navigationId, signal) {
+  if (!response.body) return;
+  const reader = response.body.getReader();
+  let total = 0;
+  try {
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      const chunk = value instanceof Uint8Array ? value : new Uint8Array(value);
+      total += chunk.byteLength;
+      if (total > MAX_NAVIGATION_RESPONSE_BYTES) {
+        throw new RangeError(`navigation response exceeds the ${MAX_NAVIGATION_RESPONSE_BYTES}-byte limit`);
+      }
+      syncCall(api.navigationResponseChunk, navigationId, chunk);
+      if (signal.aborted) throw new Error("navigation was aborted");
+    }
+  } finally {
+    try { await reader.cancel(); } catch {}
+  }
+}
+
+async function navigatePortable({ url, options = {}, allowPrivateNetwork = false, requestTimeoutMs = 30_000 } = {}) {
+  if (!Number.isSafeInteger(requestTimeoutMs) || requestTimeoutMs < 1) {
+    throw new RangeError("navigation request timeout must be a positive safe integer");
+  }
+  if (requestTimeoutMs > MAX_NAVIGATION_REQUEST_TIMEOUT_MS) {
+    throw new RangeError(`navigation request timeout must not exceed ${MAX_NAVIGATION_REQUEST_TIMEOUT_MS}ms`);
+  }
+  validateNavigationUrl(url, allowPrivateNetwork);
+  if (options === null || typeof options !== "object" || Array.isArray(options)) {
+    throw new TypeError("navigation options must be an object");
+  }
+  const allowedOptions = new Set(["method", "body", "referrer", "replaceHistory", "maxRedirects"]);
+  for (const key of Reflect.ownKeys(options)) {
+    if (typeof key !== "string" || !allowedOptions.has(key)) throw new TypeError(`unknown navigation option ${String(key)}`);
+  }
+  const method = options.method ?? "GET";
+  const body = options.body ?? "";
+  const referrer = options.referrer ?? "";
+  if (typeof method !== "string" || !/^[A-Z]{1,16}$/.test(method)) throw new TypeError("navigation method must be uppercase");
+  if (typeof body !== "string") throw new TypeError("navigation body must be a string");
+  if (typeof referrer !== "string") throw new TypeError("navigation referrer must be a string");
+  requireBoundedString(body, MAX_NAVIGATION_RESPONSE_BYTES, "navigation request body");
+  requireBoundedString(referrer, MAX_NAVIGATION_URL_BYTES, "navigation referrer");
+  const maxRedirects = options.maxRedirects ?? MAX_NAVIGATION_REDIRECTS;
+  if (!Number.isSafeInteger(maxRedirects) || maxRedirects < 0 || maxRedirects > MAX_NAVIGATION_REDIRECTS) {
+    throw new RangeError(`maxRedirects must be between 0 and ${MAX_NAVIGATION_REDIRECTS}`);
+  }
+
+  if (!bridgeCore) await replaceBridgeCore("");
+  const api = bridgeApi();
+  await requireNavigationCompatibility(api);
+  let action = JSON.parse(syncCall(api.beginNavigation, url, JSON.stringify({ method, body, referrer, replaceHistory: Boolean(options.replaceHistory), maxRedirects })));
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(new Error("navigation request timed out")), requestTimeoutMs);
+  timer.unref?.();
+  try {
+    while (true) {
+      const navigationId = requireUnsignedU32(action.navigationId, "navigation action navigationId");
+      if (action.kind === "inline") {
+        const inline = decodeInlineNavigation(action.url);
+        syncCall(api.navigationResponseHeaders, navigationId, 200, JSON.stringify({ "content-type": "text/html; charset=UTF-8" }));
+        syncCall(api.navigationResponseChunk, navigationId, inline.bytes);
+        const commit = JSON.parse(syncCall(api.navigationResponseEnd, navigationId, action.url, inline.encoding));
+        resetBridgeRealmAfterNavigation();
+        return { ...commit, navigation: JSON.parse(syncCall(api.navigationStatus)) };
+      }
+      const targetUrl = validateNavigationUrl(action.url, allowPrivateNetwork);
+      const response = await fetch(targetUrl, {
+        method: action.method,
+        body: action.method === "GET" || action.method === "HEAD" ? undefined : action.body,
+        redirect: "manual",
+        signal: controller.signal,
+        referrer: action.referrer || undefined,
+      });
+      const { headers, serialized } = responseHeadersObject(response);
+      action = JSON.parse(syncCall(api.navigationResponseHeaders, navigationId, response.status, serialized));
+      if (action.kind === "redirect") {
+        try { await response.body?.cancel(); } catch {}
+        continue;
+      }
+      if (action.kind === "responseError") {
+        const error = new Error(`navigation response status ${response.status}`);
+        error.code = "ERR_OBSCURA_NAVIGATION_RESPONSE";
+        throw error;
+      }
+      await readNavigationBody(response, api, navigationId, controller.signal);
+      const commit = JSON.parse(syncCall(api.navigationResponseEnd, navigationId, targetUrl.toString(), responseEncoding(headers)));
+      resetBridgeRealmAfterNavigation();
+      return { ...commit, navigation: JSON.parse(syncCall(api.navigationStatus)) };
+    }
+  } catch (error) {
+    try { if (api.cancelNavigation) syncCall(api.cancelNavigation, Number(action.navigationId)); } catch {}
+    throw error;
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
 async function bridgeStatus() {
   const api = bridgeCore ? bridgeApi() : {};
   if (bridgeCore && (api.domOp || api.domBatch)) synchronizeBridgeIdentity();
@@ -1497,6 +1733,19 @@ async function bridgeStatus() {
     capabilities?.pdfAbiVersion === REQUIRED_PDF_ABI_VERSION &&
     capabilities?.pdf === true &&
     exportedPdfAbiVersion === REQUIRED_PDF_ABI_VERSION;
+  const hasNavigationAbi =
+    capabilities?.navigationAbiVersion === REQUIRED_NAVIGATION_ABI_VERSION &&
+    Boolean(api.beginNavigation) && Boolean(api.navigationResponseHeaders) &&
+    Boolean(api.navigationResponseChunk) && Boolean(api.navigationResponseEnd) &&
+    Boolean(api.cancelNavigation) && Boolean(api.navigationStatus);
+  let navigation = null;
+  if (hasNavigationAbi) {
+    try {
+      navigation = JSON.parse(syncCall(api.navigationStatus));
+    } catch {
+      navigation = null;
+    }
+  }
   return {
     loaded: Boolean(bridgeCore),
     generation: bridgeGeneration,
@@ -1519,6 +1768,12 @@ async function bridgeStatus() {
       seedMissingRenderImageResource: api.seedMissingRenderImageResource?.name ?? null,
       screenshotPng: api.screenshotPng?.name ?? null,
       pdf: api.pdf?.name ?? null,
+      beginNavigation: api.beginNavigation?.name ?? null,
+      navigationResponseHeaders: api.navigationResponseHeaders?.name ?? null,
+      navigationResponseChunk: api.navigationResponseChunk?.name ?? null,
+      navigationResponseEnd: api.navigationResponseEnd?.name ?? null,
+      cancelNavigation: api.cancelNavigation?.name ?? null,
+      navigationStatus: api.navigationStatus?.name ?? null,
       dispose: api.dispose?.name ?? null,
     },
     page: {
@@ -1535,6 +1790,11 @@ async function bridgeStatus() {
       screenshotPng: Boolean(hasScreenshotPng),
       pdfAvailable: hasValidPdfAbi && Boolean(api.pdf),
       pdfAbiVersion: hasValidPdfAbi ? REQUIRED_PDF_ABI_VERSION : null,
+    },
+    navigation: {
+      available: hasNavigationAbi,
+      abiVersion: hasNavigationAbi ? REQUIRED_NAVIGATION_ABI_VERSION : null,
+      state: navigation,
     },
     bootstrap: {
       host: "node-vm",
@@ -2061,6 +2321,18 @@ async function dispatch(operation, payload) {
       return await screenshotPng(payload);
     case "pdf":
       return await pdf(payload);
+    case "navigate":
+      return await navigatePortable(payload);
+    case "navigationStatus": {
+      const api = bridgeApi();
+      await requireNavigationCompatibility(api);
+      return JSON.parse(syncCall(api.navigationStatus));
+    }
+    case "cancelNavigation": {
+      const api = bridgeApi();
+      await requireNavigationCompatibility(api);
+      return syncCall(api.cancelNavigation, requireUnsignedU32(payload?.navigationId, "navigationId"));
+    }
     case "bootstrapEvaluate":
       return await bootstrapEvaluate(payload);
     case "bridgeStatus":

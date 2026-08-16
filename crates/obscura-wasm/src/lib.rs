@@ -12,6 +12,7 @@ use wasm_bindgen::prelude::*;
 use serde::{Deserialize, Serialize};
 
 mod platform;
+mod navigation;
 
 const ABI_VERSION: u32 = 1;
 const DOM_OP_ABI_VERSION: u32 = 1;
@@ -238,6 +239,7 @@ struct PdfOptionsWire {
 #[wasm_bindgen]
 pub struct ObscuraCore {
     dom: DomTree,
+    navigation: navigation::NavigationState,
     #[cfg(feature = "render")]
     render_resources: obscura_render::RenderResourceCache,
     /// Opaque handles are never recycled, even when `set_html` replaces the
@@ -266,6 +268,7 @@ impl ObscuraCore {
         node_to_handle.insert(document, 1);
         Ok(Self {
             dom,
+            navigation: navigation::NavigationState::new(),
             #[cfg(feature = "render")]
             render_resources: portable_render_resources(),
             handle_to_node,
@@ -281,6 +284,11 @@ impl ObscuraCore {
 
     /// Replace the document using Obscura's existing html5ever-backed parser.
     pub fn set_html(&mut self, html: &str) -> Result<(), JsValue> {
+        self.navigation.cancel_pending();
+        self.replace_html(html)
+    }
+
+    fn replace_html(&mut self, html: &str) -> Result<(), JsValue> {
         require_max_bytes(html, MAX_HTML_INPUT_BYTES, "HTML input")?;
         boundary_result("set_html", || {
             let next_revision = self
@@ -303,6 +311,116 @@ impl ObscuraCore {
             self.page_revision = next_revision;
             Ok(())
         })
+    }
+
+    /// Begin a navigation transaction and return the host action to execute.
+    /// The returned record is data-only and includes the opaque navigation and
+    /// loader identities that must be echoed by every response call.
+    #[wasm_bindgen(js_name = beginNavigation)]
+    pub fn begin_navigation(&mut self, url: &str, options_json: &str) -> Result<String, JsValue> {
+        require_max_bytes(url, navigation::MAX_NAVIGATION_URL_BYTES, "navigation URL")?;
+        require_max_bytes(
+            options_json,
+            navigation::MAX_NAVIGATION_OPTIONS_BYTES,
+            "navigation options",
+        )?;
+        boundary_result("begin_navigation", || self.navigation.begin(url, options_json))
+            .and_then(|value| bounded_return(value, "navigation action"))
+    }
+
+    /// Supply response headers for the current transaction. Redirects are
+    /// resolved and approved in WASM; the host receives the next fetch action.
+    #[wasm_bindgen(js_name = navigationResponseHeaders)]
+    pub fn navigation_response_headers(
+        &mut self,
+        navigation_id: u32,
+        status: u16,
+        headers_json: &str,
+    ) -> Result<String, JsValue> {
+        require_max_bytes(
+            headers_json,
+            navigation::MAX_NAVIGATION_HEADERS_BYTES,
+            "navigation response headers",
+        )?;
+        boundary_result("navigation_response_headers", || {
+            self.navigation
+                .response_headers(u64::from(navigation_id), status, headers_json)
+        })
+        .and_then(|value| bounded_return(value, "navigation response action"))
+    }
+
+    /// Append one bounded response chunk. Chunks are accepted only for the
+    /// currently pending opaque navigation ID.
+    #[wasm_bindgen(js_name = navigationResponseChunk)]
+    pub fn navigation_response_chunk(
+        &mut self,
+        navigation_id: u32,
+        bytes: &[u8],
+    ) -> Result<(), JsValue> {
+        boundary_result("navigation_response_chunk", || {
+            self.navigation
+                .response_chunk(u64::from(navigation_id), bytes)
+        })
+    }
+
+    /// Finish a successful response, parse/replace the DOM, update document
+    /// metadata, and atomically record history. The host cannot commit a URL
+    /// different from the one approved by response headers.
+    #[wasm_bindgen(js_name = navigationResponseEnd)]
+    pub fn navigation_response_end(
+        &mut self,
+        navigation_id: u32,
+        final_url: &str,
+        encoding: &str,
+    ) -> Result<String, JsValue> {
+        let commit = boundary_result("navigation_response_end", || {
+            self.navigation.finish_response(
+                u64::from(navigation_id),
+                final_url,
+                encoding,
+            )
+        })?;
+        let body_text = obscura_platform::decode_with_label(
+            &commit.encoding,
+            &commit.body,
+            false,
+            false,
+        )
+        .unwrap_or_else(|| String::from_utf8_lossy(&commit.body).into_owned());
+        self.replace_html(&body_text)?;
+        self.set_document_metadata(&commit.url.to_string(), &commit.referrer, &commit.encoding)?;
+        boundary_result("navigation_record_commit", || self.navigation.record_commit(&commit))?;
+        bounded_return(
+            serde_json::json!({
+                "abiVersion": navigation::NAVIGATION_ABI_VERSION,
+                "navigationId": commit.navigation_id,
+                "loaderId": commit.loader_id,
+                "url": commit.url.as_str(),
+                "status": commit.status,
+                "documentGeneration": self.navigation.document_generation(),
+                "documentHandle": self.document_handle,
+                "revision": self.page_revision,
+            })
+            .to_string(),
+            "navigation commit",
+        )
+    }
+
+    /// Cancel only the currently pending transaction. A stale ID is rejected
+    /// instead of cancelling a newer navigation.
+    #[wasm_bindgen(js_name = cancelNavigation)]
+    pub fn cancel_navigation(&mut self, navigation_id: u32) -> Result<bool, JsValue> {
+        boundary_result("cancel_navigation", || {
+            self.navigation.cancel(u64::from(navigation_id))
+        })
+    }
+
+    /// Return the current URL, history cursor, document generation, and any
+    /// pending transaction as a bounded data-only JSON object.
+    #[wasm_bindgen(js_name = navigationStatus)]
+    pub fn navigation_status(&self) -> Result<String, JsValue> {
+        boundary_result("navigation_status", || self.navigation.status_json())
+            .and_then(|value| bounded_return(value, "navigation status"))
     }
 
     /// Opaque identity for the current document node.
@@ -1817,6 +1935,12 @@ pub fn abi_version() -> u32 {
     ABI_VERSION
 }
 
+/// Versioned target-neutral navigation state and host-I/O ABI.
+#[wasm_bindgen(js_name = navigationAbiVersion)]
+pub fn navigation_abi_version() -> u32 {
+    navigation::NAVIGATION_ABI_VERSION
+}
+
 #[cfg(feature = "render")]
 #[wasm_bindgen(js_name = pdfAbiVersion)]
 pub fn pdf_abi_version() -> u32 {
@@ -1829,10 +1953,11 @@ pub fn probe() -> String {
     boundary_value("probe", || {
         #[cfg(feature = "render")]
         return format!(
-            r#"{{"abiVersion":{},"dom":true,"selectors":true,"javascript":"host","embeddedV8":false,"domOpAbiVersion":{},"domBatchAbiVersion":{},"documentMetadataAbiVersion":1,"platformOpAbiVersion":{},"renderAbiVersion":{},"renderResourceRequestAbiVersion":{},"renderResourceRequests":true,"screenshotPng":true,"pdfAbiVersion":{},"pdf":true,"stableNodeHandles":true}}"#,
+            r#"{{"abiVersion":{},"dom":true,"selectors":true,"javascript":"host","embeddedV8":false,"domOpAbiVersion":{},"domBatchAbiVersion":{},"documentMetadataAbiVersion":1,"navigationAbiVersion":{},"platformOpAbiVersion":{},"renderAbiVersion":{},"renderResourceRequestAbiVersion":{},"renderResourceRequests":true,"screenshotPng":true,"pdfAbiVersion":{},"pdf":true,"stableNodeHandles":true}}"#,
             ABI_VERSION,
             DOM_OP_ABI_VERSION,
             DOM_BATCH_ABI_VERSION,
+            navigation::NAVIGATION_ABI_VERSION,
             platform::PLATFORM_OP_ABI_VERSION,
             RENDER_ABI_VERSION,
             RENDER_RESOURCE_REQUEST_ABI_VERSION,
@@ -1840,10 +1965,11 @@ pub fn probe() -> String {
         );
         #[cfg(not(feature = "render"))]
         format!(
-            r#"{{"abiVersion":{},"dom":true,"selectors":true,"javascript":"host","embeddedV8":false,"domOpAbiVersion":{},"domBatchAbiVersion":{},"documentMetadataAbiVersion":1,"platformOpAbiVersion":{},"stableNodeHandles":true}}"#,
+            r#"{{"abiVersion":{},"dom":true,"selectors":true,"javascript":"host","embeddedV8":false,"domOpAbiVersion":{},"domBatchAbiVersion":{},"documentMetadataAbiVersion":1,"navigationAbiVersion":{},"platformOpAbiVersion":{},"stableNodeHandles":true}}"#,
             ABI_VERSION,
             DOM_OP_ABI_VERSION,
             DOM_BATCH_ABI_VERSION,
+            navigation::NAVIGATION_ABI_VERSION,
             platform::PLATFORM_OP_ABI_VERSION,
         )
     })
@@ -1886,6 +2012,7 @@ mod tests {
         assert!(probe().contains(r#""abiVersion":1"#));
         assert!(probe().contains(r#""domOpAbiVersion":1"#));
         assert!(probe().contains(r#""domBatchAbiVersion":1"#));
+        assert!(probe().contains(r#""navigationAbiVersion":1"#));
         assert!(probe().contains(r#""platformOpAbiVersion":1"#));
         assert!(probe().contains(r#""stableNodeHandles":true"#));
     }

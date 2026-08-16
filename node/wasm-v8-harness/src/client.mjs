@@ -25,6 +25,9 @@ import { resolveModulePath } from "./module-loader.mjs";
 const workerUrl = new URL("./worker.mjs", import.meta.url);
 const MAX_TIMER_MS = 2_147_483_647;
 const MAX_VM_TIMEOUT_MS = 4_294_967_295;
+const MAX_NAVIGATION_URL_BYTES = 64 * 1024;
+const MAX_NAVIGATION_RESPONSE_BYTES = 32 * 1024 * 1024;
+const MAX_NAVIGATION_REDIRECTS = 10;
 const require = createRequire(import.meta.url);
 
 function nativeInitializationError(message) {
@@ -222,6 +225,39 @@ function boundedRenderResourceRequestOptions(options = {}) {
     );
   }
   return { width, height, offset, limit, expectedPage: boundedPageExpectation(options) };
+}
+
+function boundedNavigationOptions(options = {}) {
+  if (options === null || typeof options !== "object" || Array.isArray(options)) {
+    throw new TypeError("navigation options must be an object");
+  }
+  const allowed = new Set(["method", "body", "referrer", "replaceHistory", "maxRedirects", "allowPrivateNetwork", "requestTimeoutMs"]);
+  for (const key of Reflect.ownKeys(options)) {
+    if (typeof key !== "string" || !allowed.has(key)) throw new TypeError(`unknown navigation option ${String(key)}`);
+  }
+  const method = options.method ?? "GET";
+  const body = options.body ?? "";
+  const referrer = options.referrer ?? "";
+  if (typeof method !== "string" || !/^[A-Z]{1,16}$/.test(method)) {
+    throw new TypeError("navigation method must be an uppercase token");
+  }
+  if (typeof body !== "string") throw new TypeError("navigation body must be a string");
+  if (typeof referrer !== "string") throw new TypeError("navigation referrer must be a string");
+  requireBoundedString(body, MAX_NAVIGATION_RESPONSE_BYTES, "navigation request body");
+  requireBoundedString(referrer, MAX_NAVIGATION_URL_BYTES, "navigation referrer");
+  const maxRedirects = options.maxRedirects ?? MAX_NAVIGATION_REDIRECTS;
+  if (!Number.isSafeInteger(maxRedirects) || maxRedirects < 0 || maxRedirects > MAX_NAVIGATION_REDIRECTS) {
+    throw new RangeError(`maxRedirects must be between 0 and ${MAX_NAVIGATION_REDIRECTS}`);
+  }
+  return {
+    method,
+    body,
+    referrer,
+    replaceHistory: Boolean(options.replaceHistory),
+    maxRedirects,
+    allowPrivateNetwork: Boolean(options.allowPrivateNetwork),
+    requestTimeoutMs: options.requestTimeoutMs,
+  };
 }
 
 function validateTimeout(timeoutMs, label) {
@@ -520,6 +556,46 @@ export class WasmV8Worker {
     } catch (error) {
       return Promise.reject(error);
     }
+  }
+
+  navigate(url, options = {}) {
+    try {
+      if (typeof url !== "string") throw new TypeError("navigation URL must be a string");
+      requireBoundedString(url, MAX_NAVIGATION_URL_BYTES, "navigation URL");
+      // URL parsing is repeated inside the Worker, where the actual fetch and
+      // WASM approval happen. This early parse only gives callers a synchronous
+      // type error for malformed absolute URLs.
+      new URL(url);
+      const normalized = boundedNavigationOptions(options);
+      return this.request(
+        "navigate",
+        {
+          url,
+          options: {
+            method: normalized.method,
+            body: normalized.body,
+            referrer: normalized.referrer,
+            replaceHistory: normalized.replaceHistory,
+            maxRedirects: normalized.maxRedirects,
+          },
+          allowPrivateNetwork: normalized.allowPrivateNetwork,
+        },
+        normalized.requestTimeoutMs,
+      );
+    } catch (error) {
+      return Promise.reject(error);
+    }
+  }
+
+  navigationStatus(options = {}) {
+    return this.request("navigationStatus", undefined, options.requestTimeoutMs);
+  }
+
+  cancelNavigation(navigationId, options = {}) {
+    if (!Number.isSafeInteger(navigationId) || navigationId < 0 || navigationId > 0xffff_ffff) {
+      return Promise.reject(new TypeError("navigationId must be an unsigned 32-bit integer"));
+    }
+    return this.request("cancelNavigation", { navigationId }, options.requestTimeoutMs);
   }
 
   bootstrapEvaluate(source, options = {}) {

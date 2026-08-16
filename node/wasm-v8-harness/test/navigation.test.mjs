@@ -1,0 +1,57 @@
+import assert from "node:assert/strict";
+import http from "node:http";
+import test from "node:test";
+
+import { WasmV8Worker } from "../src/client.mjs";
+
+const realWasmModule = process.env.OBSCURA_REAL_WASM_MODULE;
+
+test("portable navigation owns redirects, document identity, history, and HTML commit", {
+  skip: !realWasmModule,
+}, async () => {
+  const server = http.createServer((request, response) => {
+    if (request.url === "/redirect") {
+      response.writeHead(302, { Location: "/page" });
+      response.end();
+      return;
+    }
+    if (request.url === "/page") {
+      response.writeHead(200, { "content-type": "text/html; charset=UTF-8" });
+      response.end("<!doctype html><html><head><title>portable navigation</title></head><body><h1>Node host only</h1></body></html>");
+      return;
+    }
+    response.writeHead(404, { "content-type": "text/html" });
+    response.end("<h1>missing</h1>");
+  });
+  await new Promise((resolve) => server.listen(0, "127.0.0.1", resolve));
+  const port = server.address().port;
+  const worker = await WasmV8Worker.launch(realWasmModule);
+  try {
+    await worker.bridgeDomBatch([], { html: "" });
+    const initial = await worker.bridgeStatus();
+    assert.equal(initial.navigation.available, true);
+    assert.equal(initial.navigation.abiVersion, 1);
+
+    const blank = await worker.navigate("about:blank");
+    assert.equal(blank.url, "about:blank");
+    const data = await worker.navigate("data:text/html,%3Cmain%3Einline%3C%2Fmain%3E");
+    assert.match(data.url, /^data:/);
+    const page = await worker.navigate(`http://127.0.0.1:${port}/redirect`, {
+      allowPrivateNetwork: true,
+    });
+    assert.equal(page.status, 200);
+    assert.equal(page.navigation.currentUrl, `http://127.0.0.1:${port}/page`);
+    assert.equal(page.navigation.pending, null);
+    assert.ok(page.navigation.history.length >= 4);
+    assert.equal(await worker.bridgeEvaluate("document.querySelector('title').textContent"), "portable navigation");
+    assert.equal(await worker.bridgeEvaluate("document.querySelector('h1').textContent"), "Node host only");
+
+    await assert.rejects(
+      worker.navigate("http://127.0.0.1:1/blocked"),
+      (error) => error?.code === "ERR_OBSCURA_SSRF",
+    );
+  } finally {
+    await worker.close();
+    await new Promise((resolve) => server.close(resolve));
+  }
+});
