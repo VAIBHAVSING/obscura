@@ -1,11 +1,22 @@
 import { strict as assert } from "node:assert";
+import { createServer as createHttpServer } from "node:http";
 import { test } from "node:test";
 import { ObscuraCdpServer, CdpClient } from "../src/index.mjs";
 
 const modulePath = process.env.OBSCURA_REAL_WASM_MODULE;
 
 test("real WASM artifact is reachable through package CDP", { skip: !modulePath }, async () => {
-  const server = new ObscuraCdpServer({ modulePath });
+  const fixture = createHttpServer((request, response) => {
+    response.setHeader("content-type", "text/html; charset=utf-8");
+    response.end(`<html><body><h1>${request.headers["x-portable"] ?? "missing"}</h1></body></html>`);
+  });
+  await new Promise((resolve, reject) => {
+    fixture.once("error", reject);
+    fixture.listen(0, "127.0.0.1", resolve);
+  });
+  const fixtureAddress = fixture.address();
+  const fixtureUrl = `http://127.0.0.1:${fixtureAddress.port}/headers`;
+  const server = new ObscuraCdpServer({ modulePath, allowPrivateNetwork: true });
   let client;
   try {
     await server.start();
@@ -46,6 +57,16 @@ test("real WASM artifact is reachable through package CDP", { skip: !modulePath 
     }, sessionId);
     const deletedCookies = await client.command("Storage.getCookies", {}, sessionId);
     assert.equal(deletedCookies.cookies.some((cookie) => cookie.name === "portable"), false);
+    await client.command("Network.setExtraHTTPHeaders", { headers: { "X-Portable": "wasm" } }, sessionId);
+    await client.command("Page.navigate", { url: fixtureUrl }, sessionId);
+    const headerValue = await client.command("Runtime.evaluate", {
+      expression: "document.querySelector('h1').textContent",
+      returnByValue: true,
+    }, sessionId);
+    assert.equal(headerValue.result.value, "wasm");
+    await client.command("Page.navigate", {
+      url: "data:text/html,<html><body><h1>Portable</h1></body></html>",
+    }, sessionId);
     const document = await client.command("DOM.getDocument", { depth: -1 }, sessionId);
     assert.equal(document.root.nodeType, 9);
     const htmlNode = await client.command("DOM.querySelector", { nodeId: document.root.nodeId, selector: "h1" }, sessionId);
@@ -73,5 +94,6 @@ test("real WASM artifact is reachable through package CDP", { skip: !modulePath 
   } finally {
     await client?.close();
     await server.close();
+    await new Promise((resolve) => fixture.close(resolve));
   }
 });

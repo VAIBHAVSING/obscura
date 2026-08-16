@@ -141,6 +141,7 @@ struct Target {
     viewport: Viewport,
     emulated_media: String,
     focus_emulation: bool,
+    extra_headers: BTreeMap<String, String>,
     core: ObscuraCore,
     sessions: BTreeSet<String>,
 }
@@ -193,6 +194,7 @@ impl PortableCdp {
                 viewport: Viewport::default(),
                 emulated_media: String::new(),
                 focus_emulation: false,
+                extra_headers: BTreeMap::new(),
                 core,
                 sessions: BTreeSet::new(),
             },
@@ -641,6 +643,17 @@ impl PortableCdp {
                 target.focus_emulation = request.params.get("enabled").and_then(Value::as_bool).unwrap_or(false);
                 cdp_result_response(&request.id, json!({}), session)
             }
+            "Network.setExtraHTTPHeaders" => {
+                let headers = match parse_extra_headers(&request.params) {
+                    Ok(headers) => headers,
+                    Err(error) => return cdp_error_response(&request.id, -32602, error, session),
+                };
+                let Some(target) = self.targets.get_mut(&target_id) else {
+                    return cdp_error_response(&request.id, -32000, "target is not known", session);
+                };
+                target.extra_headers = headers;
+                cdp_result_response(&request.id, json!({}), session)
+            }
             "Network.getAllCookies" | "Storage.getCookies" => {
                 let Some(target) = self.targets.get_mut(&target_id) else {
                     return cdp_error_response(&request.id, -32000, "target is not known", session);
@@ -843,13 +856,15 @@ impl PortableCdp {
             "Page.setDocumentContent" => self.queue_action(connection_id, request.clone(), target_id, "setDocumentContent", json!({
                 "html": request.params.get("html").and_then(Value::as_str).unwrap_or(""),
             })),
-            "Page.navigate" => self.queue_action(connection_id, request.clone(), target_id, "navigate", json!({
+            "Page.navigate" => self.queue_action(connection_id, request.clone(), target_id.clone(), "navigate", json!({
                 "url": request.params.get("url").and_then(Value::as_str).unwrap_or("about:blank"),
                 "method": request.params.get("referrer").and_then(Value::as_str).unwrap_or("GET"),
+                "extraHTTPHeaders": self.targets.get(&target_id).map(|target| target.extra_headers.clone()).unwrap_or_default(),
             })),
             "Page.reload" => {
                 let url = self.targets.get(&target_id).map(|target| target.url.clone()).unwrap_or_else(|| "about:blank".to_string());
-                self.queue_action(connection_id, request.clone(), target_id, "reload", json!({"url": url}))
+                let extra_headers = self.targets.get(&target_id).map(|target| target.extra_headers.clone()).unwrap_or_default();
+                self.queue_action(connection_id, request.clone(), target_id, "reload", json!({"url": url, "extraHTTPHeaders": extra_headers}))
             }
             "Runtime.evaluate" => self.queue_action(connection_id, request.clone(), target_id, "evaluate", json!({
                 "expression": request.params.get("expression").and_then(Value::as_str).unwrap_or(""),
@@ -940,6 +955,7 @@ impl PortableCdp {
             viewport: Viewport::default(),
             emulated_media: String::new(),
             focus_emulation: false,
+            extra_headers: BTreeMap::new(),
             core,
             sessions: BTreeSet::new(),
         });
@@ -1121,6 +1137,8 @@ fn layout_metrics(target: &Target) -> Value {
 
 const MAX_CDP_COOKIE_COUNT: usize = 4096;
 const MAX_CDP_COOKIE_BYTES: usize = 64 * 1024;
+const MAX_EXTRA_HEADER_COUNT: usize = 128;
+const MAX_EXTRA_HEADER_BYTES: usize = 128 * 1024;
 
 fn cookie_clock(params: &Map<String, Value>) -> Result<u64, String> {
     match params.get("_obscuraNowSecs") {
@@ -1202,6 +1220,42 @@ fn cdp_cookie_import(params: &Map<String, Value>, target_url: &str) -> Result<St
         return Err("cookies exceeds the 64KiB limit".to_string());
     }
     Ok(encoded)
+}
+
+fn parse_extra_headers(params: &Map<String, Value>) -> Result<BTreeMap<String, String>, String> {
+    let Some(values) = params.get("headers").and_then(Value::as_object) else {
+        return Err("headers must be an object".to_string());
+    };
+    if values.len() > MAX_EXTRA_HEADER_COUNT {
+        return Err(format!("headers exceeds the {MAX_EXTRA_HEADER_COUNT}-header limit"));
+    }
+    let mut total = 0usize;
+    let mut headers = BTreeMap::new();
+    for (name, value) in values {
+        if name.is_empty() || name.len() > 1024 || !name.bytes().all(is_header_name_byte) {
+            return Err(format!("invalid HTTP header name {name:?}"));
+        }
+        let Some(value) = value.as_str() else {
+            return Err(format!("HTTP header {name:?} must be a string"));
+        };
+        if value.len() > MAX_EXTRA_HEADER_BYTES || value.bytes().any(|byte| byte == b'\r' || byte == b'\n') {
+            return Err(format!("invalid HTTP header value for {name:?}"));
+        }
+        total = total.saturating_add(name.len()).saturating_add(value.len());
+        if total > MAX_EXTRA_HEADER_BYTES {
+            return Err(format!("headers exceeds the {MAX_EXTRA_HEADER_BYTES}-byte limit"));
+        }
+        headers.insert(name.clone(), value.to_string());
+    }
+    Ok(headers)
+}
+
+fn is_header_name_byte(byte: u8) -> bool {
+    matches!(byte,
+        b'a'..=b'z' | b'A'..=b'Z' | b'0'..=b'9' |
+        b'!' | b'#' | b'$' | b'%' | b'&' | b'\'' | b'*' | b'+' | b'-' |
+        b'.' | b'^' | b'_' | b'`' | b'|' | b'~'
+    )
 }
 
 const MAX_DESCRIBED_NODES: usize = 4096;
@@ -1553,6 +1607,15 @@ mod tests {
             let queued = json(&cdp.cdp_request(connection, &request).unwrap());
             assert_eq!(queued["result"]["obscuraAction"]["kind"], kind);
         }
+        let headers = format!(
+            r#"{{"id":7,"sessionId":"{session}","method":"Network.setExtraHTTPHeaders","params":{{"headers":{{"X-Portable":"wasm"}}}}}}"#
+        );
+        assert_eq!(json(&cdp.cdp_request(connection, &headers).unwrap())["result"], json!({}));
+        let navigate = format!(
+            r#"{{"id":8,"sessionId":"{session}","method":"Page.navigate","params":{{"url":"https://example.test/"}}}}"#
+        );
+        let queued = json(&cdp.cdp_request(connection, &navigate).unwrap());
+        assert_eq!(queued["result"]["obscuraAction"]["payload"]["extraHTTPHeaders"]["X-Portable"], "wasm");
     }
 
     #[test]

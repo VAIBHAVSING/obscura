@@ -331,6 +331,7 @@ class PageTarget {
     const result = await this.worker.navigate(url, {
       executeScripts: params.executeScripts !== false,
       maxRedirects: params.maxRedirects,
+      extraHTTPHeaders: params.extraHTTPHeaders,
       requestTimeoutMs: params.requestTimeoutMs ?? this.server.requestTimeoutMs,
       allowPrivateNetwork: params.allowPrivateNetwork === true,
     });
@@ -858,6 +859,7 @@ export class ObscuraCdpServer {
       "Network.deleteCookies",
       "Network.clearBrowserCookies",
       "Network.clearBrowserCache",
+      "Network.setExtraHTTPHeaders",
       "Storage.getCookies",
       "Storage.setCookies",
       "Storage.clearDataForOrigin",
@@ -896,9 +898,13 @@ export class ObscuraCdpServer {
     }
     const action = response?.result?.obscuraAction;
     if (!action) return response?.result ?? {};
+    const hostParams = { ...(command.params ?? {}) };
+    if (action.payload?.extraHTTPHeaders && typeof action.payload.extraHTTPHeaders === "object") {
+      hostParams._obscuraExtraHTTPHeaders = action.payload.extraHTTPHeaders;
+    }
     let hostResult;
     try {
-      hostResult = await this.#dispatchPage(connection, command.sessionId, target, method, command.params ?? {});
+      hostResult = await this.#dispatchPage(connection, command.sessionId, target, method, hostParams);
     } catch (error) {
       hostResult = { error: { code: Number.isInteger(error?.code) ? error.code : -32603, message: error?.message ?? "Portable host action failed" } };
     }
@@ -1114,7 +1120,11 @@ export class ObscuraCdpServer {
         if (typeof url !== "string") throw cdpError(-32602, "Page.navigate requires url");
         connection.event("Page.frameStartedLoading", { frameId: target.frameId }, sessionId);
         try {
-          const result = await target.navigate(url, { allowPrivateNetwork: this.allowPrivateNetwork, requestTimeoutMs: params.timeout });
+          const result = await target.navigate(url, {
+            allowPrivateNetwork: this.allowPrivateNetwork,
+            requestTimeoutMs: params.timeout,
+            extraHTTPHeaders: params._obscuraExtraHTTPHeaders,
+          });
           connection.event("Page.frameNavigated", { frame: frameTree(target).frameTree.frame }, sessionId);
           // A committed navigation replaces both the default and utility
           // execution worlds. Playwright waits for these notifications before
@@ -1135,7 +1145,10 @@ export class ObscuraCdpServer {
         }
       }
       case "Page.reload":
-        await target.navigate(target.url, { allowPrivateNetwork: this.allowPrivateNetwork });
+        await target.navigate(target.url, {
+          allowPrivateNetwork: this.allowPrivateNetwork,
+          extraHTTPHeaders: params._obscuraExtraHTTPHeaders,
+        });
         return {};
       case "Page.captureScreenshot": {
         const format = params.format ?? "png";

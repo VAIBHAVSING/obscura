@@ -2280,7 +2280,7 @@ async function navigatePortable({ url, options = {}, allowPrivateNetwork = false
   if (options === null || typeof options !== "object" || Array.isArray(options)) {
     throw new TypeError("navigation options must be an object");
   }
-  const allowedOptions = new Set(["method", "body", "referrer", "replaceHistory", "maxRedirects", "executeScripts"]);
+  const allowedOptions = new Set(["method", "body", "referrer", "replaceHistory", "maxRedirects", "executeScripts", "extraHTTPHeaders"]);
   for (const key of Reflect.ownKeys(options)) {
     if (typeof key !== "string" || !allowedOptions.has(key)) throw new TypeError(`unknown navigation option ${String(key)}`);
   }
@@ -2292,6 +2292,22 @@ async function navigatePortable({ url, options = {}, allowPrivateNetwork = false
   if (typeof referrer !== "string") throw new TypeError("navigation referrer must be a string");
   requireBoundedString(body, MAX_NAVIGATION_RESPONSE_BYTES, "navigation request body");
   requireBoundedString(referrer, MAX_NAVIGATION_URL_BYTES, "navigation referrer");
+  const extraHTTPHeaders = options.extraHTTPHeaders ?? {};
+  if (extraHTTPHeaders === null || typeof extraHTTPHeaders !== "object" || Array.isArray(extraHTTPHeaders)) {
+    throw new TypeError("extraHTTPHeaders must be an object");
+  }
+  if (Object.keys(extraHTTPHeaders).length > 128) throw new RangeError("extraHTTPHeaders exceeds the 128-header limit");
+  let headerBytes = 0;
+  for (const [name, value] of Object.entries(extraHTTPHeaders)) {
+    if (!/^[!#$%&'*+\-.^_`|~0-9A-Za-z]+$/u.test(name) || name.length > 1024) {
+      throw new TypeError(`invalid HTTP header name ${name}`);
+    }
+    if (typeof value !== "string" || value.includes("\r") || value.includes("\n")) {
+      throw new TypeError(`invalid HTTP header value for ${name}`);
+    }
+    headerBytes += Buffer.byteLength(name) + Buffer.byteLength(value);
+    if (headerBytes > MAX_NAVIGATION_HEADERS_BYTES) throw new RangeError("extraHTTPHeaders exceeds the 128KiB limit");
+  }
   const maxRedirects = options.maxRedirects ?? MAX_NAVIGATION_REDIRECTS;
   if (!Number.isSafeInteger(maxRedirects) || maxRedirects < 0 || maxRedirects > MAX_NAVIGATION_REDIRECTS) {
     throw new RangeError(`maxRedirects must be between 0 and ${MAX_NAVIGATION_REDIRECTS}`);
@@ -2319,7 +2335,7 @@ async function navigatePortable({ url, options = {}, allowPrivateNetwork = false
         return { ...commit, navigation: JSON.parse(syncCall(api.navigationStatus)), scripts };
       }
       const targetUrl = validateNavigationUrl(action.url, allowPrivateNetwork);
-      const navigationHeaders = {};
+      const navigationHeaders = { ...extraHTTPHeaders };
       const navigationCookie = cookieHeaderForUrl(targetUrl, "include");
       if (navigationCookie) navigationHeaders.Cookie = navigationCookie;
       const response = await fetch(targetUrl, {
