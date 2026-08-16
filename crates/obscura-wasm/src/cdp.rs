@@ -280,7 +280,7 @@ impl PortableCdp {
         self.actions.remove(&action_id);
         let result: Value = serde_json::from_str(result_json)
             .map_err(|error| js_error(&format!("invalid CDP action result: {error}")))?;
-        if action.kind == "navigate" {
+        if action.kind == "navigate" || action.kind == "setDocumentContent" {
             if let Some(target) = self.targets.get_mut(&action.target_id) {
                 if let Some(url) = result.get("url").and_then(Value::as_str) {
                     target.url = url.to_string();
@@ -306,6 +306,18 @@ impl PortableCdp {
                     }
                     if let Some(revision) = state.get("revision").and_then(Value::as_u64) {
                         target.revision = u32::try_from(revision).map_err(|_| js_error("page revision exceeds u32"))?;
+                    }
+                    if let Some(html) = state.get("html").and_then(Value::as_str) {
+                        target
+                            .core
+                            .set_html(html)
+                            .map_err(|_| js_error("portable CDP document replacement failed"))?;
+                        target
+                            .core
+                            .set_document_metadata(&target.url, "", "UTF-8")
+                            .map_err(|_| js_error("portable CDP document metadata update failed"))?;
+                        target.document_handle = target.core.document_handle();
+                        target.revision = target.core.page_revision();
                     }
                 }
             }
@@ -569,23 +581,123 @@ impl PortableCdp {
                 }}}), session)
             }
             "DOM.getDocument" => {
-                let Some(target) = self.targets.get(&target_id) else {
+                let Some(target) = self.targets.get_mut(&target_id) else {
                     return cdp_error_response(&request.id, -32000, "target is not known", session);
                 };
+                let depth = request.params.get("depth").and_then(Value::as_i64).unwrap_or(1);
+                let max_depth = if depth < 0 { 64 } else { usize::try_from(depth).unwrap_or(1).min(64) };
                 let document_handle = target.document_handle;
-                cdp_result_response(&request.id, json!({"root": {
-                    "nodeId": document_handle,
-                    "backendNodeId": document_handle,
-                    "nodeType": 9,
-                    "nodeName": "#document",
-                    "localName": "",
-                    "nodeValue": "",
-                    "childNodeCount": 0,
-                    "children": [],
-                    "documentURL": target.url,
-                    "baseURL": target.url,
-                }}), session)
+                let document_url = target.url.clone();
+                let root = match describe_node(&mut target.core, document_handle, max_depth, 0) {
+                    Ok(mut root) => {
+                        if let Value::Object(ref mut object) = root {
+                            object.insert("documentURL".to_string(), Value::String(document_url.clone()));
+                            object.insert("baseURL".to_string(), Value::String(document_url));
+                        }
+                        root
+                    }
+                    Err(error) => return cdp_error_response(&request.id, -32000, error, session),
+                };
+                cdp_result_response(&request.id, json!({"root": root}), session)
             }
+            "DOM.querySelector" => {
+                let Some(target) = self.targets.get_mut(&target_id) else {
+                    return cdp_error_response(&request.id, -32000, "target is not known", session);
+                };
+                let selector = request.params.get("selector").and_then(Value::as_str).unwrap_or("");
+                let root = request.params.get("nodeId").and_then(Value::as_u64).unwrap_or(u64::from(target.document_handle));
+                let result = if root == u64::from(target.document_handle) {
+                    target.core.dom_op("query_selector", selector, "")
+                } else {
+                    target.core.dom_op("query_selector_scoped", &root.to_string(), selector)
+                };
+                let handle = match result {
+                    Ok(value) => value.parse::<u32>().unwrap_or(0),
+                    Err(_) => return cdp_error_response(&request.id, -32000, "DOM selector failed", session),
+                };
+                cdp_result_response(&request.id, json!({"nodeId": if handle == u32::MAX { 0 } else { handle }}), session)
+            }
+            "DOM.querySelectorAll" => {
+                let Some(target) = self.targets.get_mut(&target_id) else {
+                    return cdp_error_response(&request.id, -32000, "target is not known", session);
+                };
+                let selector = request.params.get("selector").and_then(Value::as_str).unwrap_or("");
+                let root = request.params.get("nodeId").and_then(Value::as_u64).unwrap_or(u64::from(target.document_handle));
+                let result = if root == u64::from(target.document_handle) {
+                    target.core.dom_op("query_selector_all", selector, "")
+                } else {
+                    target.core.dom_op("query_selector_all_scoped", &root.to_string(), selector)
+                };
+                let node_ids = match result {
+                    Ok(value) => serde_json::from_str::<Vec<u32>>(&value).unwrap_or_default(),
+                    Err(_) => return cdp_error_response(&request.id, -32000, "DOM selector failed", session),
+                };
+                cdp_result_response(&request.id, json!({"nodeIds": node_ids}), session)
+            }
+            "DOM.getOuterHTML" => {
+                let Some(target) = self.targets.get_mut(&target_id) else {
+                    return cdp_error_response(&request.id, -32000, "target is not known", session);
+                };
+                let node_id = request.params.get("nodeId").and_then(Value::as_u64).unwrap_or(0);
+                let raw = match target.core.dom_op("outer_html", &node_id.to_string(), "") {
+                    Ok(value) => value,
+                    Err(_) => return cdp_error_response(&request.id, -32000, "DOM node is not known", session),
+                };
+                let html = serde_json::from_str::<String>(&raw).unwrap_or(raw);
+                cdp_result_response(&request.id, json!({"outerHTML": html}), session)
+            }
+            "DOM.getAttributes" => {
+                let Some(target) = self.targets.get_mut(&target_id) else {
+                    return cdp_error_response(&request.id, -32000, "target is not known", session);
+                };
+                let node_id = request.params.get("nodeId").and_then(Value::as_u64).unwrap_or(0);
+                let names = match target.core.dom_op("attribute_names", &node_id.to_string(), "") {
+                    Ok(value) => serde_json::from_str::<Vec<String>>(&value).unwrap_or_default(),
+                    Err(_) => return cdp_error_response(&request.id, -32000, "DOM node is not known", session),
+                };
+                let mut attributes = Vec::with_capacity(names.len().saturating_mul(2));
+                for name in names {
+                    let value = target
+                        .core
+                        .dom_op("get_attribute", &node_id.to_string(), &name)
+                        .ok()
+                        .and_then(|raw| serde_json::from_str::<Option<String>>(&raw).ok().flatten())
+                        .unwrap_or_default();
+                    attributes.push(Value::String(name));
+                    attributes.push(Value::String(value));
+                }
+                cdp_result_response(&request.id, json!({"attributes": attributes}), session)
+            }
+            "DOM.describeNode" => {
+                let Some(target) = self.targets.get_mut(&target_id) else {
+                    return cdp_error_response(&request.id, -32000, "target is not known", session);
+                };
+                let node_id = request.params.get("nodeId").and_then(Value::as_u64).unwrap_or(u64::from(target.document_handle));
+                let depth = request.params.get("depth").and_then(Value::as_i64).unwrap_or(1);
+                let max_depth = if depth < 0 { 64 } else { usize::try_from(depth).unwrap_or(1).min(64) };
+                let node = match describe_node(&mut target.core, u32::try_from(node_id).unwrap_or(0), max_depth, 0) {
+                    Ok(node) => node,
+                    Err(error) => return cdp_error_response(&request.id, -32000, error, session),
+                };
+                cdp_result_response(&request.id, json!({"node": node}), session)
+            }
+            "DOM.requestChildNodes" => {
+                let Some(target) = self.targets.get_mut(&target_id) else {
+                    return cdp_error_response(&request.id, -32000, "target is not known", session);
+                };
+                let node_id = request.params.get("nodeId").and_then(Value::as_u64).unwrap_or(0);
+                let children = match describe_children(&mut target.core, u32::try_from(node_id).unwrap_or(0), 1, 0) {
+                    Ok(children) => children,
+                    Err(error) => return cdp_error_response(&request.id, -32000, error, session),
+                };
+                if let Some(connection) = self.connections.get_mut(&connection_id) {
+                    queue_event(connection, "DOM.setChildNodes", json!({"parentId": node_id, "nodes": children}), session);
+                }
+                cdp_result_response(&request.id, json!({}), session)
+            }
+            "Page.setDocumentContent" => self.queue_action(connection_id, request.clone(), target_id, "setDocumentContent", json!({
+                "html": request.params.get("html").and_then(Value::as_str).unwrap_or(""),
+            })),
             "Page.navigate" => self.queue_action(connection_id, request.clone(), target_id, "navigate", json!({
                 "url": request.params.get("url").and_then(Value::as_str).unwrap_or("about:blank"),
                 "method": request.params.get("referrer").and_then(Value::as_str).unwrap_or("GET"),
@@ -801,6 +913,112 @@ impl PortableCdp {
     }
 }
 
+const MAX_DESCRIBED_NODES: usize = 4096;
+
+fn describe_children(
+    core: &mut ObscuraCore,
+    node_id: u32,
+    depth: usize,
+    seen: usize,
+) -> Result<Vec<Value>, String> {
+    if seen >= MAX_DESCRIBED_NODES {
+        return Err("DOM description exceeds the node limit".to_string());
+    }
+    let raw = core
+        .dom_op("child_nodes", &node_id.to_string(), "")
+        .map_err(|_| "DOM node is not known".to_string())?;
+    let ids = serde_json::from_str::<Vec<u32>>(&raw)
+        .map_err(|_| "DOM child node response is invalid".to_string())?;
+    ids.into_iter()
+        .enumerate()
+        .map(|(index, child)| describe_node(core, child, depth, seen.saturating_add(index)))
+        .collect()
+}
+
+fn describe_node(
+    core: &mut ObscuraCore,
+    node_id: u32,
+    depth: usize,
+    seen: usize,
+) -> Result<Value, String> {
+    if node_id == 0 || seen >= MAX_DESCRIBED_NODES {
+        return Err("DOM node description limit exceeded".to_string());
+    }
+    let handle = node_id.to_string();
+    let node_type = core
+        .dom_op("node_type", &handle, "")
+        .map_err(|_| "DOM node is not known".to_string())?
+        .parse::<u32>()
+        .unwrap_or(0);
+    if node_type == 0 {
+        return Err("DOM node is not known".to_string());
+    }
+    let node_name_command = if node_type == 1 { "tag_name" } else { "node_name" };
+    let node_name = core
+        .dom_op(node_name_command, &handle, "")
+        .map_err(|_| "DOM node name is unavailable".to_string())
+        .and_then(|value| serde_json::from_str::<String>(&value).map_err(|_| "DOM node name is invalid".to_string()))?;
+    let local_name = core
+        .dom_op("local_name", &handle, "")
+        .ok()
+        .and_then(|value| serde_json::from_str::<String>(&value).ok())
+        .unwrap_or_default();
+    let node_value = if matches!(node_type, 3 | 7 | 8) {
+        core.dom_op("text_content", &handle, "")
+            .ok()
+            .and_then(|value| serde_json::from_str::<String>(&value).ok())
+            .unwrap_or_default()
+    } else {
+        String::new()
+    };
+    let mut node = json!({
+        "nodeId": node_id,
+        "backendNodeId": node_id,
+        "nodeType": node_type,
+        "nodeName": node_name,
+        "localName": local_name,
+        "nodeValue": node_value,
+        "childNodeCount": 0,
+    });
+    if node_type == 1 {
+        let attributes = core
+            .dom_op("attribute_names", &handle, "")
+            .ok()
+            .and_then(|value| serde_json::from_str::<Vec<String>>(&value).ok())
+            .unwrap_or_default();
+        let mut flat = Vec::with_capacity(attributes.len().saturating_mul(2));
+        for name in attributes {
+            let value = core
+                .dom_op("get_attribute", &handle, &name)
+                .ok()
+                .and_then(|value| serde_json::from_str::<Option<String>>(&value).ok().flatten())
+                .unwrap_or_default();
+            flat.push(Value::String(name));
+            flat.push(Value::String(value));
+        }
+        if let Value::Object(ref mut object) = node {
+            object.insert("attributes".to_string(), Value::Array(flat));
+        }
+    }
+    let child_count = core
+        .dom_op("child_nodes", &handle, "")
+        .ok()
+        .and_then(|value| serde_json::from_str::<Vec<u32>>(&value).ok())
+        .map(|children| children.len())
+        .unwrap_or(0);
+    if let Value::Object(ref mut object) = node {
+        object.insert("childNodeCount".to_string(), json!(child_count));
+    }
+    if depth > 0 {
+        let children = describe_children(core, node_id, depth.saturating_sub(1), seen.saturating_add(1))?;
+        if let Value::Object(ref mut object) = node {
+            object.insert("childNodeCount".to_string(), json!(children.len()));
+            object.insert("children".to_string(), Value::Array(children));
+        }
+    }
+    Ok(node)
+}
+
 fn queue_event(connection: &mut Connection, method: &str, params: Value, session_id: Option<&str>) {
     if connection.events.len() >= MAX_EVENT_QUEUE {
         connection.events.pop_front();
@@ -897,6 +1115,50 @@ mod tests {
         assert_eq!(failed["error"]["code"], -32001);
         assert_eq!(failed["error"]["message"], "host timeout");
         assert_eq!(failed["error"]["data"]["retryable"], true);
+    }
+
+    #[test]
+    fn portable_dom_commands_read_the_wasm_document_tree() {
+        let mut cdp = PortableCdp::new(
+            "<!doctype html><html><body><h1 id=title>Portable</h1></body></html>",
+        )
+        .unwrap();
+        let connection = cdp.open_connection().unwrap();
+        let attached = json(&cdp.cdp_request(
+            connection,
+            r#"{"id":1,"method":"Target.attachToTarget","params":{"targetId":"page-1"}}"#,
+        ).unwrap());
+        let session = attached["result"]["sessionId"].as_str().unwrap().to_string();
+        cdp.poll_cdp_events(connection, 8).unwrap();
+
+        let document = json(&cdp.cdp_request(
+            connection,
+            &format!(r#"{{"id":2,"sessionId":"{session}","method":"DOM.getDocument","params":{{"depth":-1}}}}"#),
+        ).unwrap());
+        assert_eq!(document["result"]["root"]["nodeType"], 9);
+        assert_eq!(document["result"]["root"]["children"][0]["nodeName"], "html");
+        assert!(document["result"]["root"]["children"][0]["children"].as_array().is_some());
+
+        let selected = json(&cdp.cdp_request(
+            connection,
+            &format!(r##"{{"id":3,"sessionId":"{session}","method":"DOM.querySelector","params":{{"nodeId":{},"selector":"#title"}}}}"##, cdp.targets["page-1"].document_handle),
+        ).unwrap());
+        let node_id = selected["result"]["nodeId"].as_u64().unwrap();
+        assert!(node_id > 0);
+        let html = json(&cdp.cdp_request(
+            connection,
+            &format!(r#"{{"id":4,"sessionId":"{session}","method":"DOM.getOuterHTML","params":{{"nodeId":{node_id}}}}}"#),
+        ).unwrap());
+        assert_eq!(html["result"]["outerHTML"], "<h1 id=\"title\">Portable</h1>");
+
+        cdp.cdp_request(
+            connection,
+            &format!(r#"{{"id":5,"sessionId":"{session}","method":"DOM.requestChildNodes","params":{{"nodeId":{node_id}}}}}"#),
+        )
+        .unwrap();
+        let events = json(&cdp.poll_cdp_events(connection, 8).unwrap());
+        assert_eq!(events[0]["method"], "DOM.setChildNodes");
+        assert_eq!(events[0]["params"]["parentId"], node_id);
     }
 
     #[test]

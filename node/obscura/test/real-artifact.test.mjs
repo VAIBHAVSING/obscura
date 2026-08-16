@@ -23,6 +23,26 @@ test("real WASM artifact is reachable through package CDP", { skip: !modulePath 
       returnByValue: true,
     }, sessionId);
     assert.equal(evaluated.result.value, "Portable");
+    const document = await client.command("DOM.getDocument", { depth: -1 }, sessionId);
+    assert.equal(document.root.nodeType, 9);
+    const htmlNode = await client.command("DOM.querySelector", { nodeId: document.root.nodeId, selector: "h1" }, sessionId);
+    assert.ok(htmlNode.nodeId > 0);
+    const outer = await client.command("DOM.getOuterHTML", { nodeId: htmlNode.nodeId }, sessionId);
+    assert.equal(outer.outerHTML, '<h1>Portable</h1>');
+    const childEvents = [];
+    const unsubscribe = client.onEvent((event) => {
+      if (event.method === "DOM.setChildNodes") childEvents.push(event);
+    });
+    await client.command("DOM.requestChildNodes", { nodeId: htmlNode.nodeId }, sessionId);
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    unsubscribe();
+    assert.equal(childEvents.at(-1)?.params.parentId, htmlNode.nodeId);
+    await client.command("Page.setDocumentContent", {
+      html: "<html><body><p id=next>Next</p></body></html>",
+    }, sessionId);
+    const replaced = await client.command("DOM.getDocument", { depth: -1 }, sessionId);
+    const paragraph = await client.command("DOM.querySelector", { nodeId: replaced.root.nodeId, selector: "#next" }, sessionId);
+    assert.ok(paragraph.nodeId > 0);
     const screenshot = await client.command("Page.captureScreenshot", {}, sessionId);
     assert.deepEqual(Buffer.from(screenshot.data, "base64").subarray(0, 8), Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]));
     const pdf = await client.command("Page.printToPDF", {}, sessionId);

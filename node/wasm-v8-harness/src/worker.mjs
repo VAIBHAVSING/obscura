@@ -1673,6 +1673,10 @@ async function replaceBridgeCore(html, documentMetadata) {
     }
     throw error;
   }
+  // The portable CDP object is an independent state owner. Replacing the
+  // page's host DOM realm must not invalidate an in-flight CDP action; its
+  // target state is synchronized explicitly by completeAction below.
+  const savedPortableCdpCore = portableCdpCore;
   try {
     await disposeBridgeCore();
   } catch (error) {
@@ -1683,6 +1687,7 @@ async function replaceBridgeCore(html, documentMetadata) {
     }
     throw error;
   }
+  portableCdpCore = savedPortableCdpCore;
   bridgeCore = next;
   bridgeGeneration += 1;
   bridgeTaskLastStatus = null;

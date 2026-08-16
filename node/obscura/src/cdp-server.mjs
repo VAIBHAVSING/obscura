@@ -115,6 +115,24 @@ function frameTree(target) {
   };
 }
 
+function rewritePortableTargetIds(value, internalTargetId, externalTargetId) {
+  if (Array.isArray(value)) {
+    for (const item of value) rewritePortableTargetIds(item, internalTargetId, externalTargetId);
+    return value;
+  }
+  if (!value || typeof value !== "object") return value;
+  for (const [key, child] of Object.entries(value)) {
+    if (["id", "targetId", "frameId", "parentFrameId", "openerId"].includes(key) && child === internalTargetId) {
+      value[key] = externalTargetId;
+    } else if (key === "uniqueId" && typeof child === "string" && child.startsWith(`${internalTargetId}:`)) {
+      value[key] = `${externalTargetId}${child.slice(internalTargetId.length)}`;
+    } else {
+      rewritePortableTargetIds(child, internalTargetId, externalTargetId);
+    }
+  }
+  return value;
+}
+
 function normalizeRemote(value, target, returnByValue = false) {
   if (value === undefined) return { type: "undefined" };
   if (value === null) return { type: "object", subtype: "null", value: null };
@@ -355,7 +373,21 @@ class PageTarget {
 
   async dom(command, arg1 = "", arg2 = "") {
     await this.start();
-    return this.worker.bridgeDomOp(command, arg1, arg2, { requestTimeoutMs: this.server.requestTimeoutMs });
+    const result = await this.worker.bridgeDomOp(command, arg1, arg2, { requestTimeoutMs: this.server.requestTimeoutMs });
+    return result && typeof result === "object" && Object.hasOwn(result, "result") ? result.result : result;
+  }
+
+  async portableCdpHtml() {
+    const documentElement = await this.dom("document_element");
+    if (typeof documentElement !== "string" || documentElement === "-1" || documentElement === "null") return "";
+    const wire = await this.dom("outer_html", documentElement);
+    if (typeof wire !== "string") return "";
+    try {
+      const html = JSON.parse(wire);
+      return typeof html === "string" ? html : "";
+    } catch {
+      return wire;
+    }
   }
 
   async status() {
@@ -375,10 +407,16 @@ class PageTarget {
       if (abi !== 1) return null;
       let coreConnectionId;
       try {
-        coreConnectionId = await this.worker.portableCdpOpen({ requestTimeoutMs: this.server.requestTimeoutMs });
+        let html = "";
+        try { html = await this.portableCdpHtml(); } catch {}
+        coreConnectionId = await this.worker.portableCdpOpen({ html, requestTimeoutMs: this.server.requestTimeoutMs });
         const attached = await this.worker.portableCdpRequest(
           coreConnectionId,
-          JSON.stringify({ id: 0, method: "Target.attachToTarget", params: { targetId: this.id, flatten: true } }),
+          // Each PageTarget owns one WASM worker, whose initial portable target
+          // is page-1. The package-level target id is intentionally mapped at
+          // this adapter boundary rather than leaking host ids into the WASM
+          // state ABI.
+          JSON.stringify({ id: 0, method: "Target.attachToTarget", params: { targetId: "page-1", flatten: true } }),
           { requestTimeoutMs: this.server.requestTimeoutMs },
         );
         if (attached?.error || typeof attached?.result?.sessionId !== "string") {
@@ -400,13 +438,17 @@ class PageTarget {
       { requestTimeoutMs: this.server.requestTimeoutMs },
     );
     if (response?.error?.code === -32601 || response?.error?.code === -32602) return null;
-    if (response && typeof response === "object") response.sessionId = command.sessionId;
+    if (response && typeof response === "object") {
+      response.sessionId = command.sessionId;
+      rewritePortableTargetIds(response, "page-1", this.frameId);
+    }
     let events = [];
     try {
       events = await this.worker.portableCdpPoll(record.connectionId, 512, { requestTimeoutMs: this.server.requestTimeoutMs });
       if (!Array.isArray(events)) events = [];
       for (const event of events) {
         if (typeof event?.sessionId === "string") event.sessionId = command.sessionId;
+        rewritePortableTargetIds(event, "page-1", this.frameId);
       }
     } catch {}
     return { record, response, events };
@@ -760,8 +802,15 @@ export class ObscuraCdpServer {
       "Page.enable",
       "Page.getFrameTree",
       "DOM.getDocument",
+      "DOM.querySelector",
+      "DOM.querySelectorAll",
+      "DOM.getOuterHTML",
+      "DOM.getAttributes",
+      "DOM.describeNode",
+      "DOM.requestChildNodes",
       "Runtime.evaluate",
       "Page.navigate",
+      "Page.setDocumentContent",
       "Page.captureScreenshot",
       "Page.printToPDF",
     ]).has(method)) {
@@ -785,9 +834,11 @@ export class ObscuraCdpServer {
       hostResult = { error: { code: Number.isInteger(error?.code) ? error.code : -32603, message: error?.message ?? "Portable host action failed" } };
     }
     let completion = hostResult;
-    if (method === "Page.navigate") {
+    if (method === "Page.navigate" || method === "Page.setDocumentContent") {
       let page = {};
       try { page = (await target.status()).page ?? {}; } catch {}
+      let html = "";
+      try { html = await target.portableCdpHtml(); } catch {}
       completion = {
         ...hostResult,
         __obscuraState: {
@@ -796,6 +847,7 @@ export class ObscuraCdpServer {
           title: target.title,
           documentHandle: page.documentHandle,
           revision: page.revision,
+          html,
         },
       };
     }
