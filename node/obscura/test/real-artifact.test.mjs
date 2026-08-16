@@ -67,6 +67,19 @@ test("real WASM artifact is reachable through package CDP", { skip: !modulePath 
     await client.command("Page.navigate", {
       url: "data:text/html,<html><body><h1>Portable</h1></body></html>",
     }, sessionId);
+    await client.command("Runtime.evaluate", {
+      expression: "globalThis.__portableClicks = 0; document.body.addEventListener('click', () => { globalThis.__portableClicks += 1; });",
+    }, sessionId);
+    await client.command("Input.dispatchMouseEvent", { type: "mousePressed", x: 1, y: 1, button: "left", buttons: 1 }, sessionId);
+    await client.command("Input.dispatchMouseEvent", { type: "mouseReleased", x: 1, y: 1, button: "left", buttons: 0 }, sessionId);
+    const clickCount = await client.command("Runtime.evaluate", { expression: "globalThis.__portableClicks", returnByValue: true }, sessionId);
+    assert.equal(clickCount.result.value, 1);
+    await client.command("Runtime.evaluate", {
+      expression: "globalThis.__portableKeys = 0; document.body.addEventListener('keydown', () => { globalThis.__portableKeys += 1; });",
+    }, sessionId);
+    await client.command("Input.dispatchKeyEvent", { type: "keyDown", key: "a", code: "KeyA" }, sessionId);
+    const keyCount = await client.command("Runtime.evaluate", { expression: "globalThis.__portableKeys", returnByValue: true }, sessionId);
+    assert.equal(keyCount.result.value, 1);
     const document = await client.command("DOM.getDocument", { depth: -1 }, sessionId);
     assert.equal(document.root.nodeType, 9);
     const htmlNode = await client.command("DOM.querySelector", { nodeId: document.root.nodeId, selector: "h1" }, sessionId);

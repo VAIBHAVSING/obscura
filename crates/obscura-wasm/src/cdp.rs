@@ -905,6 +905,27 @@ impl PortableCdp {
                 "getIsolateId",
                 Value::Object(request.params.clone()),
             ),
+            "Input.dispatchMouseEvent" => self.queue_action(
+                connection_id,
+                request.clone(),
+                target_id,
+                "dispatchMouseEvent",
+                Value::Object(request.params.clone()),
+            ),
+            "Input.dispatchKeyEvent" => self.queue_action(
+                connection_id,
+                request.clone(),
+                target_id,
+                "dispatchKeyEvent",
+                Value::Object(request.params.clone()),
+            ),
+            "Input.insertText" => self.queue_action(
+                connection_id,
+                request.clone(),
+                target_id,
+                "insertText",
+                Value::Object(request.params.clone()),
+            ),
             "Page.captureScreenshot" => self.queue_action(connection_id, request.clone(), target_id, "screenshot", json!({
                 "format": request.params.get("format").and_then(Value::as_str).unwrap_or("png"),
             })),

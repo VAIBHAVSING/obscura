@@ -849,6 +849,9 @@ export class ObscuraCdpServer {
       "Runtime.releaseObjectGroup",
       "Runtime.getProperties",
       "Runtime.getIsolateId",
+      "Input.dispatchMouseEvent",
+      "Input.dispatchKeyEvent",
+      "Input.insertText",
       "Page.navigate",
       "Page.reload",
       "Page.setDocumentContent",
@@ -1109,6 +1112,76 @@ export class ObscuraCdpServer {
         await target.worker.bootstrapEvaluate("undefined", { html: params.html, documentMetadata: { url: target.url, referrer: "", encoding: "UTF-8" } });
         target.remoteObjects.clear();
         return {};
+      case "Input.dispatchMouseEvent": {
+        const eventTypes = { mousePressed: "mousedown", mouseReleased: "mouseup", mouseMoved: "mousemove", mouseWheel: "wheel" };
+        const eventType = eventTypes[params.type];
+        if (!eventType) throw cdpError(-32602, "Unsupported mouse event type");
+        const button = params.button === "right" ? 2 : params.button === "middle" ? 1 : params.button === "back" ? 3 : params.button === "forward" ? 4 : 0;
+        const payload = {
+          type: params.type,
+          eventType,
+          x: Number.isFinite(params.x) ? params.x : 0,
+          y: Number.isFinite(params.y) ? params.y : 0,
+          button,
+          buttons: Number.isFinite(params.buttons) ? params.buttons : 0,
+          click: params.type === "mouseReleased" && button === 0,
+          deltaX: Number.isFinite(params.deltaX) ? params.deltaX : 0,
+          deltaY: Number.isFinite(params.deltaY) ? params.deltaY : 0,
+          ctrlKey: Boolean(params.modifiers & 2),
+          altKey: Boolean(params.modifiers & 1),
+          shiftKey: Boolean(params.modifiers & 8),
+          metaKey: Boolean(params.modifiers & 4),
+        };
+        const encoded = jsonBytes(payload, "mouse event");
+        await target.evaluate(`(function(p){
+          const el = (document.elementFromPoint?.(p.x, p.y) || document.body || document.documentElement);
+          if (!el) return false;
+          try { if (p.type === "mousePressed" && typeof el.focus === "function") el.focus(); } catch {}
+          const Ctor = p.eventType === "wheel" ? globalThis.WheelEvent : globalThis.MouseEvent;
+          if (typeof Ctor !== "function") return false;
+          const options = { bubbles: true, cancelable: true, clientX: p.x, clientY: p.y, button: p.button, buttons: p.buttons, ctrlKey: p.ctrlKey, altKey: p.altKey, shiftKey: p.shiftKey, metaKey: p.metaKey, deltaX: p.deltaX, deltaY: p.deltaY };
+          el.dispatchEvent(new Ctor(p.eventType, options));
+          if (p.click) el.dispatchEvent(new globalThis.MouseEvent("click", options));
+          return true;
+        })(${encoded})`, { timeoutMs: this.server.evaluateTimeoutMs });
+        return {};
+      }
+      case "Input.dispatchKeyEvent": {
+        const eventTypes = { keyDown: "keydown", rawKeyDown: "keydown", keyUp: "keyup", char: "keypress" };
+        const eventType = eventTypes[params.type];
+        if (!eventType) throw cdpError(-32602, "Unsupported key event type");
+        const payload = {
+          eventType,
+          key: typeof params.key === "string" ? params.key.slice(0, 256) : "",
+          code: typeof params.code === "string" ? params.code.slice(0, 256) : "",
+          text: typeof params.text === "string" ? params.text.slice(0, 4096) : "",
+          location: Number.isFinite(params.location) ? params.location : 0,
+          ctrlKey: Boolean(params.modifiers & 2),
+          altKey: Boolean(params.modifiers & 1),
+          shiftKey: Boolean(params.modifiers & 8),
+          metaKey: Boolean(params.modifiers & 4),
+          repeat: Boolean(params.autoRepeat),
+        };
+        const encoded = jsonBytes(payload, "key event");
+        await target.evaluate(`(function(p){
+          const el = document.activeElement || document.body || document.documentElement;
+          if (!el || typeof globalThis.KeyboardEvent !== "function") return false;
+          return el.dispatchEvent(new globalThis.KeyboardEvent(p.eventType, { bubbles: true, cancelable: true, key: p.key, code: p.code, location: p.location, ctrlKey: p.ctrlKey, altKey: p.altKey, shiftKey: p.shiftKey, metaKey: p.metaKey, repeat: p.repeat }));
+        })(${encoded})`, { timeoutMs: this.server.evaluateTimeoutMs });
+        return {};
+      }
+      case "Input.insertText": {
+        if (typeof params.text !== "string" || Buffer.byteLength(params.text) > 64 * 1024) throw cdpError(-32602, "Input.insertText requires bounded text");
+        const encoded = jsonBytes({ text: params.text }, "insert text");
+        await target.evaluate(`(function(p){
+          const el = document.activeElement || document.body || document.documentElement;
+          if (!el) return false;
+          if (typeof el.value === "string") el.value += p.text;
+          if (typeof globalThis.InputEvent === "function") el.dispatchEvent(new globalThis.InputEvent("input", { bubbles: true, data: p.text, inputType: "insertText" }));
+          return true;
+        })(${encoded})`, { timeoutMs: this.server.evaluateTimeoutMs });
+        return {};
+      }
       case "Page.getFrameTree":
         return frameTree(target);
       case "Page.getNavigationHistory":
