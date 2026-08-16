@@ -410,6 +410,10 @@ let bridgeCapabilityProbePromise;
 let portablePlatformOp;
 let bridgeTaskHost;
 let bridgeTaskLastStatus = null;
+let bootstrapRuntime;
+let nextBootstrapFetchId = 1;
+const bootstrapFetches = new Map();
+let activeAllowPrivateNetwork = false;
 let enqueueSerializedWork;
 let shuttingDown = false;
 
@@ -1413,6 +1417,9 @@ function installDocumentFacade() {
 async function disposeBridgeCore() {
   const core = bridgeCore;
   bridgeCore = null;
+  cancelBootstrapFetches();
+  bootstrapRuntime = null;
+  activeAllowPrivateNetwork = false;
   bridgeDocumentHandle = null;
   bridgePageRevision = null;
   if (bridgeTaskHost) {
@@ -1518,6 +1525,8 @@ async function replaceBridgeCore(html, documentMetadata) {
 }
 
 function resetBridgeRealmAfterNavigation() {
+  cancelBootstrapFetches();
+  bootstrapRuntime = null;
   if (bridgeTaskHost) {
     bridgeTaskHost.close();
     bridgeTaskLastStatus = bridgeTaskHost.status();
@@ -1534,6 +1543,13 @@ function resetBridgeRealmAfterNavigation() {
       bridgePageRevision = identity.revision;
     }
   }
+}
+
+function cancelBootstrapFetches() {
+  for (const { controller } of bootstrapFetches.values()) {
+    try { controller.abort(new Error("page realm was reset")); } catch {}
+  }
+  bootstrapFetches.clear();
 }
 
 function validateNavigationUrl(value, allowPrivateNetwork = false) {
@@ -1625,7 +1641,7 @@ function decodeWireString(value, label) {
   return decoded;
 }
 
-async function readBoundedResponseBytes(response) {
+async function readBoundedResponseBytes(response, maxBytes = MAX_SCRIPT_SOURCE_BYTES) {
   if (!response.body) return new Uint8Array();
   const reader = response.body.getReader();
   const chunks = [];
@@ -1636,8 +1652,8 @@ async function readBoundedResponseBytes(response) {
       if (done) break;
       const chunk = value instanceof Uint8Array ? value : new Uint8Array(value);
       total += chunk.byteLength;
-      if (total > MAX_SCRIPT_SOURCE_BYTES) {
-        throw new RangeError(`script source exceeds the ${MAX_SCRIPT_SOURCE_BYTES}-byte limit`);
+      if (total > maxBytes) {
+        throw new RangeError(`response exceeds the ${maxBytes}-byte limit`);
       }
       chunks.push(chunk);
     }
@@ -1651,6 +1667,101 @@ async function readBoundedResponseBytes(response) {
     offset += chunk.byteLength;
   }
   return result;
+}
+
+function binaryStringToBytes(value) {
+  if (typeof value !== "string") throw new TypeError("fetch body must be a string");
+  requireBoundedString(value, MAX_NAVIGATION_RESPONSE_BYTES, "fetch request body");
+  const bytes = new Uint8Array(value.length);
+  for (let index = 0; index < value.length; index += 1) bytes[index] = value.charCodeAt(index) & 0xff;
+  return bytes;
+}
+
+function bootstrapFetchResolution(id, envelope) {
+  const record = bootstrapFetches.get(id);
+  if (!record) return;
+  bootstrapFetches.delete(id);
+  if (record.generation !== bridgeGeneration || record.runtime !== bootstrapRuntime) return;
+  const serialized = JSON.stringify(envelope);
+  if (typeof enqueueSerializedWork !== "function") return;
+  void enqueueSerializedWork(() => record.runtime.resolveFetch(id, serialized, 1_000));
+}
+
+function startBootstrapFetch(url, method, headersJson, body, pageOrigin, mode, credentials) {
+  const id = nextBootstrapFetchId;
+  nextBootstrapFetchId += 1;
+  if (nextBootstrapFetchId > 0xffff_ffff) nextBootstrapFetchId = 1;
+  if (!bootstrapRuntime) throw new Error("Portable bootstrap network runtime is not ready");
+  requireBoundedString(url, MAX_NAVIGATION_URL_BYTES, "fetch URL");
+  requireBoundedString(method, 32, "fetch method");
+  requireBoundedString(headersJson, MAX_NAVIGATION_HEADERS_BYTES, "fetch headers");
+  requireBoundedString(pageOrigin, MAX_NAVIGATION_URL_BYTES, "fetch page origin");
+  requireBoundedString(mode, 32, "fetch mode");
+  requireBoundedString(credentials, 32, "fetch credentials");
+  const targetUrl = validateNavigationUrl(url, activeAllowPrivateNetwork);
+  let headers;
+  try { headers = JSON.parse(headersJson); } catch { throw new TypeError("fetch headers must be valid JSON"); }
+  if (headers === null || typeof headers !== "object" || Array.isArray(headers)) {
+    throw new TypeError("fetch headers must be a JSON object");
+  }
+  for (const [name, value] of Object.entries(headers)) {
+    if (typeof value !== "string") throw new TypeError(`fetch header ${name} must be a string`);
+    requireBoundedString(name, 1024, "fetch header name");
+    requireBoundedString(value, MAX_NAVIGATION_HEADERS_BYTES, "fetch header value");
+  }
+  const controller = new AbortController();
+  const record = { controller, runtime: bootstrapRuntime, generation: bridgeGeneration };
+  bootstrapFetches.set(id, record);
+  void (async () => {
+    try {
+      const response = await fetch(targetUrl, {
+        method,
+        headers,
+        body: method === "GET" || method === "HEAD" ? undefined : binaryStringToBytes(body),
+        redirect: "follow",
+        signal: controller.signal,
+      });
+      const { headers: responseHeaders } = responseHeadersObject(response);
+      const sameOrigin = (() => {
+        try { return new URL(pageOrigin).origin === new URL(response.url || targetUrl).origin; } catch { return false; }
+      })();
+      if (mode === "cors" && !sameOrigin) {
+        const allowedOrigin = responseHeaders["access-control-allow-origin"];
+        const allowedCredentials = responseHeaders["access-control-allow-credentials"]?.toLowerCase() === "true";
+        if ((allowedOrigin !== "*" && allowedOrigin !== pageOrigin) ||
+            (credentials === "include" && !allowedCredentials)) {
+          try { await response.body?.cancel(); } catch {}
+          bootstrapFetchResolution(id, { ok: true, value: JSON.stringify({ corsBlocked: true, corsError: "CORS policy blocked the response" }) });
+          return;
+        }
+      }
+      if (mode === "no-cors" && !sameOrigin) {
+        try { await response.body?.cancel(); } catch {}
+        bootstrapFetchResolution(id, { ok: true, value: JSON.stringify({ blocked: false, corsBlocked: false, status: 0, headers: {}, body: "", url: "", redirected: false }) });
+        return;
+      }
+      const bytes = await readBoundedResponseBytes(response, MAX_NAVIGATION_RESPONSE_BYTES);
+      bootstrapFetchResolution(id, {
+        ok: true,
+        value: JSON.stringify({
+          blocked: false,
+          corsBlocked: false,
+          status: response.status,
+          headers: responseHeaders,
+          body: Buffer.from(bytes).toString("utf8"),
+          bodyBase64: Buffer.from(bytes).toString("base64"),
+          url: response.url || targetUrl.toString(),
+          redirected: response.redirected,
+        }),
+      });
+    } catch (error) {
+      bootstrapFetchResolution(id, {
+        ok: false,
+        error: { name: "TypeError", message: error?.name === "AbortError" ? "The fetch was aborted" : "Failed to fetch" },
+      });
+    }
+  })();
+  return id;
 }
 
 async function fetchClassicScript(url, requestTimeoutMs, allowPrivateNetwork) {
@@ -1773,8 +1884,8 @@ async function navigatePortable({ url, options = {}, allowPrivateNetwork = false
   if (!Number.isSafeInteger(maxRedirects) || maxRedirects < 0 || maxRedirects > MAX_NAVIGATION_REDIRECTS) {
     throw new RangeError(`maxRedirects must be between 0 and ${MAX_NAVIGATION_REDIRECTS}`);
   }
-
   if (!bridgeCore) await replaceBridgeCore("");
+  activeAllowPrivateNetwork = Boolean(allowPrivateNetwork);
   const api = bridgeApi();
   await requireNavigationCompatibility(api);
   let action = JSON.parse(syncCall(api.beginNavigation, url, JSON.stringify({ method, body, referrer, replaceHistory: Boolean(options.replaceHistory), maxRedirects })));
@@ -2255,8 +2366,10 @@ async function installBootstrapRealm(timeoutMs = 5_000) {
         domOperation(command, arg1, arg2, generation, documentHandle),
       opPlatform: platformOperation,
       opTask: (command, argument) => taskHost.operation(command, argument),
+      opFetch: (...args) => startBootstrapFetch(...args),
     });
     taskHost.attach(taskDispatcher);
+    bootstrapRuntime = taskDispatcher;
     bridgeTaskHost = taskHost;
     bridgeTaskLastStatus = null;
     bridgeRealmKind = "bootstrap";

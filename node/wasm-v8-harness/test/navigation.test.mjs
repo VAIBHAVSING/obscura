@@ -25,6 +25,11 @@ test("portable navigation owns redirects, document identity, history, and HTML c
       response.end("document.querySelector('h1').textContent = document.body.getAttribute('data-inline') === 'yes' ? 'script order ok' : 'script order bad';");
       return;
     }
+    if (request.url === "/api") {
+      response.writeHead(200, { "content-type": "application/json" });
+      response.end('{"answer":42}');
+      return;
+    }
     response.writeHead(404, { "content-type": "text/html" });
     response.end("<h1>missing</h1>");
   });
@@ -51,6 +56,12 @@ test("portable navigation owns redirects, document identity, history, and HTML c
     assert.deepEqual(page.scripts.executed.map(({ nid }) => nid).length, 2);
     assert.equal(await worker.bootstrapEvaluate("document.querySelector('title').textContent"), "portable navigation");
     assert.equal(await worker.bootstrapEvaluate("document.querySelector('h1').textContent"), "script order ok");
+    await worker.bootstrapEvaluate("globalThis.__fetchValue = null; fetch('/api').then((response) => response.text()).then((value) => { globalThis.__fetchValue = value; }); undefined");
+    await new Promise((resolve) => setTimeout(resolve, 100));
+    assert.equal(await worker.bootstrapEvaluate("globalThis.__fetchValue"), '{"answer":42}');
+    await worker.bootstrapEvaluate("globalThis.__fetchError = null; fetch('http://127.0.0.1:1/unreachable').catch((error) => { globalThis.__fetchError = error.name; }); undefined");
+    await new Promise((resolve) => setTimeout(resolve, 100));
+    assert.equal(await worker.bootstrapEvaluate("globalThis.__fetchError"), "TypeError");
 
     await assert.rejects(
       worker.navigate("http://127.0.0.1:1/blocked"),

@@ -5,8 +5,10 @@ import { translateTaskDispatchError } from "./task-runtime.mjs";
 
 const HOST_DOM_OP_BINDING = "__obscuraHostDomOpBridge__";
 const HOST_PLATFORM_OP_BINDING = "__obscuraHostPlatformOpBridge__";
+const HOST_FETCH_OP_BINDING = "__obscuraHostFetchOpBridge__";
 const HOST_TASK_OP_BINDING = "__obscuraHostTaskOpBridge__";
 const HOST_TASK_DISPATCH_SLOT_BINDING = "__obscuraHostTaskDispatchSlot__";
+const HOST_FETCH_DISPATCH_SLOT_BINDING = "__obscuraHostFetchDispatchSlot__";
 const DEFAULT_INSTALL_TIMEOUT_MS = 5_000;
 const MAX_VM_TIMEOUT_MS = 4_294_967_295;
 
@@ -106,8 +108,10 @@ const installDomBridgeScript = new vm.Script(
     "use strict";
     const hostDomOp = globalThis.${HOST_DOM_OP_BINDING};
     const hostPlatformOp = globalThis.${HOST_PLATFORM_OP_BINDING};
+    const hostFetchOp = globalThis.${HOST_FETCH_OP_BINDING};
     const hostTaskOp = globalThis.${HOST_TASK_OP_BINDING};
     const taskDispatchSlot = globalThis.${HOST_TASK_DISPATCH_SLOT_BINDING};
+    const fetchDispatchSlot = globalThis.${HOST_FETCH_DISPATCH_SLOT_BINDING};
     const safeApply = Reflect.apply;
     const safeCreate = Object.create;
     const safeJsonStringify = JSON.stringify;
@@ -124,12 +128,15 @@ const installDomBridgeScript = new vm.Script(
     const ContextURIError = URIError;
     const ContextString = String;
     const ContextNumber = Number;
+    const safeNumberIsSafeInteger = Number.isSafeInteger;
     const ContextPromise = Promise;
+    const safePromiseCatch = Promise.prototype.catch;
     const ContextUint8Array = Uint8Array;
     const ContextMap = Map;
     const safeMapGet = Map.prototype.get;
     const safeMapSet = Map.prototype.set;
     const safeMapDelete = Map.prototype.delete;
+    const safeJsonParse = JSON.parse;
     const BASE64 = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
     const MAX_PLATFORM_BINARY_BYTES = 8 * 1024 * 1024;
 
@@ -361,6 +368,52 @@ const installDomBridgeScript = new vm.Script(
       opSubtleAesGcm, opSubtleAesCbc, opSubtleAesCtr, opSubtlePbkdf2, opSubtleHkdf]
       .forEach(Object.freeze);
 
+    // Network completion crosses the Worker boundary through an opaque
+    // request ID. The page realm owns the Promise and resolver; the host ever
+    // receives only primitive request strings and later injects one JSON text
+    // envelope through the fetch dispatcher slot.
+    const fetchEntries = new ContextMap();
+    const opFetchUrl = function op_fetch_url(url, method, headers, body, pageOrigin, mode, credentials) {
+      const promise = new ContextPromise((resolve, reject) => {
+        try {
+          const id = safeApply(hostFetchOp, undefined, [
+            stringValue(url), stringValue(method), stringValue(headers), stringValue(body),
+            stringValue(pageOrigin), stringValue(mode), stringValue(credentials),
+          ]);
+          if (!safeNumberIsSafeInteger(id) || id < 1) {
+            throw new ContextTypeError("Obscura fetch bridge returned an invalid request id");
+          }
+          safeApply(safeMapSet, fetchEntries, [id, { resolve, reject }]);
+        } catch (error) {
+          reject(error);
+        }
+      });
+      // A browser reports an unhandled rejection to the page rather than
+      // terminating the Worker. Attach an internal no-op observer while still
+      // returning the original page-owned Promise to the caller.
+      safeApply(safePromiseCatch, promise, [() => undefined]);
+      return promise;
+    };
+    const resolveFetch = function resolveFetch(id, serialized) {
+      const entry = safeApply(safeMapGet, fetchEntries, [id]);
+      if (entry === undefined) return false;
+      safeApply(safeMapDelete, fetchEntries, [id]);
+      try {
+        const envelope = safeApply(safeJsonParse, undefined, [serialized]);
+        if (envelope?.ok === true && typeof envelope.value === "string") {
+          safeApply(entry.resolve, undefined, [envelope.value]);
+        } else if (envelope?.ok === false) {
+          safeApply(entry.reject, undefined, [translatedError(envelope.error)]);
+        } else {
+          safeApply(entry.reject, undefined, [new ContextTypeError("Obscura fetch bridge returned an invalid response")]);
+        }
+      } catch (error) {
+        safeApply(entry.reject, undefined, [error]);
+      }
+      return true;
+    };
+    [opFetchUrl, resolveFetch].forEach(Object.freeze);
+
     const taskEntries = new ContextMap();
     const callTaskHost = (command, argument) => {
       const response = safeApply(hostTaskOp, undefined, [command, argument]);
@@ -438,6 +491,7 @@ const installDomBridgeScript = new vm.Script(
       op_subtle_aes_ctr: { value: opSubtleAesCtr, enumerable: true },
       op_subtle_pbkdf2: { value: opSubtlePbkdf2, enumerable: true },
       op_subtle_hkdf: { value: opSubtleHkdf, enumerable: true },
+      op_fetch_url: { value: opFetchUrl, enumerable: true },
     });
     Object.freeze(ops);
 
@@ -460,6 +514,12 @@ const installDomBridgeScript = new vm.Script(
     });
     Object.defineProperty(globalThis, taskDispatchSlot, {
       value: dispatchTask,
+      writable: false,
+      enumerable: false,
+      configurable: true,
+    });
+    Object.defineProperty(globalThis, fetchDispatchSlot, {
+      value: resolveFetch,
       writable: false,
       enumerable: false,
       configurable: true,
@@ -565,12 +625,20 @@ export function compileBootstrapRuntime(source, { filename = "<obscura:bootstrap
   // code. The random identifier is compiled only into host-owned scripts.
   const secret = randomBytes(16).toString("hex");
   const dispatchLexical = `__obscuraTaskDispatch_${secret}`;
+  const fetchResolveLexical = `__obscuraFetchResolve_${secret}`;
   const dispatchSlot = `__obscuraTaskDispatchSlot_${secret}`;
+  const fetchDispatchSlot = `__obscuraFetchDispatchSlot_${secret}`;
   const dispatchIdSlot = `__obscuraTaskId_${secret}`;
+  const dispatchPayloadSlot = `__obscuraFetchPayload_${secret}`;
   const captureTaskDispatcherScript = new vm.Script(
     `const ${dispatchLexical} = globalThis[${JSON.stringify(dispatchSlot)}];\n` +
       `delete globalThis[${JSON.stringify(dispatchSlot)}];`,
     { filename: "obscura-portable-task-capture.js" },
+  );
+  const captureFetchResolverScript = new vm.Script(
+    `const ${fetchResolveLexical} = globalThis[${JSON.stringify(fetchDispatchSlot)}];\n` +
+      `delete globalThis[${JSON.stringify(fetchDispatchSlot)}];`,
+    { filename: "obscura-portable-fetch-capture.js" },
   );
   const dispatchTaskScript = new vm.Script(
     `(() => {\n` +
@@ -581,8 +649,19 @@ export function compileBootstrapRuntime(source, { filename = "<obscura:bootstrap
       `})()`,
     { filename: "obscura-portable-task-dispatch.js" },
   );
+  const dispatchFetchScript = new vm.Script(
+    `(() => {\n` +
+      `  "use strict";\n` +
+      `  const id = globalThis[${JSON.stringify(dispatchIdSlot)}];\n` +
+      `  const payload = globalThis[${JSON.stringify(dispatchPayloadSlot)}];\n` +
+      `  delete globalThis[${JSON.stringify(dispatchIdSlot)}];\n` +
+      `  delete globalThis[${JSON.stringify(dispatchPayloadSlot)}];\n` +
+      `  return ${fetchResolveLexical}(id, payload);\n` +
+      `})()`,
+    { filename: "obscura-portable-fetch-dispatch.js" },
+  );
   return Object.freeze({
-    install(context, { opDom, opPlatform, opTask, timeoutMs } = {}) {
+    install(context, { opDom, opPlatform, opTask, opFetch, timeoutMs } = {}) {
       if (!vm.isContext(context)) {
         throw new TypeError("Obscura bootstrap requires a Node vm context");
       }
@@ -594,6 +673,9 @@ export function compileBootstrapRuntime(source, { filename = "<obscura:bootstrap
       }
       if (typeof opTask !== "function") {
         throw new TypeError("Obscura bootstrap requires a synchronous task callback");
+      }
+      if (opFetch !== undefined && typeof opFetch !== "function") {
+        throw new TypeError("Obscura bootstrap fetch callback must be a function when supplied");
       }
       timeoutMs = vmTimeout(timeoutMs);
       if (Object.hasOwn(context, "Deno") || Object.hasOwn(context, "document")) {
@@ -619,6 +701,15 @@ export function compileBootstrapRuntime(source, { filename = "<obscura:bootstrap
         ),
         configurable: true,
       });
+      Object.defineProperty(context, HOST_FETCH_OP_BINDING, {
+        value: (...args) => {
+          if (typeof opFetch !== "function") {
+            throw new Error("Portable network fetch is not configured for this page realm");
+          }
+          return opFetch(...args);
+        },
+        configurable: true,
+      });
       Object.defineProperty(context, HOST_TASK_OP_BINDING, {
         value: (command, argument) => taskHostResponse(opTask, command, argument),
         configurable: true,
@@ -627,16 +718,23 @@ export function compileBootstrapRuntime(source, { filename = "<obscura:bootstrap
         value: dispatchSlot,
         configurable: true,
       });
+      Object.defineProperty(context, HOST_FETCH_DISPATCH_SLOT_BINDING, {
+        value: fetchDispatchSlot,
+        configurable: true,
+      });
       try {
         installDomBridgeScript.runInContext(context, { timeout: timeoutMs });
       } finally {
         Reflect.deleteProperty(context, HOST_DOM_OP_BINDING);
         Reflect.deleteProperty(context, HOST_PLATFORM_OP_BINDING);
+        Reflect.deleteProperty(context, HOST_FETCH_OP_BINDING);
         Reflect.deleteProperty(context, HOST_TASK_OP_BINDING);
         Reflect.deleteProperty(context, HOST_TASK_DISPATCH_SLOT_BINDING);
+        Reflect.deleteProperty(context, HOST_FETCH_DISPATCH_SLOT_BINDING);
       }
 
       captureTaskDispatcherScript.runInContext(context, { timeout: timeoutMs });
+      captureFetchResolverScript.runInContext(context, { timeout: timeoutMs });
 
       bootstrapScript.runInContext(context, { timeout: timeoutMs });
       initializePageScript.runInContext(context, { timeout: timeoutMs });
@@ -659,6 +757,33 @@ export function compileBootstrapRuntime(source, { filename = "<obscura:bootstrap
             throw translateTaskDispatchError(error, taskTimeoutMs);
           } finally {
             Reflect.deleteProperty(context, dispatchIdSlot);
+          }
+        },
+        resolveFetch(id, serialized, fetchTimeoutMs) {
+          if (!Number.isSafeInteger(id) || id < 1) {
+            throw new TypeError("Obscura fetch dispatch id must be a positive safe integer");
+          }
+          if (typeof serialized !== "string") {
+            throw new TypeError("Obscura fetch dispatch payload must be a string");
+          }
+          fetchTimeoutMs = vmTimeout(fetchTimeoutMs);
+          Object.defineProperty(context, dispatchIdSlot, {
+            value: id,
+            writable: false,
+            enumerable: false,
+            configurable: true,
+          });
+          Object.defineProperty(context, dispatchPayloadSlot, {
+            value: serialized,
+            writable: false,
+            enumerable: false,
+            configurable: true,
+          });
+          try {
+            return dispatchFetchScript.runInContext(context, { timeout: fetchTimeoutMs });
+          } finally {
+            Reflect.deleteProperty(context, dispatchIdSlot);
+            Reflect.deleteProperty(context, dispatchPayloadSlot);
           }
         },
       });
