@@ -35,6 +35,10 @@
 - The Node Worker now exposes bounded `portableCdpOpen`, `portableCdpRequest`,
   `portableCdpComplete`, `portableCdpPoll`, and `portableCdpClose` methods;
   the real generated wrapper test passed the full action round trip.
+- The package suite against a fresh `--features render` wrapper passed 6/6
+  runnable tests (one Playwright test skipped because no external
+  `playwright-core` path was supplied); a non-render wrapper is intentionally
+  rejected by the package's render capability gate.
 
 ## Remaining integration
 
