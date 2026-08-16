@@ -26,6 +26,9 @@ test("real WASM artifact is reachable through package CDP", { skip: !modulePath 
     await client.command("Page.navigate", {
       url: "data:text/html,<html><body><h1>Portable</h1></body></html>",
     }, sessionId);
+    const history = await client.command("Page.getNavigationHistory", {}, sessionId);
+    assert.equal(history.currentIndex, 0);
+    assert.equal(history.entries.at(-1).url, "data:text/html,<html><body><h1>Portable</h1></body></html>");
     const evaluated = await client.command("Runtime.evaluate", {
       expression: "document.querySelector('h1').textContent",
       returnByValue: true,

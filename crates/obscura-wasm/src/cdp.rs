@@ -299,7 +299,7 @@ impl PortableCdp {
         self.actions.remove(&action_id);
         let result: Value = serde_json::from_str(result_json)
             .map_err(|error| js_error(&format!("invalid CDP action result: {error}")))?;
-        if action.kind == "navigate" || action.kind == "setDocumentContent" {
+        if action.kind == "navigate" || action.kind == "reload" || action.kind == "setDocumentContent" {
             if let Some(target) = self.targets.get_mut(&action.target_id) {
                 if let Some(url) = result.get("url").and_then(Value::as_str) {
                     target.url = url.to_string();
@@ -709,6 +709,22 @@ impl PortableCdp {
                     "name": "",
                 }}}), session)
             }
+            "Page.getNavigationHistory" => {
+                let Some(target) = self.targets.get(&target_id) else {
+                    return cdp_error_response(&request.id, -32000, "target is not known", session);
+                };
+                cdp_result_response(&request.id, json!({
+                    "currentIndex": 0,
+                    "entries": [{
+                        "id": 1,
+                        "url": target.url,
+                        "userTypedURL": target.url,
+                        "title": target.title,
+                        "transitionType": "typed",
+                    }],
+                }), session)
+            }
+            "Page.resetNavigationHistory" => cdp_result_response(&request.id, json!({}), session),
             "DOM.getDocument" => {
                 let Some(target) = self.targets.get_mut(&target_id) else {
                     return cdp_error_response(&request.id, -32000, "target is not known", session);
@@ -831,6 +847,10 @@ impl PortableCdp {
                 "url": request.params.get("url").and_then(Value::as_str).unwrap_or("about:blank"),
                 "method": request.params.get("referrer").and_then(Value::as_str).unwrap_or("GET"),
             })),
+            "Page.reload" => {
+                let url = self.targets.get(&target_id).map(|target| target.url.clone()).unwrap_or_else(|| "about:blank".to_string());
+                self.queue_action(connection_id, request.clone(), target_id, "reload", json!({"url": url}))
+            }
             "Runtime.evaluate" => self.queue_action(connection_id, request.clone(), target_id, "evaluate", json!({
                 "expression": request.params.get("expression").and_then(Value::as_str).unwrap_or(""),
                 "returnByValue": request.params.get("returnByValue").and_then(Value::as_bool).unwrap_or(false),
@@ -1452,6 +1472,28 @@ mod tests {
             &format!(r#"{{"id":4,"sessionId":"{session}","method":"Emulation.setDeviceMetricsOverride","params":{{"width":0,"height":480}}}}"#),
         ).unwrap());
         assert_eq!(invalid["error"]["code"], -32602);
+    }
+
+    #[test]
+    fn portable_history_is_stateful_and_reload_stays_host_bounded() {
+        let mut cdp = PortableCdp::new("").unwrap();
+        let connection = cdp.open_connection().unwrap();
+        let attached = json(&cdp.cdp_request(
+            connection,
+            r#"{"id":1,"method":"Target.attachToTarget","params":{"targetId":"page-1"}}"#,
+        ).unwrap());
+        let session = attached["result"]["sessionId"].as_str().unwrap();
+        let history = json(&cdp.cdp_request(
+            connection,
+            &format!(r#"{{"id":2,"sessionId":"{session}","method":"Page.getNavigationHistory"}}"#),
+        ).unwrap());
+        assert_eq!(history["result"]["currentIndex"], 0);
+        assert_eq!(history["result"]["entries"].as_array().unwrap().len(), 1);
+        let reload = json(&cdp.cdp_request(
+            connection,
+            &format!(r#"{{"id":3,"sessionId":"{session}","method":"Page.reload"}}"#),
+        ).unwrap());
+        assert_eq!(reload["result"]["obscuraAction"]["kind"], "reload");
     }
 
     #[test]

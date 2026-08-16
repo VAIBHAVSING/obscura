@@ -824,6 +824,8 @@ export class ObscuraCdpServer {
       "Page.enable",
       "Page.getFrameTree",
       "Page.getLayoutMetrics",
+      "Page.getNavigationHistory",
+      "Page.resetNavigationHistory",
       "DOM.getDocument",
       "DOM.querySelector",
       "DOM.querySelectorAll",
@@ -833,6 +835,7 @@ export class ObscuraCdpServer {
       "DOM.requestChildNodes",
       "Runtime.evaluate",
       "Page.navigate",
+      "Page.reload",
       "Page.setDocumentContent",
       "Page.captureScreenshot",
       "Page.printToPDF",
@@ -872,7 +875,7 @@ export class ObscuraCdpServer {
       hostResult = { error: { code: Number.isInteger(error?.code) ? error.code : -32603, message: error?.message ?? "Portable host action failed" } };
     }
     let completion = hostResult;
-    if (method === "Page.navigate" || method === "Page.setDocumentContent") {
+    if (method === "Page.navigate" || method === "Page.reload" || method === "Page.setDocumentContent") {
       let page = {};
       try { page = (await target.status()).page ?? {}; } catch {}
       let html = "";
