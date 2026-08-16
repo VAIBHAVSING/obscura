@@ -23,6 +23,18 @@ test("real WASM artifact is reachable through package CDP", { skip: !modulePath 
       returnByValue: true,
     }, sessionId);
     assert.equal(evaluated.result.value, "Portable");
+    await client.command("Network.setCookies", {
+      cookies: [{ name: "portable", value: "wasm", domain: "example.test", path: "/", httpOnly: true }],
+    }, sessionId);
+    const cookieSnapshot = await client.command("Network.getAllCookies", {}, sessionId);
+    assert.equal(cookieSnapshot.cookies.find((cookie) => cookie.name === "portable")?.value, "wasm");
+    await client.command("Network.deleteCookies", {
+      name: "portable",
+      domain: "example.test",
+      path: "/",
+    }, sessionId);
+    const deletedCookies = await client.command("Storage.getCookies", {}, sessionId);
+    assert.equal(deletedCookies.cookies.some((cookie) => cookie.name === "portable"), false);
     const document = await client.command("DOM.getDocument", { depth: -1 }, sessionId);
     assert.equal(document.root.nodeType, 9);
     const htmlNode = await client.command("DOM.querySelector", { nodeId: document.root.nodeId, selector: "h1" }, sessionId);

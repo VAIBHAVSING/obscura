@@ -431,7 +431,19 @@ class PageTarget {
         return null;
       }
     }
-    const request = { ...command, sessionId: record.sessionId };
+    const requestParams = { ...(command.params ?? {}) };
+    if (new Set([
+      "Network.getAllCookies",
+      "Network.setCookies",
+      "Network.deleteCookies",
+      "Network.clearBrowserCookies",
+      "Storage.getCookies",
+      "Storage.setCookies",
+      "Storage.clearDataForOrigin",
+    ]).has(command.method)) {
+      requestParams._obscuraNowSecs = Math.floor(Date.now() / 1000);
+    }
+    const request = { ...command, params: requestParams, sessionId: record.sessionId };
     const response = await this.worker.portableCdpRequest(
       record.connectionId,
       JSON.stringify(request),
@@ -813,12 +825,23 @@ export class ObscuraCdpServer {
       "Page.setDocumentContent",
       "Page.captureScreenshot",
       "Page.printToPDF",
+      "Network.getAllCookies",
+      "Network.setCookies",
+      "Network.deleteCookies",
+      "Network.clearBrowserCookies",
+      "Network.clearBrowserCache",
+      "Storage.getCookies",
+      "Storage.setCookies",
+      "Storage.clearDataForOrigin",
     ]).has(method)) {
       return undefined;
     }
     const routed = await target.portableCdpCommand(connection.id, command);
     if (!routed) return undefined;
     const response = routed.response;
+    if (Array.isArray(response?.result?.cookies)) {
+      response.result.cookies = response.result.cookies.map(cdpCookie);
+    }
     for (const event of routed.events ?? []) {
       if (typeof event?.method === "string") connection.event(event.method, event.params ?? {}, command.sessionId);
     }

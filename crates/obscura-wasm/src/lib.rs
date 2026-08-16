@@ -544,6 +544,27 @@ impl ObscuraCore {
         Ok(())
     }
 
+    pub(crate) fn cdp_all_cookies(&self, now_secs: u64) -> Result<String, String> {
+        self.cookies.all_json(now_secs)
+    }
+
+    pub(crate) fn cdp_import_cookies(&mut self, value: &str, now_secs: u64) -> Result<(), String> {
+        self.cookies.import_json(value, now_secs)
+    }
+
+    pub(crate) fn cdp_delete_cookies(&mut self, name: &str, domain: &str, path: Option<&str>) {
+        self.cookies.delete(name, domain, path);
+    }
+
+    pub(crate) fn cdp_clear_cookies(&mut self) {
+        self.cookies.clear();
+    }
+
+    #[wasm_bindgen(js_name = clearCookies)]
+    pub fn clear_cookies(&mut self) {
+        self.cookies.clear();
+    }
+
     /// Seed one response body fetched by the Node page transport. Rendering
     /// never opens sockets or reads files from inside the WASM module.
     #[cfg(feature = "render")]

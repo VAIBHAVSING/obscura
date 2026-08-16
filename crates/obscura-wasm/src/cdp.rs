@@ -11,6 +11,7 @@ use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
 
 use serde::Deserialize;
 use serde_json::{json, Map, Value};
+use url::Url;
 use wasm_bindgen::prelude::*;
 
 use crate::ObscuraCore;
@@ -566,6 +567,60 @@ impl PortableCdp {
             "Page.enable" | "Network.enable" | "DOM.enable" | "Runtime.disable" | "Page.disable" | "Network.disable" | "DOM.disable" => {
                 cdp_result_response(&request.id, json!({}), session)
             }
+            "Network.getAllCookies" | "Storage.getCookies" => {
+                let Some(target) = self.targets.get_mut(&target_id) else {
+                    return cdp_error_response(&request.id, -32000, "target is not known", session);
+                };
+                let now = match cookie_clock(&request.params) {
+                    Ok(value) => value,
+                    Err(error) => return cdp_error_response(&request.id, -32602, error, session),
+                };
+                let raw = match target.core.cdp_all_cookies(now) {
+                    Ok(value) => value,
+                    Err(error) => return cdp_error_response(&request.id, -32000, error, session),
+                };
+                let cookies = serde_json::from_str::<Value>(&raw).unwrap_or_else(|_| Value::Array(Vec::new()));
+                cdp_result_response(&request.id, json!({"cookies": cookies}), session)
+            }
+            "Network.setCookies" | "Storage.setCookies" => {
+                let Some(target) = self.targets.get_mut(&target_id) else {
+                    return cdp_error_response(&request.id, -32000, "target is not known", session);
+                };
+                let now = match cookie_clock(&request.params) {
+                    Ok(value) => value,
+                    Err(error) => return cdp_error_response(&request.id, -32602, error, session),
+                };
+                let import = match cdp_cookie_import(&request.params, &target.url) {
+                    Ok(value) => value,
+                    Err(error) => return cdp_error_response(&request.id, -32602, error, session),
+                };
+                if let Err(error) = target.core.cdp_import_cookies(&import, now) {
+                    return cdp_error_response(&request.id, -32602, error, session);
+                }
+                cdp_result_response(&request.id, json!({}), session)
+            }
+            "Network.deleteCookies" => {
+                let Some(target) = self.targets.get_mut(&target_id) else {
+                    return cdp_error_response(&request.id, -32000, "target is not known", session);
+                };
+                let Some(name) = request.params.get("name").and_then(Value::as_str) else {
+                    return cdp_error_response(&request.id, -32602, "name is required", session);
+                };
+                let domain = request.params.get("domain").and_then(Value::as_str).map(str::to_string).or_else(|| {
+                    request.params.get("url").and_then(Value::as_str).and_then(cookie_url_host)
+                }).unwrap_or_default();
+                let path = request.params.get("path").and_then(Value::as_str).map(str::to_string);
+                target.core.cdp_delete_cookies(name, &domain, path.as_deref());
+                cdp_result_response(&request.id, json!({}), session)
+            }
+            "Network.clearBrowserCookies" | "Storage.clearDataForOrigin" => {
+                let Some(target) = self.targets.get_mut(&target_id) else {
+                    return cdp_error_response(&request.id, -32000, "target is not known", session);
+                };
+                target.core.cdp_clear_cookies();
+                cdp_result_response(&request.id, json!({}), session)
+            }
+            "Network.clearBrowserCache" => cdp_result_response(&request.id, json!({}), session),
             "Page.getFrameTree" => {
                 let Some(target) = self.targets.get(&target_id) else {
                     return cdp_error_response(&request.id, -32000, "target is not known", session);
@@ -913,6 +968,91 @@ impl PortableCdp {
     }
 }
 
+const MAX_CDP_COOKIE_COUNT: usize = 4096;
+const MAX_CDP_COOKIE_BYTES: usize = 64 * 1024;
+
+fn cookie_clock(params: &Map<String, Value>) -> Result<u64, String> {
+    match params.get("_obscuraNowSecs") {
+        None => Ok(0),
+        Some(value) => value
+            .as_u64()
+            .ok_or_else(|| "_obscuraNowSecs must be a non-negative integer".to_string()),
+    }
+}
+
+fn cookie_url_host(value: &str) -> Option<String> {
+    Url::parse(value)
+        .ok()
+        .and_then(|url| url.host_str().map(str::to_ascii_lowercase))
+}
+
+fn cdp_cookie_import(params: &Map<String, Value>, target_url: &str) -> Result<String, String> {
+    let Some(values) = params.get("cookies").and_then(Value::as_array) else {
+        return Err("cookies must be an array".to_string());
+    };
+    if values.len() > MAX_CDP_COOKIE_COUNT {
+        return Err("cookies exceeds the 4096-cookie limit".to_string());
+    }
+    let target_host = cookie_url_host(target_url);
+    let mut normalized = Vec::with_capacity(values.len());
+    for (index, cookie) in values.iter().enumerate() {
+        let Some(cookie) = cookie.as_object() else {
+            return Err(format!("cookies[{index}] must be an object"));
+        };
+        let name = cookie.get("name").and_then(Value::as_str).unwrap_or("");
+        let value = cookie.get("value").and_then(Value::as_str).unwrap_or("");
+        if name.is_empty() {
+            return Err(format!("cookies[{index}].name is required"));
+        }
+        let url_host = cookie
+            .get("url")
+            .and_then(Value::as_str)
+            .and_then(cookie_url_host);
+        let domain = cookie
+            .get("domain")
+            .and_then(Value::as_str)
+            .map(|domain| domain.trim_start_matches('.').to_ascii_lowercase())
+            .filter(|domain| !domain.is_empty())
+            .or(url_host)
+            .or_else(|| target_host.clone())
+            .ok_or_else(|| format!("cookies[{index}] requires a domain or URL"))?;
+        let path = cookie
+            .get("path")
+            .and_then(Value::as_str)
+            .filter(|path| path.starts_with('/'))
+            .unwrap_or("/");
+        let same_site = match cookie.get("sameSite").and_then(Value::as_str) {
+            Some("Strict") => "Strict",
+            Some("None") => "None",
+            _ => "Lax",
+        };
+        let expires = cookie.get("expires").and_then(|value| {
+            let value = value.as_f64()?;
+            if !value.is_finite() || value < 0.0 || value > i64::MAX as f64 {
+                None
+            } else {
+                Some(value as i64)
+            }
+        });
+        let normalized_cookie = json!({
+            "name": name,
+            "value": value,
+            "domain": domain,
+            "path": path,
+            "secure": cookie.get("secure").and_then(Value::as_bool).unwrap_or(false),
+            "httpOnly": cookie.get("httpOnly").and_then(Value::as_bool).unwrap_or(false),
+            "sameSite": same_site,
+            "expires": expires,
+        });
+        normalized.push(normalized_cookie);
+    }
+    let encoded = serde_json::to_string(&normalized).map_err(|error| error.to_string())?;
+    if encoded.len() > MAX_CDP_COOKIE_BYTES {
+        return Err("cookies exceeds the 64KiB limit".to_string());
+    }
+    Ok(encoded)
+}
+
 const MAX_DESCRIBED_NODES: usize = 4096;
 
 fn describe_children(
@@ -1159,6 +1299,36 @@ mod tests {
         let events = json(&cdp.poll_cdp_events(connection, 8).unwrap());
         assert_eq!(events[0]["method"], "DOM.setChildNodes");
         assert_eq!(events[0]["params"]["parentId"], node_id);
+    }
+
+    #[test]
+    fn portable_cookie_commands_use_the_wasm_cookie_jar() {
+        let mut cdp = PortableCdp::new("").unwrap();
+        let connection = cdp.open_connection().unwrap();
+        let attached = json(&cdp.cdp_request(
+                connection,
+                r#"{"id":1,"method":"Target.attachToTarget","params":{"targetId":"page-1"}}"#,
+            )
+            .unwrap());
+        let session = attached["result"]["sessionId"].as_str().unwrap();
+        let set = format!(
+            r#"{{"id":2,"sessionId":"{session}","method":"Network.setCookies","params":{{"_obscuraNowSecs":100,"cookies":[{{"name":"sid","value":"abc","domain":"example.test","path":"/","httpOnly":true}}]}}}}"#
+        );
+        assert_eq!(json(&cdp.cdp_request(connection, &set).unwrap())["result"], json!({}));
+
+        let get = format!(
+            r#"{{"id":3,"sessionId":"{session}","method":"Network.getAllCookies","params":{{"_obscuraNowSecs":100}}}}"#
+        );
+        let cookies = json(&cdp.cdp_request(connection, &get).unwrap());
+        assert_eq!(cookies["result"]["cookies"][0]["name"], "sid");
+        assert_eq!(cookies["result"]["cookies"][0]["value"], "abc");
+
+        let delete = format!(
+            r#"{{"id":4,"sessionId":"{session}","method":"Network.deleteCookies","params":{{"name":"sid","domain":"example.test","path":"/"}}}}"#
+        );
+        assert_eq!(json(&cdp.cdp_request(connection, &delete).unwrap())["result"], json!({}));
+        let empty = json(&cdp.cdp_request(connection, &get).unwrap());
+        assert!(empty["result"]["cookies"].as_array().unwrap().is_empty());
     }
 
     #[test]

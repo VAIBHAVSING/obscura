@@ -156,6 +156,10 @@ impl CookieJar {
         });
     }
 
+    pub fn clear(&mut self) {
+        self.entries.clear();
+    }
+
     fn set_cookie(
         &mut self,
         value: &str,
