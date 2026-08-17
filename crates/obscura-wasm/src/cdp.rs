@@ -16,9 +16,10 @@ use url::Url;
 use wasm_bindgen::prelude::*;
 
 use crate::ObscuraCore;
+use crate::navigation::MAX_NAVIGATION_URL_BYTES;
 
 pub const CDP_ABI_VERSION: u32 = 1;
-const MAX_MESSAGE_BYTES: usize = 1 * 1024 * 1024;
+const MAX_MESSAGE_BYTES: usize = 8 * 1024 * 1024;
 const MAX_METHOD_BYTES: usize = 256;
 const MAX_SESSION_BYTES: usize = 256;
 const MAX_EVENT_QUEUE: usize = 512;
@@ -26,6 +27,8 @@ const MAX_EVENT_BYTES: usize = 4 * 1024 * 1024;
 const MAX_ACTION_RESULT_BYTES: usize = 16 * 1024 * 1024;
 const MAX_STREAM_BYTES: usize = 12 * 1024 * 1024;
 const MAX_STREAM_CHUNK_BYTES: usize = 1 * 1024 * 1024;
+const MAX_RESPONSE_BODY_BYTES: usize = 4 * 1024 * 1024;
+const MAX_RESPONSE_BODIES: usize = 128;
 
 fn js_error(message: &str) -> JsValue {
     #[cfg(target_arch = "wasm32")]
@@ -126,6 +129,11 @@ struct Stream {
     offset: usize,
 }
 
+struct ResponseBody {
+    body: String,
+    base64_encoded: bool,
+}
+
 #[derive(Clone, Copy)]
 struct Viewport {
     width: u32,
@@ -151,6 +159,8 @@ struct Target {
     emulated_media: String,
     focus_emulation: bool,
     extra_headers: BTreeMap<String, String>,
+    network_enabled_sessions: BTreeSet<String>,
+    response_bodies: BTreeMap<String, ResponseBody>,
     core: ObscuraCore,
     sessions: BTreeSet<String>,
 }
@@ -206,6 +216,8 @@ impl PortableCdp {
                 emulated_media: String::new(),
                 focus_emulation: false,
                 extra_headers: BTreeMap::new(),
+                network_enabled_sessions: BTreeSet::new(),
+                response_bodies: BTreeMap::new(),
                 core,
                 sessions: BTreeSet::new(),
             },
@@ -286,6 +298,7 @@ impl PortableCdp {
             if let Some(target_id) = connection.sessions.get(&session_id) {
                 if let Some(target) = self.targets.get_mut(target_id) {
                     target.sessions.remove(&session_id);
+                    target.network_enabled_sessions.remove(&session_id);
                 }
             }
         }
@@ -341,7 +354,7 @@ impl PortableCdp {
             return Err(js_error("CDP action target session is no longer live"));
         }
         self.actions.remove(&action_id);
-        let result: Value = serde_json::from_str(result_json)
+        let mut result: Value = serde_json::from_str(result_json)
             .map_err(|error| js_error(&format!("invalid CDP action result: {error}")))?;
         if action.kind == "navigate" || action.kind == "reload" || action.kind == "setDocumentContent" {
             if let Some(target) = self.targets.get_mut(&action.target_id) {
@@ -384,6 +397,13 @@ impl PortableCdp {
                     }
                 }
             }
+        }
+        let mut network_metadata = None;
+        if let Value::Object(ref mut object) = result {
+            network_metadata = object.remove("__obscuraNetwork");
+        }
+        if let Some(network_metadata) = network_metadata {
+            self.record_network_metadata(&action.target_id, &network_metadata)?;
         }
         let response = if let Value::Object(mut object) = result {
             object.remove("__obscuraState");
@@ -444,12 +464,111 @@ impl PortableCdp {
             "streamBytes": MAX_STREAM_BYTES,
             "streamChunkBytes": MAX_STREAM_CHUNK_BYTES,
             "streams": self.streams.len(),
+            "responseBodyBytes": MAX_RESPONSE_BODY_BYTES,
+            "responseBodies": self.targets.values().map(|target| target.response_bodies.len()).sum::<usize>(),
         })
         .to_string()
     }
 }
 
 impl PortableCdp {
+    fn record_network_metadata(&mut self, target_id: &str, metadata: &Value) -> Result<(), JsValue> {
+        let Some(events) = metadata.as_array() else {
+            return Err(js_error("portable network metadata must be an array"));
+        };
+        if events.len() > MAX_EVENT_QUEUE {
+            return Err(js_range_error("portable network metadata exceeds the event limit"));
+        }
+        let Some(target) = self.targets.get_mut(target_id) else {
+            return Err(js_error("portable network target is not known"));
+        };
+        for event in events {
+            let Some(event) = event.as_object() else {
+                return Err(js_error("portable network event must be an object"));
+            };
+            let request_id = event.get("requestId").and_then(Value::as_str).unwrap_or("");
+            let loader_id = event.get("loaderId").and_then(Value::as_str).unwrap_or("");
+            let url = event.get("url").and_then(Value::as_str).unwrap_or("");
+            let method = event.get("method").and_then(Value::as_str).unwrap_or("GET");
+            if request_id.is_empty() || request_id.len() > MAX_METHOD_BYTES || url.len() > MAX_NAVIGATION_URL_BYTES {
+                return Err(js_error("portable network event has an invalid request identity"));
+            }
+            let response_headers = event.get("responseHeaders").cloned().unwrap_or_else(|| Value::Object(Map::new()));
+            if !response_headers.is_object() {
+                return Err(js_error("portable network response headers must be an object"));
+            }
+            let body_base64 = event.get("bodyBase64").and_then(Value::as_str);
+            if let Some(body_base64) = body_base64 {
+                bounded(body_base64, MAX_ACTION_RESULT_BYTES, "portable network response body")?;
+                let body = BASE64
+                    .decode(body_base64)
+                    .map_err(|_| js_error("portable network response body is not valid base64"))?;
+                if body.len() > MAX_RESPONSE_BODY_BYTES {
+                    return Err(js_range_error("portable network response body exceeds the 4MiB limit"));
+                }
+            }
+            if target.response_bodies.len() >= MAX_RESPONSE_BODIES && !target.response_bodies.contains_key(request_id) {
+                let oldest = target.response_bodies.keys().next().cloned();
+                if let Some(oldest) = oldest {
+                    target.response_bodies.remove(&oldest);
+                }
+            }
+            if let Some(body_base64) = body_base64 {
+                target.response_bodies.insert(request_id.to_string(), ResponseBody {
+                    body: body_base64.to_string(),
+                    base64_encoded: true,
+                });
+            }
+
+            let request_headers = event.get("requestHeaders").cloned().unwrap_or_else(|| Value::Object(Map::new()));
+            let timestamp = event.get("timestamp").and_then(Value::as_f64).unwrap_or(0.0);
+            let wall_time = event.get("wallTime").and_then(Value::as_f64).unwrap_or(timestamp);
+            let status = event.get("status").and_then(Value::as_u64).unwrap_or(200);
+            let mime_type = event.get("mimeType").and_then(Value::as_str).unwrap_or("");
+            let resource_type = event.get("resourceType").and_then(Value::as_str).unwrap_or("Document");
+            let frame_id = target.frame_id.clone();
+            let document_url = target.url.clone();
+            let session_ids: Vec<(u32, String)> = self
+                .connections
+                .iter()
+                .flat_map(|(connection_id, connection)| {
+                    connection.sessions.iter().filter_map(|(session_id, mapped_target)| {
+                        (mapped_target == target_id && target.network_enabled_sessions.contains(session_id))
+                            .then_some((*connection_id, session_id.clone()))
+                    })
+                })
+                .collect();
+            for (connection_id, session_id) in session_ids {
+                let Some(connection) = self.connections.get_mut(&connection_id) else { continue; };
+                queue_event(connection, "Network.requestWillBeSent", json!({
+                    "requestId": request_id,
+                    "loaderId": loader_id,
+                    "documentURL": document_url,
+                    "request": {"url": url, "method": method, "headers": request_headers},
+                    "timestamp": timestamp,
+                    "wallTime": wall_time,
+                    "initiator": {"type": event.get("initiatorType").and_then(Value::as_str).unwrap_or("other")},
+                    "type": resource_type,
+                    "frameId": frame_id,
+                }), Some(&session_id));
+                queue_event(connection, "Network.responseReceived", json!({
+                    "requestId": request_id,
+                    "loaderId": loader_id,
+                    "timestamp": timestamp,
+                    "type": resource_type,
+                    "response": {"url": url, "status": status, "statusText": "", "headers": response_headers, "mimeType": mime_type},
+                    "frameId": frame_id,
+                }), Some(&session_id));
+                queue_event(connection, "Network.loadingFinished", json!({
+                    "requestId": request_id,
+                    "timestamp": timestamp,
+                    "encodedDataLength": event.get("bodySize").and_then(Value::as_u64).unwrap_or(0),
+                }), Some(&session_id));
+            }
+        }
+        Ok(())
+    }
+
     fn target_for_session(
         &self,
         connection_id: u32,
@@ -629,7 +748,27 @@ impl PortableCdp {
                 }
                 cdp_result_response(&request.id, json!({}), session)
             }
-            "Page.enable" | "Network.enable" | "DOM.enable" | "Runtime.disable" | "Page.disable" | "Network.disable" | "DOM.disable" => {
+            "Page.enable" | "Page.disable" | "DOM.enable" | "DOM.disable" | "Runtime.disable" => {
+                cdp_result_response(&request.id, json!({}), session)
+            }
+            "Network.enable" => {
+                let Some(session_id) = session else {
+                    return cdp_error_response(&request.id, -32600, "Network.enable requires a target session", session);
+                };
+                let Some(target) = self.targets.get_mut(&target_id) else {
+                    return cdp_error_response(&request.id, -32000, "target is not known", session);
+                };
+                target.network_enabled_sessions.insert(session_id.to_string());
+                cdp_result_response(&request.id, json!({}), session)
+            }
+            "Network.disable" => {
+                let Some(target) = self.targets.get_mut(&target_id) else {
+                    return cdp_error_response(&request.id, -32000, "target is not known", session);
+                };
+                if let Some(session_id) = session {
+                    target.network_enabled_sessions.remove(session_id);
+                }
+                target.response_bodies.clear();
                 cdp_result_response(&request.id, json!({}), session)
             }
             "Page.getLayoutMetrics" => {
@@ -753,6 +892,21 @@ impl PortableCdp {
                 cdp_result_response(&request.id, json!({}), session)
             }
             "Network.clearBrowserCache" => cdp_result_response(&request.id, json!({}), session),
+            "Network.getResponseBody" => {
+                let Some(request_id) = request.params.get("requestId").and_then(Value::as_str) else {
+                    return cdp_error_response(&request.id, -32602, "requestId is required", session);
+                };
+                if request_id.len() > MAX_METHOD_BYTES {
+                    return cdp_error_response(&request.id, -32602, "requestId exceeds the 256-byte limit", session);
+                }
+                let Some(target) = self.targets.get(&target_id) else {
+                    return cdp_error_response(&request.id, -32000, "target is not known", session);
+                };
+                let Some(body) = target.response_bodies.get(request_id) else {
+                    return cdp_error_response(&request.id, -32000, "No response body found for requestId", session);
+                };
+                cdp_result_response(&request.id, json!({"body": body.body, "base64Encoded": body.base64_encoded}), session)
+            }
             "Page.getFrameTree" => {
                 let Some(target) = self.targets.get(&target_id) else {
                     return cdp_error_response(&request.id, -32000, "target is not known", session);
@@ -1078,6 +1232,8 @@ impl PortableCdp {
             emulated_media: String::new(),
             focus_emulation: false,
             extra_headers: BTreeMap::new(),
+            network_enabled_sessions: BTreeSet::new(),
+            response_bodies: BTreeMap::new(),
             core,
             sessions: BTreeSet::new(),
         });
@@ -1175,6 +1331,7 @@ impl PortableCdp {
             .and_then(|connection| connection.sessions.remove(session_id))?;
         if let Some(target) = self.targets.get_mut(&target_id) {
             target.sessions.remove(session_id);
+            target.network_enabled_sessions.remove(session_id);
         }
         self.actions.retain(|_, action| {
             action.connection_id != connection_id || action.session_id.as_deref() != Some(session_id)
@@ -1688,6 +1845,39 @@ mod tests {
             &format!(r#"{{"id":4,"sessionId":"{session}","method":"IO.close","params":{{"handle":"{handle}"}}}}"#),
         ).unwrap());
         assert_eq!(closed["result"], json!({}));
+    }
+
+    #[test]
+    fn portable_network_events_and_response_bodies_are_owned_by_wasm() {
+        let mut cdp = PortableCdp::new("").unwrap();
+        let connection = cdp.open_connection().unwrap();
+        let attached = json(&cdp.cdp_request(
+            connection,
+            r#"{"id":1,"method":"Target.attachToTarget","params":{"targetId":"page-1","flatten":true}}"#,
+        ).unwrap());
+        let session = attached["result"]["sessionId"].as_str().unwrap().to_string();
+        cdp.poll_cdp_events(connection, 8).unwrap();
+        let enable = format!(r#"{{"id":2,"sessionId":"{session}","method":"Network.enable"}}"#);
+        assert_eq!(json(&cdp.cdp_request(connection, &enable).unwrap())["result"], json!({}));
+        let navigate = format!(r#"{{"id":3,"sessionId":"{session}","method":"Page.navigate","params":{{"url":"https://example.test/"}}}}"#);
+        let queued = json(&cdp.cdp_request(connection, &navigate).unwrap());
+        let action_id = queued["result"]["obscuraAction"]["actionId"].as_u64().unwrap() as u32;
+        let body = BASE64.encode(b"<html>network</html>");
+        let completed = json(&cdp.complete_action(action_id, &format!(
+            r#"{{"url":"https://example.test/","loaderId":"loader-1","__obscuraNetwork":[{{"requestId":"loader-1","loaderId":"loader-1","url":"https://example.test/","method":"GET","requestHeaders":{{"x-test":"yes"}},"status":200,"responseHeaders":{{"content-type":"text/html"}},"mimeType":"text/html","bodyBase64":"{body}","bodySize":20,"timestamp":1.0,"wallTime":1.0}}]}}"#
+        )).unwrap());
+        assert_eq!(completed["result"]["url"], "https://example.test/");
+        let events = json(&cdp.poll_cdp_events(connection, 8).unwrap());
+        assert_eq!(events.as_array().unwrap().iter().filter(|event| event["method"] == "Network.requestWillBeSent").count(), 1);
+        assert_eq!(events.as_array().unwrap().iter().filter(|event| event["method"] == "Network.responseReceived").count(), 1);
+        assert_eq!(events.as_array().unwrap().iter().filter(|event| event["method"] == "Network.loadingFinished").count(), 1);
+        let get_body = format!(r#"{{"id":4,"sessionId":"{session}","method":"Network.getResponseBody","params":{{"requestId":"loader-1"}}}}"#);
+        let response = json(&cdp.cdp_request(connection, &get_body).unwrap());
+        assert_eq!(response["result"]["base64Encoded"], true);
+        assert_eq!(BASE64.decode(response["result"]["body"].as_str().unwrap()).unwrap(), b"<html>network</html>");
+        let disable = format!(r#"{{"id":5,"sessionId":"{session}","method":"Network.disable"}}"#);
+        assert_eq!(json(&cdp.cdp_request(connection, &disable).unwrap())["result"], json!({}));
+        assert_eq!(json(&cdp.cdp_request(connection, &get_body).unwrap())["error"]["code"], -32000);
     }
 
     #[test]

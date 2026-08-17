@@ -58,7 +58,24 @@ test("real WASM artifact is reachable through package CDP", { skip: !modulePath 
     const deletedCookies = await client.command("Storage.getCookies", {}, sessionId);
     assert.equal(deletedCookies.cookies.some((cookie) => cookie.name === "portable"), false);
     await client.command("Network.setExtraHTTPHeaders", { headers: { "X-Portable": "wasm" } }, sessionId);
+    const networkEvents = [];
+    const stopNetworkEvents = client.onEvent((event) => {
+      if (event.sessionId === sessionId && event.method?.startsWith("Network.")) networkEvents.push(event);
+    });
+    await client.command("Network.enable", {}, sessionId);
     await client.command("Page.navigate", { url: fixtureUrl }, sessionId);
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    const requestEvent = networkEvents.find((event) => event.method === "Network.requestWillBeSent");
+    const responseEvent = networkEvents.find((event) => event.method === "Network.responseReceived");
+    const finishedEvent = networkEvents.find((event) => event.method === "Network.loadingFinished");
+    assert.ok(requestEvent?.params?.requestId);
+    assert.equal(requestEvent.params.request.url, fixtureUrl);
+    assert.equal(responseEvent?.params?.response.status, 200);
+    assert.equal(finishedEvent?.params?.requestId, requestEvent.params.requestId);
+    const responseBody = await client.command("Network.getResponseBody", { requestId: requestEvent.params.requestId }, sessionId);
+    const responseText = responseBody.base64Encoded ? Buffer.from(responseBody.body, "base64").toString("utf8") : responseBody.body;
+    assert.match(responseText, /<h1>wasm<\/h1>/);
+    stopNetworkEvents();
     const headerValue = await client.command("Runtime.evaluate", {
       expression: "document.querySelector('h1').textContent",
       returnByValue: true,

@@ -111,6 +111,7 @@ const MAX_NAVIGATION_URL_BYTES = 64 * 1024;
 const MAX_NAVIGATION_OPTIONS_BYTES = 64 * 1024;
 const MAX_NAVIGATION_HEADERS_BYTES = 128 * 1024;
 const MAX_NAVIGATION_RESPONSE_BYTES = 32 * 1024 * 1024;
+const MAX_NETWORK_RESPONSE_BODY_BYTES = 4 * 1024 * 1024;
 const MAX_NAVIGATION_REDIRECTS = 10;
 const MAX_NAVIGATION_REQUEST_TIMEOUT_MS = 120_000;
 const MAX_SCRIPT_SOURCE_BYTES = 16 * 1024 * 1024;
@@ -1804,9 +1805,11 @@ function responseEncoding(headers) {
 }
 
 async function readNavigationBody(response, api, navigationId, signal) {
-  if (!response.body) return;
+  if (!response.body) return { bytes: new Uint8Array(), total: 0 };
   const reader = response.body.getReader();
+  const captured = [];
   let total = 0;
+  let capturedTotal = 0;
   try {
     while (true) {
       const { done, value } = await reader.read();
@@ -1816,12 +1819,47 @@ async function readNavigationBody(response, api, navigationId, signal) {
       if (total > MAX_NAVIGATION_RESPONSE_BYTES) {
         throw new RangeError(`navigation response exceeds the ${MAX_NAVIGATION_RESPONSE_BYTES}-byte limit`);
       }
+      if (capturedTotal < MAX_NETWORK_RESPONSE_BODY_BYTES) {
+        const remaining = MAX_NETWORK_RESPONSE_BODY_BYTES - capturedTotal;
+        const copy = chunk.byteLength <= remaining ? chunk : chunk.subarray(0, remaining);
+        captured.push(copy.slice());
+        capturedTotal += copy.byteLength;
+      }
       syncCall(api.navigationResponseChunk, navigationId, chunk);
       if (signal.aborted) throw new Error("navigation was aborted");
     }
   } finally {
     try { await reader.cancel(); } catch {}
   }
+  const bytes = new Uint8Array(capturedTotal);
+  let offset = 0;
+  for (const chunk of captured) {
+    bytes.set(chunk, offset);
+    offset += chunk.byteLength;
+  }
+  return { bytes, total };
+}
+
+function networkRecord({ requestId, loaderId, url, method, requestHeaders, status, responseHeaders, mimeType, body, bodySize, redirect = false }) {
+  const record = {
+    requestId: String(requestId),
+    loaderId: String(loaderId),
+    url: String(url),
+    method: String(method || "GET"),
+    requestHeaders: { ...(requestHeaders || {}) },
+    status: Number.isSafeInteger(status) ? status : 200,
+    responseHeaders: { ...(responseHeaders || {}) },
+    mimeType: typeof mimeType === "string" ? mimeType.split(";", 1)[0].trim() : "",
+    bodySize: Number.isSafeInteger(bodySize) && bodySize >= 0 ? bodySize : 0,
+    timestamp: Date.now() / 1000,
+    wallTime: Date.now() / 1000,
+    resourceType: "Document",
+    initiatorType: "other",
+  };
+  if (!redirect && body && body.byteLength <= MAX_NETWORK_RESPONSE_BODY_BYTES) {
+    record.bodyBase64 = Buffer.from(body).toString("base64");
+  }
+  return record;
 }
 
 function decodeWireString(value, label) {
@@ -2335,6 +2373,7 @@ async function navigatePortable({ url, options = {}, allowPrivateNetwork = false
   const api = bridgeApi();
   await requireNavigationCompatibility(api);
   let action = JSON.parse(syncCall(api.beginNavigation, url, JSON.stringify({ method, body, referrer, replaceHistory: Boolean(options.replaceHistory), maxRedirects })));
+  const networkEvents = [];
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(new Error("navigation request timed out")), requestTimeoutMs);
   timer.unref?.();
@@ -2346,11 +2385,23 @@ async function navigatePortable({ url, options = {}, allowPrivateNetwork = false
         syncCall(api.navigationResponseHeaders, navigationId, 200, JSON.stringify({ "content-type": "text/html; charset=UTF-8" }));
         syncCall(api.navigationResponseChunk, navigationId, inline.bytes);
         const commit = JSON.parse(syncCall(api.navigationResponseEnd, navigationId, action.url, inline.encoding));
+        networkEvents.push(networkRecord({
+          requestId: action.loaderId,
+          loaderId: action.loaderId,
+          url: action.url,
+          method: action.method,
+          requestHeaders: {},
+          status: 200,
+          responseHeaders: { "content-type": "text/html; charset=UTF-8" },
+          mimeType: "text/html",
+          body: inline.bytes,
+          bodySize: inline.bytes.byteLength,
+        }));
         resetBridgeRealmAfterNavigation();
         const scripts = options.executeScripts === false
           ? null
           : await executeDocumentScripts({ requestTimeoutMs, allowPrivateNetwork });
-        return { ...commit, navigation: JSON.parse(syncCall(api.navigationStatus)), scripts };
+        return { ...commit, navigation: JSON.parse(syncCall(api.navigationStatus)), scripts, __obscuraNetwork: networkEvents };
       }
       const targetUrl = validateNavigationUrl(action.url, allowPrivateNetwork);
       const navigationHeaders = { ...extraHTTPHeaders };
@@ -2366,8 +2417,21 @@ async function navigatePortable({ url, options = {}, allowPrivateNetwork = false
       });
       storeResponseCookies(response.url || targetUrl, response);
       const { headers, serialized } = responseHeadersObject(response);
+      const requestId = `${action.loaderId}${action.redirectCount ? `-redirect-${action.redirectCount}` : ""}`;
+      const responseRecord = networkRecord({
+        requestId,
+        loaderId: action.loaderId,
+        url: targetUrl.toString(),
+        method: action.method,
+        requestHeaders: navigationHeaders,
+        status: response.status,
+        responseHeaders: headers,
+        mimeType: headers["content-type"] ?? "",
+        redirect: response.status >= 300 && response.status < 400,
+      });
       action = JSON.parse(syncCall(api.navigationResponseHeaders, navigationId, response.status, serialized));
       if (action.kind === "redirect") {
+        networkEvents.push(responseRecord);
         try { await response.body?.cancel(); } catch {}
         continue;
       }
@@ -2376,13 +2440,14 @@ async function navigatePortable({ url, options = {}, allowPrivateNetwork = false
         error.code = "ERR_OBSCURA_NAVIGATION_RESPONSE";
         throw error;
       }
-      await readNavigationBody(response, api, navigationId, controller.signal);
+      const captured = await readNavigationBody(response, api, navigationId, controller.signal);
       const commit = JSON.parse(syncCall(api.navigationResponseEnd, navigationId, targetUrl.toString(), responseEncoding(headers)));
+      networkEvents.push({ ...responseRecord, bodySize: captured.total, ...(captured.bytes.byteLength <= MAX_NETWORK_RESPONSE_BODY_BYTES ? { bodyBase64: Buffer.from(captured.bytes).toString("base64") } : {}) });
       resetBridgeRealmAfterNavigation();
       const scripts = options.executeScripts === false
         ? null
         : await executeDocumentScripts({ requestTimeoutMs, allowPrivateNetwork });
-      return { ...commit, navigation: JSON.parse(syncCall(api.navigationStatus)), scripts };
+      return { ...commit, navigation: JSON.parse(syncCall(api.navigationStatus)), scripts, __obscuraNetwork: networkEvents };
     }
   } catch (error) {
     try { if (api.cancelNavigation) syncCall(api.cancelNavigation, Number(action.navigationId)); } catch {}

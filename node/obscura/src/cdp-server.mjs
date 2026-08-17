@@ -11,7 +11,7 @@ import {
 
 const HERE = dirname(fileURLToPath(import.meta.url));
 const DEFAULT_HOST = "127.0.0.1";
-const MAX_COMMAND_BYTES = 1 * 1024 * 1024;
+const MAX_COMMAND_BYTES = 8 * 1024 * 1024;
 const MAX_EVENT_QUEUE = 512;
 const MAX_REMOTE_OBJECTS = 2_048;
 
@@ -444,6 +444,9 @@ class PageTarget {
     const requestParams = { ...(command.params ?? {}) };
     if (new Set([
       "Network.getAllCookies",
+      "Network.enable",
+      "Network.disable",
+      "Network.getResponseBody",
       "Network.setCookies",
       "Network.deleteCookies",
       "Network.clearBrowserCookies",
@@ -870,6 +873,9 @@ export class ObscuraCdpServer {
       "IO.read",
       "IO.close",
       "Network.getAllCookies",
+      "Network.enable",
+      "Network.disable",
+      "Network.getResponseBody",
       "Network.setCookies",
       "Network.deleteCookies",
       "Network.clearBrowserCookies",
@@ -924,13 +930,21 @@ export class ObscuraCdpServer {
       hostResult = { error: { code: Number.isInteger(error?.code) ? error.code : -32603, message: error?.message ?? "Portable host action failed" } };
     }
     let completion = hostResult;
+    // Navigation metadata is private to the WASM CDP state. The host action
+    // wraps Page.navigate's result, so lift it for completion and remove it
+    // from the response that reaches the client.
+    if (hostResult?.result && typeof hostResult.result === "object" && !Array.isArray(hostResult.result) &&
+        Object.hasOwn(hostResult.result, "__obscuraNetwork")) {
+      const { __obscuraNetwork, ...publicResult } = hostResult.result;
+      completion = { ...hostResult, result: publicResult, __obscuraNetwork };
+    }
     if (method === "Page.navigate" || method === "Page.reload" || method === "Page.setDocumentContent") {
       let page = {};
       try { page = (await target.status()).page ?? {}; } catch {}
       let html = "";
       try { html = await target.portableCdpHtml(); } catch {}
       completion = {
-        ...hostResult,
+        ...completion,
         __obscuraState: {
           url: target.url,
           loaderId: target.loaderId,
@@ -945,6 +959,22 @@ export class ObscuraCdpServer {
     if (completed?.error) {
       throw cdpError(completed.error.code ?? -32603, completed.error.message ?? "Portable CDP action failed", completed.error.data);
     }
+    // Completion may enqueue WASM-owned Network events (and response-body
+    // state). Drain them before returning the command so ordering is
+    // deterministic for CDP clients which await Page.navigate.
+    try {
+      const completedEvents = await target.worker.portableCdpPoll(
+        routed.record.connectionId,
+        512,
+        { requestTimeoutMs: this.server.requestTimeoutMs },
+      );
+      for (const event of Array.isArray(completedEvents) ? completedEvents : []) {
+        if (typeof event?.method !== "string") continue;
+        if (typeof event.sessionId === "string") event.sessionId = command.sessionId;
+        rewritePortableTargetIds(event, "page-1", target.frameId);
+        connection.event(event.method, event.params ?? {}, command.sessionId);
+      }
+    } catch {}
     return completed?.result ?? hostResult;
   }
 
