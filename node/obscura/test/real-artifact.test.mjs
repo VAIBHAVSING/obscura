@@ -205,6 +205,48 @@ test("real WASM artifact is reachable through package CDP", { skip: !modulePath 
       ? Buffer.from(fetchResponseBody.body, "base64").toString("utf8")
       : fetchResponseBody.body;
     assert.equal(fetchText, "continued-body");
+
+    const responseFetchEvents = [];
+    const stopResponseFetchEvents = client.onEvent((event) => {
+      if (event.sessionId === sessionId && event.method === "Fetch.requestPaused") responseFetchEvents.push(event);
+    });
+    await client.command("Fetch.enable", {
+      patterns: [{ urlPattern: `${new URL(fixtureUrl).origin}/*`, requestStage: "Response" }],
+    }, sessionId);
+    await client.command("Runtime.evaluate", {
+      expression: "globalThis.__fetchValue = null; fetch('/api').then((response) => response.text()).then((value) => { globalThis.__fetchValue = value; }); undefined",
+    }, sessionId);
+    let responsePaused;
+    for (let attempt = 0; attempt < 100; attempt += 1) {
+      responsePaused = responseFetchEvents.at(-1);
+      if (responsePaused) break;
+      await new Promise((resolve) => setTimeout(resolve, 10));
+    }
+    assert.equal(responsePaused?.params?.request?.url, apiUrl);
+    assert.equal(responsePaused?.params?.responseStatusCode, 200);
+    const pausedResponseBody = await client.command("Fetch.getResponseBody", {
+      requestId: responsePaused.params.requestId,
+    }, sessionId);
+    assert.equal(Buffer.from(pausedResponseBody.body, "base64").toString("utf8"), "fetch-body");
+    await client.command("Fetch.fulfillRequest", {
+      requestId: responsePaused.params.requestId,
+      responseCode: 203,
+      responseHeaders: [{ name: "content-type", value: "text/plain" }],
+      body: Buffer.from("response-fulfilled").toString("base64"),
+    }, sessionId);
+    let responseFetchValue;
+    for (let attempt = 0; attempt < 100; attempt += 1) {
+      const evaluatedFetch = await client.command("Runtime.evaluate", {
+        expression: "globalThis.__fetchValue",
+        returnByValue: true,
+      }, sessionId);
+      responseFetchValue = evaluatedFetch.result.value;
+      if (responseFetchValue === "response-fulfilled") break;
+      await new Promise((resolve) => setTimeout(resolve, 10));
+    }
+    assert.equal(responseFetchValue, "response-fulfilled");
+    await client.command("Fetch.disable", {}, sessionId);
+    stopResponseFetchEvents();
     const renderUrl = new URL("/render", fixtureUrl).href;
     await client.command("Page.navigate", { url: renderUrl }, sessionId);
     const renderScreenshot = await client.command("Page.captureScreenshot", {}, sessionId);

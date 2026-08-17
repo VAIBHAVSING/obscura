@@ -1293,6 +1293,7 @@ function portableCdpInterceptFetch(metadata) {
   }
 }
 
+
 function portableCdpOperation(payload = {}) {
   const operation = payload.operation;
   if (operation === "abi") {
@@ -2153,12 +2154,48 @@ function startBootstrapFetch(url, method, headersJson, body, pageOrigin, mode, c
         redirect: "follow",
         signal: controller.signal,
       });
-      const { headers: responseHeaders } = responseHeadersObject(response);
+      let { headers: responseHeaders } = responseHeadersObject(response);
+      let responseUrl = response.url || effectiveUrl.toString();
+      let responseStatus = response.status;
+      let responseBytes = await readBoundedResponseBytes(response, MAX_NAVIGATION_RESPONSE_BYTES);
       const sameOrigin = (() => {
-        try { return new URL(pageOrigin).origin === new URL(response.url || effectiveUrl).origin; } catch { return false; }
+        try { return new URL(pageOrigin).origin === new URL(responseUrl).origin; } catch { return false; }
       })();
       if (credentials !== "omit" && (sameOrigin || credentials === "include")) {
-        storeResponseCookies(response.url || effectiveUrl, response);
+        storeResponseCookies(responseUrl, response);
+      }
+      const responseInterception = portableCdpInterceptFetch({
+        requestId,
+        requestStage: "Response",
+        url: responseUrl,
+        method: effectiveMethod,
+        headers: requestHeaders,
+        postData: effectiveMethod === "GET" || effectiveMethod === "HEAD" ? undefined : effectiveBody,
+        responseStatusCode: responseStatus,
+        responseHeaders,
+        responseBodyBase64: Buffer.from(responseBytes).toString("base64"),
+        resourceType: "Fetch",
+        frameId: "page-1",
+      });
+      if (responseInterception.paused === true) {
+        const resolution = await new Promise((resolve, reject) => {
+          record.interceptionResolve = resolve;
+          record.interceptionReject = reject;
+        });
+        if (!resolution || resolution.action === "fail") {
+          throw new Error("Fetch response failed by interception");
+        }
+        if (resolution.action === "fulfill") {
+          responseStatus = Number.isSafeInteger(resolution.status) ? resolution.status : 200;
+          responseHeaders = {};
+          for (const entry of Array.isArray(resolution.headers) ? resolution.headers : []) {
+            if (entry && typeof entry.name === "string" && typeof entry.value === "string") {
+              responseHeaders[entry.name] = entry.value;
+            }
+          }
+          responseBytes = Buffer.from(String(resolution.bodyBase64 ?? ""), "base64");
+          responseUrl = typeof resolution.url === "string" ? validateNavigationUrl(resolution.url, activeAllowPrivateNetwork).toString() : responseUrl;
+        }
       }
       if (mode === "cors" && !sameOrigin) {
         const allowedOrigin = responseHeaders["access-control-allow-origin"];
@@ -2171,10 +2208,10 @@ function startBootstrapFetch(url, method, headersJson, body, pageOrigin, mode, c
             ...networkRecord({
               requestId,
               loaderId,
-              url: response.url || effectiveUrl.toString(),
+              url: responseUrl,
               method: effectiveMethod,
               requestHeaders,
-              status: response.status,
+              status: responseStatus,
               responseHeaders,
               mimeType: responseHeaders["content-type"] ?? "",
               bodySize: 0,
@@ -2182,7 +2219,7 @@ function startBootstrapFetch(url, method, headersJson, body, pageOrigin, mode, c
               initiatorType: "script",
             }),
           });
-          try { await response.body?.cancel(); } catch {}
+          responseBytes = new Uint8Array();
           bootstrapFetchResolution(id, { ok: true, value: JSON.stringify({ corsBlocked: true, corsError: "CORS policy blocked the response" }) });
           return;
         }
@@ -2194,10 +2231,10 @@ function startBootstrapFetch(url, method, headersJson, body, pageOrigin, mode, c
           ...networkRecord({
             requestId,
             loaderId,
-            url: response.url || effectiveUrl.toString(),
+            url: responseUrl,
             method: effectiveMethod,
             requestHeaders,
-            status: response.status,
+            status: responseStatus,
             responseHeaders: {},
             mimeType: "",
             bodySize: 0,
@@ -2205,25 +2242,24 @@ function startBootstrapFetch(url, method, headersJson, body, pageOrigin, mode, c
             initiatorType: "script",
           }),
         });
-        try { await response.body?.cancel(); } catch {}
+        responseBytes = new Uint8Array();
         bootstrapFetchResolution(id, { ok: true, value: JSON.stringify({ blocked: false, corsBlocked: false, status: 0, headers: {}, body: "", url: "", redirected: false }) });
         return;
       }
-      const bytes = await readBoundedResponseBytes(response, MAX_NAVIGATION_RESPONSE_BYTES);
       queueBootstrapNetworkEvent({
         generation: record.generation,
         runtime: record.runtime,
         ...networkRecord({
           requestId,
           loaderId,
-          url: response.url || effectiveUrl.toString(),
+          url: responseUrl,
           method: effectiveMethod,
           requestHeaders,
-          status: response.status,
+          status: responseStatus,
           responseHeaders,
           mimeType: responseHeaders["content-type"] ?? "",
-          body: bytes,
-          bodySize: bytes.byteLength,
+          body: responseBytes,
+          bodySize: responseBytes.byteLength,
           resourceType: "Fetch",
           initiatorType: "script",
         }),
@@ -2233,11 +2269,11 @@ function startBootstrapFetch(url, method, headersJson, body, pageOrigin, mode, c
         value: JSON.stringify({
           blocked: false,
           corsBlocked: false,
-          status: response.status,
+          status: responseStatus,
           headers: responseHeaders,
-          body: Buffer.from(bytes).toString("utf8"),
-          bodyBase64: Buffer.from(bytes).toString("base64"),
-          url: response.url || targetUrl.toString(),
+          body: Buffer.from(responseBytes).toString("utf8"),
+          bodyBase64: Buffer.from(responseBytes).toString("base64"),
+          url: responseUrl,
           redirected: response.redirected,
         }),
       });
