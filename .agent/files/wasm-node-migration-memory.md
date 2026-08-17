@@ -1,7 +1,7 @@
 # Obscura Node and WebAssembly migration memory
 
 Latest verified implementation commit:
-`b674f79` (`feat: extend Fetch response interception to resources`).
+`32cb905` (`feat: add portable bounded HTTP cache policy`).
 The prior checkpoint was `c78d6a5` (`feat: route portable navigation network state through WASM`).
 Earlier harness, portable rendering, resource discovery, PDF, and
 boundary-hardening milestones remain recorded below.
@@ -950,5 +950,40 @@ Verification:
 This still is not complete browser parity. Cache validation/revalidation,
 redirect policy under interception, response-stage edge semantics for every
 resource type, broader CDP domains, mutation/event synchronization, full
+Playwright compatibility, Deno packaging, and the unavailable obstacle course
+remain open.
+
+## Portable bounded HTTP cache checkpoint (2026-08-17)
+
+Source commit: `32cb905` (`feat: add portable bounded HTTP cache policy`).
+
+The portable Rust CDP target now owns `Network.setCacheDisabled` policy and
+`Network.clearBrowserCache` state. The Node adapter keeps a per-page bounded
+HTTP response cache for successful GET/HEAD document, script, stylesheet, and
+render-resource responses. Keys include URL, method, resource type, and
+normalized request headers. Entries use deterministic LRU eviction with
+128-entry and 16 MiB aggregate caps; `no-store`, `no-cache`, and `set-cookie`
+responses are excluded. Request interception runs before lookup, and
+response-stage interception still runs for cache hits. Cache clear and
+disabling are propagated from the WASM CDP state to the host store.
+
+Verification:
+
+- Rust release fallback cache-policy test: **1/1 passed**. The environment
+  lacks `cargo-nextest`; the equivalent release `cargo test` command was used.
+- Fresh render-enabled wasm32 release build passed.
+- Real package suite: **10 passed, 1 optional Playwright skip, 0 failed**.
+  The fixture proves cache reuse, `Network.setCacheDisabled`, and
+  `Network.clearBrowserCache` by counting script requests, alongside the
+  existing request/response interception and screenshot coverage.
+- Real Node WASM harness: **68 passed, 2 expected native-addon skips, 0
+  failed**.
+- Exact render CLI release build passed as a repository regression gate.
+
+Page `fetch()`/XHR currently still use their own response path and are not yet
+backed by this HTTP cache; adding that without changing CORS, credentials,
+cookie, and response-stage ordering is a remaining bounded task. Full cache
+revalidation/expiry/Vary semantics, redirect policy under interception,
+broader CDP domains, full DOM mutation/event synchronization, complete
 Playwright compatibility, Deno packaging, and the unavailable obstacle course
 remain open.
