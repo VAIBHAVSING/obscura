@@ -509,7 +509,19 @@ function synchronousResult(value, label) {
 
 function boundedEvaluateScript(source, filename) {
   const literal = JSON.stringify(sourceText(source));
-  return new vm.Script(`globalThis.${BOUNDED_EVALUATE_BINDING}(${literal})`, { filename });
+  return new vm.Script(`globalThis.${BOUNDED_EVALUATE_BINDING}(${literal})`, {
+    filename,
+    // Node's VM supports dynamic import for both Script and SourceTextModule
+    // when the Worker is launched with --experimental-vm-modules. Keep the
+    // hook on the script itself so a page-created import() remains in the
+    // same bounded module graph and never falls back to host-realm import().
+    importModuleDynamically(specifier, script) {
+      const referrer = typeof script?.identifier === "string"
+        ? script.identifier
+        : documentUrlForCookies();
+      return dynamicImportModule(specifier, referrer, MAX_NAVIGATION_REQUEST_TIMEOUT_MS, activeAllowPrivateNetwork);
+    },
+  });
 }
 
 function decodeBoundedEnvelope(serialized, label) {
@@ -2074,10 +2086,13 @@ function resolveModuleSpecifier(specifier, referrer) {
   return resolved;
 }
 
-function rejectDynamicImportSyntax(source) {
-  if (/\bimport\s*\(/.test(source)) {
-    throw new TypeError("dynamic import() is not yet supported in the bounded VM module loader");
-  }
+async function dynamicImportModule(specifier, referrer, requestTimeoutMs, allowPrivateNetwork) {
+  const targetUrl = resolveModuleSpecifier(specifier, referrer || documentUrlForCookies());
+  // Static imports are linked by the parent module's graph evaluation. A
+  // dynamic import has no such parent evaluation step, so evaluate the
+  // fetched dependency before returning its Module to V8. This also keeps
+  // cycles and duplicate imports in the same per-document record map.
+  return await loadAndEvaluateModule(targetUrl, requestTimeoutMs, allowPrivateNetwork);
 }
 
 async function loadModuleRecord(url, requestTimeoutMs, allowPrivateNetwork) {
@@ -2093,7 +2108,6 @@ async function loadModuleRecord(url, requestTimeoutMs, allowPrivateNetwork) {
   const sourceBytes = await fetchClassicScript(url, requestTimeoutMs, allowPrivateNetwork);
   const source = new TextDecoder("utf-8", { fatal: false }).decode(sourceBytes);
   requireBoundedString(source, MAX_SCRIPT_SOURCE_BYTES, "module source");
-  rejectDynamicImportSyntax(source);
   const record = { url, module: null, linkPromise: null, evaluatePromise: null };
   moduleRecords.set(url, record);
   try {
@@ -2103,8 +2117,8 @@ async function loadModuleRecord(url, requestTimeoutMs, allowPrivateNetwork) {
       initializeImportMeta(meta) {
         meta.url = url;
       },
-      importModuleDynamically: () => {
-        throw new TypeError("dynamic import() is not yet supported in the bounded VM module loader");
+      importModuleDynamically(specifier, referencingModule) {
+        return dynamicImportModule(specifier, referencingModule?.identifier || url, requestTimeoutMs, allowPrivateNetwork);
       },
     });
     record.linkPromise = record.module.link(async (specifier, referencingModule) => {
@@ -2160,7 +2174,6 @@ async function executeDocumentModules(records, base, requestTimeoutMs, allowPriv
       if (!script.src) {
         const source = script.code;
         requireBoundedString(source, MAX_SCRIPT_SOURCE_BYTES, "module source");
-        rejectDynamicImportSyntax(source);
         if (typeof vm.SourceTextModule !== "function") {
           throw new Error("Node VM modules are unavailable; launch the Worker with --experimental-vm-modules");
         }
@@ -2170,8 +2183,8 @@ async function executeDocumentModules(records, base, requestTimeoutMs, allowPriv
           context: getHostContext(),
           identifier: sourceUrl,
           initializeImportMeta(meta) { meta.url = sourceUrl; },
-          importModuleDynamically: () => {
-            throw new TypeError("dynamic import() is not yet supported in the bounded VM module loader");
+          importModuleDynamically(specifier, referencingModule) {
+            return dynamicImportModule(specifier, referencingModule?.identifier || sourceUrl, requestTimeoutMs, allowPrivateNetwork);
           },
         });
         record.linkPromise = record.module.link(async (specifier, referencingModule) => {

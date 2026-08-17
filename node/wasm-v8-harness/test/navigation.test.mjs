@@ -49,6 +49,11 @@ test("portable navigation owns redirects, document identity, history, and HTML c
       response.end(`<!doctype html><html><head><script type="importmap">{"imports":{"dep":"/dep.js"}}</script><script type="module">import { value } from "dep"; document.body.setAttribute("data-module", value);</script></head><body><h1>modules</h1></body></html>`);
       return;
     }
+    if (request.url === "/dynamic-page") {
+      response.writeHead(200, { "content-type": "text/html; charset=UTF-8" });
+      response.end(`<!doctype html><html><head><script type="module">globalThis.__dynamicState = 'started'; globalThis.__dynamicPromise = import('/dynamic.js'); globalThis.__dynamicPromise.then((module) => { globalThis.__dynamicState = module.default; document.body.setAttribute('data-dynamic', module.default); }).catch((error) => { globalThis.__dynamicState = error.name; document.body.setAttribute('data-dynamic-error', error.name); });</script></head><body><h1>dynamic modules</h1></body></html>`);
+      return;
+    }
     if (request.url === "/dep.js") {
       response.writeHead(200, { "content-type": "text/javascript" });
       response.end("export const value = 'dep-ok';");
@@ -108,6 +113,14 @@ test("portable navigation owns redirects, document identity, history, and HTML c
     });
     assert.equal(modules.scripts.modules.executed.length, 1);
     assert.equal(await worker.bootstrapEvaluate("document.body.getAttribute('data-module')"), "dep-ok");
+
+    await worker.navigate(`http://127.0.0.1:${port}/dynamic-page`, {
+      allowPrivateNetwork: true,
+    });
+    await new Promise((resolve) => setTimeout(resolve, 100));
+    assert.equal(await worker.bootstrapEvaluate("globalThis.__dynamicState"), "started");
+    assert.equal(await worker.bootstrapEvaluate("document.body.getAttribute('data-dynamic')"), "dynamic-ok");
+    assert.equal(await worker.bootstrapEvaluate("document.body.getAttribute('data-dynamic-error')"), null);
 
     await assert.rejects(
       worker.navigate("http://127.0.0.1:1/blocked"),
