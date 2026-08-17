@@ -63,7 +63,7 @@ envelopes, following the existing harness security design.
 
 ## Current authoritative baseline
 
-The latest pushed package checkpoint is `8538aa0` on
+The latest pushed package checkpoint is `c78d6a5` on
 `wasm-node-migration`.
 
 Pushed baseline: `c860841` on `wasm-node-migration`.
@@ -93,11 +93,44 @@ Additional shipped slices after that checkpoint:
 - `fbf7b34`: bounded Node fetch/XHR bridge for navigation and page realms.
 - `0f3b0a8`: static ES modules, import maps and bounded module graph loading.
 - `c860841`: target-neutral cookie state with Node request/document adapters.
+- `1c91203`: bounded dynamic module import loading through the Node host.
+- `ea23961`: portable PDF generation and CDP return-as-stream handling.
+- `c78d6a5`: navigation request/response/loading-finished events and bounded
+  response bodies owned by the portable WASM CDP state.
 
-These slices are real and tested, but they do not yet constitute a complete
-CDP browser or a publishable npm package. Dynamic `import()` remains
-fail-closed, XHR is a compatibility subset, and interception/cache/full SSRF
-policy are not complete.
+These slices are real and tested, and they now form a publishable npm
+feasibility package, but they do not yet constitute a complete CDP browser.
+Dynamic `import()` remains
+bounded by the host module loader, XHR is a compatibility subset, network
+events currently cover navigation metadata rather than every subresource,
+and interception/cache/full SSRF policy are not complete.
+
+## Current checkpoint status (2026-08-17)
+
+The portable WASM CDP core and the JavaScript host transport are now exercised
+together. The latest source checkpoint is `c78d6a5`; it keeps navigation network
+metadata, bounded response bodies, `Network.enable/disable`, and
+`Network.getResponseBody` in WASM while Node performs the actual HTTP fetch.
+The package tarball contains JavaScript, declarations, bootstrap code, and the
+WASM bindgen output only; it rejects native `.node` paths.
+
+Recorded verification for this checkpoint:
+
+- Full release render nextest: 1,491/1,491 passed, 4 configured skips.
+- Portable WASM release nextest: 63/63 passed.
+- Node host harness: 62 passed, 8 expected skips.
+- Real package WASM CDP suite: 6 passed, 1 optional Playwright skip.
+- Clean packed npm artifact connected through Playwright over CDP and produced
+  a valid PNG and PDF; the tarball contained no native addon or CLI binary.
+- Exact release CLI build passed as a repository regression gate. The CLI is
+  not part of the npm runtime architecture.
+
+The remaining work is browser-surface parity rather than the basic WASM/Node
+transport: subresource and page-script network events, complete interception,
+cache and redirect policy, broader CDP domains, DOM mutation/event
+synchronization between the page realm and CDP state, and production release
+publishing. The companion `obscura-benchmark` repository is absent, so its
+33/33 obstacle course is unavailable and must not be reported as passed.
 
 The user-owned untracked repository-root `index.js` is outside this migration.
 Never edit, delete, stage or commit it.

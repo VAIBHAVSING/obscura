@@ -1,9 +1,9 @@
 # Obscura Node and WebAssembly migration memory
 
 Latest verified implementation commit:
-`ab36f8e6743b3efc822a4e709585018068ca96aa`
-(`feat: generate portable WASM PDFs`). Earlier harness, portable rendering,
-resource discovery, and boundary-hardening milestones remain recorded below.
+`c78d6a5` (`feat: route portable navigation network state through WASM`).
+Earlier harness, portable rendering, resource discovery, PDF, and
+boundary-hardening milestones remain recorded below.
 
 ## Decision
 
@@ -25,8 +25,9 @@ target obscura-wasm (planned full portable core)
   DOM, selectors, style, layout, portable state, and CPU paint
 ```
 
-Node is the implemented feasibility-harness Worker host, not yet a production
-browser host. The generated Deno bindings execute the same portable core, but
+Node is the implemented package Worker host and JavaScript CDP transport, but
+the browser surface is still a bounded portability slice rather than Chromium
+parity. The generated Deno bindings execute the same portable core, but
 there is not yet a Deno Worker/browser integration. The separate
 `obscura-node` experiment embeds a second, native V8 inside Node. It is a
 native-fidelity fallback and proof of coexistence, not the host-V8 WebAssembly
@@ -694,3 +695,47 @@ This packet supplies portable PDF generation, not navigation/fetch
 orchestration, dynamic script loading, CDP/WebSocket transport, Playwright
 compatibility, or the final npm/npx package. Those remain in the subsequent
 packets.
+
+## Portable CDP navigation-network checkpoint (2026-08-17)
+
+Source commit: `c78d6a5` (`feat: route portable navigation network state through
+WASM`). This is the current pushed source checkpoint.
+
+### Implemented boundary
+
+- The Rust/WASM CDP target owns bounded per-session network enable state,
+  request/response/loading-finished event queues, and response bodies capped at
+  4 MiB and 128 retained entries.
+- The Node worker performs HTTP navigation, streams the full response into the
+  WASM navigation state, and copies only a bounded body into private metadata.
+  The package CDP server removes that metadata from public action results,
+  records it in WASM, emits events, and serves `Network.getResponseBody`.
+- The package remains JavaScript plus WASM. Native `.node` modules, the native
+  Obscura CLI, deno_core, and rusty_v8 are rejected or absent from the npm
+  tarball.
+
+### Verification
+
+- Full release render gate: **1,491/1,491 passed, 4 configured skips**, run
+  `5fc36316-6c3e-4f82-91d2-9c8b34e2cb39`.
+- Portable WASM release nextest: **63/63 passed**, run
+  `5299006f-7189-4fd1-a91a-a4b440932ef7`.
+- Node host harness: **62 passed, 8 expected skips, 0 failed**.
+- Real WASM package CDP suite: **6 passed, 1 optional Playwright skip, 0
+  failed**. The real network test observed request/response/loading-finished
+  events and retrieved the HTML body through `Network.getResponseBody`.
+- A clean `@obscura/browser` tarball was installed into a temporary directory,
+  connected through Playwright over CDP, navigated, evaluated a selector,
+  captured a valid PNG, and produced a valid `%PDF-` document. The tarball
+  contained no native addon or CLI binary.
+- The exact repository CLI release build passed as a regression gate; the CLI
+  is not used by the npm runtime.
+
+### Remaining limits
+
+This does not claim a complete browser. Network events currently describe
+navigation metadata rather than every subresource, fetch, or XHR. Full
+interception/cache/redirect credential policy, broad CDP domain parity, and
+complete DOM mutation/event synchronization remain. The companion
+`obscura-benchmark` repository is absent, so the required 33/33 obstacle course
+is unavailable and is not counted as passed.
