@@ -405,9 +405,20 @@ class PageTarget {
 
   async screenshot(params = {}) {
     await this.start();
+    const width = params.width ?? this.viewport.width;
+    const height = params.height ?? this.viewport.height;
+    if (typeof this.worker.prepareRenderResources === "function") {
+      await this.worker.prepareRenderResources({
+        width,
+        height,
+        maxMs: Math.min(this.server.requestTimeoutMs, 5_000),
+        requestTimeoutMs: this.server.requestTimeoutMs,
+      });
+      await this.flushPortableNetworkEvents();
+    }
     const result = await this.worker.screenshotPng({
-      width: params.width ?? this.viewport.width,
-      height: params.height ?? this.viewport.height,
+      width,
+      height,
       scrollX: params.scrollX ?? 0,
       scrollY: params.scrollY ?? 0,
       requestTimeoutMs: this.server.requestTimeoutMs,
@@ -417,10 +428,21 @@ class PageTarget {
 
   async pdf(params = {}) {
     await this.start();
+    const viewportWidth = params.viewportWidth ?? this.viewport.width;
+    const viewportHeight = params.viewportHeight ?? this.viewport.height;
+    if (typeof this.worker.prepareRenderResources === "function") {
+      await this.worker.prepareRenderResources({
+        width: viewportWidth,
+        height: viewportHeight,
+        maxMs: Math.min(this.server.requestTimeoutMs, 5_000),
+        requestTimeoutMs: this.server.requestTimeoutMs,
+      });
+      await this.flushPortableNetworkEvents();
+    }
     const result = await this.worker.pdf({
       ...params,
-      viewportWidth: params.viewportWidth ?? this.viewport.width,
-      viewportHeight: params.viewportHeight ?? this.viewport.height,
+      viewportWidth,
+      viewportHeight,
       requestTimeoutMs: this.server.requestTimeoutMs,
     });
     return result.data;

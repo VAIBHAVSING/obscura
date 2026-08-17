@@ -28,6 +28,7 @@ const MAX_VM_TIMEOUT_MS = 4_294_967_295;
 const MAX_NAVIGATION_URL_BYTES = 64 * 1024;
 const MAX_NAVIGATION_RESPONSE_BYTES = 32 * 1024 * 1024;
 const MAX_NAVIGATION_REDIRECTS = 10;
+const MAX_RENDER_RESOURCE_PREPARE_MS = 30_000;
 const MAX_CDP_STREAM_BASE64_BYTES = 12 * 1024 * 1024;
 const require = createRequire(import.meta.url);
 
@@ -551,6 +552,27 @@ export class WasmV8Worker {
         "seedMissingRenderImageResource",
         { url, profile, expectedPage },
         options.requestTimeoutMs,
+      );
+    } catch (error) {
+      return Promise.reject(error);
+    }
+  }
+
+  prepareRenderResources(options = {}) {
+    try {
+      const { width, height, expectedPage } = boundedRenderResourceRequestOptions(options);
+      const requestTimeoutMs = options.requestTimeoutMs;
+      if (requestTimeoutMs !== undefined) validateTimeout(requestTimeoutMs, "render resource request timeout");
+      const maxMs = options.maxMs ?? 5_000;
+      if (!Number.isSafeInteger(maxMs) || maxMs < 1 || maxMs > MAX_RENDER_RESOURCE_PREPARE_MS) {
+        throw new RangeError(
+          `render resource preparation timeout must be an integer between 1 and ${MAX_RENDER_RESOURCE_PREPARE_MS} milliseconds`,
+        );
+      }
+      return this.request(
+        "prepareRenderResources",
+        { width, height, maxMs, requestTimeoutMs, expectedPage },
+        requestTimeoutMs,
       );
     } catch (error) {
       return Promise.reject(error);

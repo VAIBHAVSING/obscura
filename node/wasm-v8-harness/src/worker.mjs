@@ -114,6 +114,8 @@ const MAX_NAVIGATION_RESPONSE_BYTES = 32 * 1024 * 1024;
 const MAX_NETWORK_RESPONSE_BODY_BYTES = 4 * 1024 * 1024;
 const MAX_NAVIGATION_REDIRECTS = 10;
 const MAX_NAVIGATION_REQUEST_TIMEOUT_MS = 120_000;
+const MAX_RENDER_RESOURCE_PREPARE_MS = 30_000;
+const MAX_RENDER_RESOURCE_REQUEST_TIMEOUT_MS = 120_000;
 const MAX_SCRIPT_SOURCE_BYTES = 16 * 1024 * 1024;
 const MAX_DOCUMENT_SCRIPTS = 512;
 const PLATFORM_OP_COMMAND_SET = new Set(BOOTSTRAP_PLATFORM_OP_COMMANDS);
@@ -2986,6 +2988,203 @@ async function seedMissingRenderImageResource({ url, profile, expectedPage } = {
   return { generation, documentHandle: identity.documentHandle, revision: identity.revision };
 }
 
+async function fetchAndSeedRenderResource(
+  request,
+  api,
+  generation,
+  documentHandle,
+  requestTimeoutMs,
+  allowPrivateNetwork,
+) {
+  const url = request.url;
+  const requestId = `resource-${nextBootstrapNetworkRequestId++}`;
+  if (nextBootstrapNetworkRequestId > 0xffff_ffff) nextBootstrapNetworkRequestId = 1;
+  const loaderId = currentNavigationLoaderId();
+  const resourceType = request.kind === "font" ? "Font" : "Image";
+  const initiatorType = "parser";
+  let response;
+  let responseHeaders = {};
+  let responseUrl = url;
+  let requestHeaders = {};
+  let recorded = false;
+  let timer;
+
+  const record = (status, body, bodySize = body?.byteLength ?? 0) => {
+    if (recorded) return;
+    queueBootstrapNetworkEvent({
+      generation,
+      runtime: bootstrapRuntime,
+      ...networkRecord({
+        requestId,
+        loaderId,
+        url: responseUrl,
+        method: "GET",
+        requestHeaders,
+        status,
+        responseHeaders,
+        mimeType: responseHeaders["content-type"] ?? "",
+        body,
+        bodySize,
+        resourceType,
+        initiatorType,
+      }),
+    });
+    recorded = true;
+  };
+
+  const seed = (bytes) => {
+    synchronizeBridgeIdentity(generation, documentHandle);
+    if (request.kind === "image" && request.profile !== undefined) {
+      syncCall(api.seedRenderImageResource, url, request.profile, bytes);
+    } else {
+      syncCall(api.seedRenderResource, url, bytes);
+    }
+    synchronizeBridgeIdentity(generation, documentHandle);
+  };
+
+  const seedMissing = () => {
+    try {
+      synchronizeBridgeIdentity(generation, documentHandle);
+      if (request.kind === "image" && request.profile !== undefined) {
+        syncCall(api.seedMissingRenderImageResource, url, request.profile);
+      } else {
+        syncCall(api.seedMissingRenderResource, url);
+      }
+      synchronizeBridgeIdentity(generation, documentHandle);
+    } catch {
+      // A failed resource must not prevent the renderer from producing a
+      // capture. The WASM cache records a missing resource when possible.
+    }
+  };
+
+  try {
+    const targetUrl = validateNavigationUrl(url, allowPrivateNetwork);
+    if (targetUrl.protocol === "data:" || targetUrl.protocol === "about:") {
+      const inline = decodeInlineNavigation(url);
+      responseHeaders = { "content-type": "application/octet-stream" };
+      record(200, inline.bytes, inline.bytes.byteLength);
+      seed(inline.bytes);
+      return { loaded: true, url };
+    }
+
+    const cookie = cookieHeaderForUrl(targetUrl, "include");
+    if (cookie) requestHeaders.Cookie = cookie;
+    const controller = new AbortController();
+    timer = setTimeout(() => controller.abort(new Error("render resource fetch timed out")), requestTimeoutMs);
+    timer.unref?.();
+    response = await fetch(targetUrl, {
+      headers: requestHeaders,
+      redirect: "follow",
+      signal: controller.signal,
+      referrer: documentUrlForCookies(),
+    });
+    responseUrl = response.url || targetUrl.toString();
+    storeResponseCookies(responseUrl, response);
+    ({ headers: responseHeaders } = responseHeadersObject(response));
+    if (!response.ok) {
+      record(response.status, undefined, 0);
+      try { await response.body?.cancel(); } catch {}
+      seedMissing();
+      return { loaded: false, status: response.status, url: responseUrl };
+    }
+    const bytes = await readBoundedResponseBytes(response, MAX_RENDER_RESOURCE_BYTES);
+    record(response.status, bytes, bytes.byteLength);
+    seed(bytes);
+    return { loaded: true, status: response.status, url: responseUrl };
+  } catch (error) {
+    record(response?.status ?? 0, undefined, 0);
+    seedMissing();
+    return { loaded: false, status: response?.status ?? 0, url: responseUrl, error: error?.name ?? "Error" };
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+async function prepareRenderResources({
+  width = 800,
+  height = 600,
+  requestTimeoutMs = 30_000,
+  maxMs = 5_000,
+  allowPrivateNetwork = activeAllowPrivateNetwork,
+  expectedPage,
+} = {}) {
+  requireExpectedPage(expectedPage);
+  requireBridgeCore();
+  const api = bridgeApi();
+  const capabilities = await getBridgeCapabilityProbe();
+  if (
+    !capabilities ||
+    capabilities.renderResourceRequests !== true ||
+    capabilities.renderResourceRequestAbiVersion !== REQUIRED_RENDER_RESOURCE_REQUEST_ABI_VERSION ||
+    !api.renderResourceRequests ||
+    !api.seedRenderResource ||
+    !api.seedMissingRenderResource ||
+    !api.seedRenderImageResource ||
+    !api.seedMissingRenderImageResource
+  ) {
+    return { skipped: true, reason: "render resource ABI unavailable", requested: 0, loaded: 0, failed: 0 };
+  }
+  if (!Number.isSafeInteger(requestTimeoutMs) || requestTimeoutMs < 1 || requestTimeoutMs > MAX_RENDER_RESOURCE_REQUEST_TIMEOUT_MS) {
+    throw new RangeError(`render resource request timeout must be between 1 and ${MAX_RENDER_RESOURCE_REQUEST_TIMEOUT_MS}ms`);
+  }
+  if (!Number.isSafeInteger(maxMs) || maxMs < 1 || maxMs > MAX_RENDER_RESOURCE_PREPARE_MS) {
+    throw new RangeError(`render resource preparation timeout must be between 1 and ${MAX_RENDER_RESOURCE_PREPARE_MS}ms`);
+  }
+  const generation = bridgeGeneration;
+  const documentHandle = bridgeDocumentHandle;
+  synchronizeBridgeIdentity(generation, documentHandle);
+  const started = performance.now();
+  let offset = 0;
+  let requested = 0;
+  let loaded = 0;
+  let failed = 0;
+  let done = false;
+  const seen = new Set();
+  while (!done && performance.now() - started < maxMs) {
+    const page = await renderResourceRequests({
+      width,
+      height,
+      offset,
+      limit: MAX_RENDER_RESOURCE_REQUESTS_PER_PAGE,
+      expectedPage: { generation, documentHandle },
+    });
+    if (page.requests.length === 0 && page.nextOffset === offset && !page.done) {
+      throw new Error("renderResourceRequests did not advance its cursor");
+    }
+    for (const request of page.requests) {
+      const key = `${request.kind}\u0000${request.profile ?? ""}\u0000${request.url}`;
+      if (seen.has(key)) continue;
+      seen.add(key);
+      requested += 1;
+      const remainingMs = Math.max(1, Math.ceil(maxMs - (performance.now() - started)));
+      const result = await fetchAndSeedRenderResource(
+        request,
+        api,
+        generation,
+        documentHandle,
+        Math.min(requestTimeoutMs, remainingMs),
+        Boolean(allowPrivateNetwork),
+      );
+      if (result.loaded) loaded += 1;
+      else failed += 1;
+      if (performance.now() - started >= maxMs) break;
+    }
+    offset = page.nextOffset;
+    done = page.done;
+  }
+  const identity = synchronizeBridgeIdentity(generation, documentHandle);
+  return {
+    skipped: false,
+    generation,
+    documentHandle: identity.documentHandle,
+    revision: identity.revision,
+    requested,
+    loaded,
+    failed,
+    timedOut: !done,
+  };
+}
+
 async function screenshotPng({ width, height, scrollX, scrollY, expectedPage } = {}) {
   requireExpectedPage(expectedPage);
   requireBridgeCore();
@@ -3287,6 +3486,8 @@ async function dispatch(operation, payload) {
       return await seedRenderImageResource(payload);
     case "seedMissingRenderImageResource":
       return await seedMissingRenderImageResource(payload);
+    case "prepareRenderResources":
+      return await prepareRenderResources(payload);
     case "screenshotPng":
       return await screenshotPng(payload);
     case "pdf":

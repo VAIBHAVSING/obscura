@@ -4,6 +4,10 @@ import { test } from "node:test";
 import { ObscuraCdpServer, CdpClient } from "../src/index.mjs";
 
 const modulePath = process.env.OBSCURA_REAL_WASM_MODULE;
+const PIXEL_PNG = Buffer.from(
+  "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII=",
+  "base64",
+);
 
 test("real WASM artifact is reachable through package CDP", { skip: !modulePath }, async () => {
   const fixture = createHttpServer((request, response) => {
@@ -17,9 +21,15 @@ test("real WASM artifact is reachable through package CDP", { skip: !modulePath 
       response.end("globalThis.__portableScriptLoaded = true;");
       return;
     }
+    if (request.url === "/pixel.png") {
+      response.setHeader("content-type", "image/png");
+      response.end(PIXEL_PNG);
+      return;
+    }
     response.setHeader("content-type", "text/html; charset=utf-8");
     const script = request.url === "/headers" ? '<script src="/script.js"></script>' : "";
-    response.end(`<html><body><h1>${request.headers["x-portable"] ?? "missing"}</h1>${script}</body></html>`);
+    const image = request.url === "/render" ? '<img src="/pixel.png" width="1" height="1">' : "";
+    response.end(`<html><body><h1>${request.headers["x-portable"] ?? "missing"}</h1>${script}${image}</body></html>`);
   });
   await new Promise((resolve, reject) => {
     fixture.once("error", reject);
@@ -122,6 +132,25 @@ test("real WASM artifact is reachable through package CDP", { skip: !modulePath 
       ? Buffer.from(fetchResponseBody.body, "base64").toString("utf8")
       : fetchResponseBody.body;
     assert.equal(fetchText, "fetch-body");
+    const renderUrl = new URL("/render", fixtureUrl).href;
+    await client.command("Page.navigate", { url: renderUrl }, sessionId);
+    const renderScreenshot = await client.command("Page.captureScreenshot", {}, sessionId);
+    assert.deepEqual(Buffer.from(renderScreenshot.data, "base64").subarray(0, 8), Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]));
+    const imageUrl = new URL("/pixel.png", renderUrl).href;
+    const imageRequestEvent = networkEvents.find(
+      (event) => event.method === "Network.requestWillBeSent" && event.params.request.url === imageUrl,
+    );
+    assert.ok(imageRequestEvent?.params?.requestId);
+    assert.equal(imageRequestEvent.params.type, "Image");
+    const imageResponseBody = await client.command(
+      "Network.getResponseBody",
+      { requestId: imageRequestEvent.params.requestId },
+      sessionId,
+    );
+    const imageBytes = imageResponseBody.base64Encoded
+      ? Buffer.from(imageResponseBody.body, "base64")
+      : Buffer.from(imageResponseBody.body, "binary");
+    assert.deepEqual(imageBytes, PIXEL_PNG);
     stopNetworkEvents();
     const headerValue = await client.command("Runtime.evaluate", {
       expression: "document.querySelector('h1').textContent",
