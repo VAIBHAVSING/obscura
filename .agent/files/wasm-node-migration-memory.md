@@ -766,3 +766,25 @@ The remaining browser-parity work is still broader than this slice: page script
 and subresource events, complete interception/cache/redirect policy, broader CDP
 domains, DOM mutation/event synchronization, and the unavailable companion
 obstacle course remain open.
+
+## Portable script-network checkpoint (2026-08-17)
+
+Source commit: `7322acf` (`feat: expose portable script network events`).
+
+External classic script loads now use the same bounded WASM CDP network ingress
+as page fetches. The Node adapter assigns a loader/request identity, records
+`Network.requestWillBeSent`, `Network.responseReceived`, and
+`Network.loadingFinished` with `type: "Script"`, retains response bytes only
+within the existing cap, and preserves the package's external session ID.
+Failed script responses are represented as bounded failed network records and
+are never evaluated as source. Module and dynamic-import fetches share this
+adapter path.
+
+Verification:
+
+- Full release render nextest: **1,492/1,492 passed, 4 configured skips**.
+- Exact release CLI build with render: passed.
+- Node WASM harness: **62 passed, 8 expected skips, 0 failed**.
+- Real `@obscura/browser` package suite: **6 passed, 1 optional Playwright skip,
+  0 failed**, including a real external script event and
+  `Network.getResponseBody` assertion.
