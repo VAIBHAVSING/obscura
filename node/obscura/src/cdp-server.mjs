@@ -288,7 +288,10 @@ class PageTarget {
       });
     }
     this.networkFlushTimer = setInterval(() => {
-      void this.flushPortableNetworkEvents();
+      // Fetch interception may pause a parser/resource request while the
+      // navigation host action is awaiting network I/O. Poll portable CDP
+      // events during that await so the client can continue/fulfill/fail it.
+      void this.flushPortableNetworkEvents({ allowWhilePaused: true });
     }, 25);
     this.networkFlushTimer.unref?.();
   }
@@ -311,15 +314,23 @@ class PageTarget {
     this.worker = null;
   }
 
-  async flushPortableNetworkEvents() {
-    if (this.closed || this.networkFlushPaused || !this.worker || this.portableCdpConnections.size === 0) return;
+  async flushPortableNetworkEvents({ allowWhilePaused = false } = {}) {
+    if (this.closed || (this.networkFlushPaused && !allowWhilePaused) || !this.worker || this.portableCdpConnections.size === 0) return;
     if (this.networkFlushPromise) return this.networkFlushPromise;
     this.networkFlushPromise = (async () => {
       let recorded;
-      try {
-        recorded = await this.worker.portableCdpRecordNetwork({ requestTimeoutMs: this.server.requestTimeoutMs });
-      } catch {
-        return;
+      // While a navigation is awaiting a Fetch pause, expose only the
+      // Fetch.requestPaused control event. Hold ordinary Network metadata
+      // until the navigation commits so Document remains before its
+      // subresources in the observable event order.
+      if (this.networkFlushPaused && allowWhilePaused) {
+        recorded = { recorded: true, count: 0 };
+      } else {
+        try {
+          recorded = await this.worker.portableCdpRecordNetwork({ requestTimeoutMs: this.server.requestTimeoutMs });
+        } catch {
+          return;
+        }
       }
       // Poll even when no asynchronous Network metadata was recorded. Fetch
       // interception emits requestPaused directly from the portable CDP core,

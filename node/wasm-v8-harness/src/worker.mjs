@@ -431,6 +431,10 @@ let portableCdpCore = null;
 let bootstrapRuntime;
 let nextBootstrapFetchId = 1;
 const bootstrapFetches = new Map();
+// Host-owned parser/resource requests can pause at a portable Fetch
+// interception point while the main navigation operation is awaiting I/O.
+// Their continuations are serviced by re-entrant portableCdp messages.
+const portableFetchWaiters = new Map();
 const MAX_BOOTSTRAP_NETWORK_EVENTS = 512;
 const MAX_BOOTSTRAP_NETWORK_BYTES = 12 * 1024 * 1024;
 let nextBootstrapNetworkRequestId = 1;
@@ -1269,11 +1273,13 @@ function drainPortableFetchResolutions() {
   let applied = 0;
   for (const resolution of resolutions) {
     if (!resolution || typeof resolution !== "object" || typeof resolution.requestId !== "string") continue;
-    const record = [...bootstrapFetches.values()].find((candidate) => candidate.requestId === resolution.requestId);
+    const record = [...bootstrapFetches.values()].find((candidate) => candidate.requestId === resolution.requestId)
+      ?? portableFetchWaiters.get(resolution.requestId);
     if (!record || typeof record.interceptionResolve !== "function") continue;
     const resolve = record.interceptionResolve;
     record.interceptionResolve = null;
     record.interceptionReject = null;
+    if (portableFetchWaiters.get(resolution.requestId) === record) portableFetchWaiters.delete(resolution.requestId);
     resolve(resolution);
     applied += 1;
   }
@@ -1291,6 +1297,20 @@ function portableCdpInterceptFetch(metadata) {
     if (error?.code === "ERR_OBSCURA_CDP_ABI") throw error;
     return { paused: false };
   }
+}
+
+function awaitPortableFetchInterception(metadata, record) {
+  const interception = portableCdpInterceptFetch(metadata);
+  if (interception.paused !== true) return null;
+  if (!record || typeof record !== "object" || typeof metadata?.requestId !== "string") {
+    throw new TypeError("portable Fetch interception requires a request record");
+  }
+  return new Promise((resolve, reject) => {
+    record.requestId = metadata.requestId;
+    record.interceptionResolve = resolve;
+    record.interceptionReject = reject;
+    portableFetchWaiters.set(metadata.requestId, record);
+  });
 }
 
 
@@ -1806,7 +1826,11 @@ function resetBridgeRealmAfterNavigation() {
 
 function cancelBootstrapFetches(cdpCore = portableCdpCore) {
   const cancel = member(cdpCore, ["cancelFetchRequest", "cancel_fetch_request"]);
-  for (const { controller, requestId, interceptionResolve } of bootstrapFetches.values()) {
+  const records = [...bootstrapFetches.values(), ...portableFetchWaiters.values()];
+  const seen = new Set();
+  for (const { controller, requestId, interceptionResolve } of records) {
+    if (seen.has(requestId)) continue;
+    seen.add(requestId);
     try { controller.abort(new Error("page realm was reset")); } catch {}
     if (typeof interceptionResolve === "function") {
       try { interceptionResolve({ requestId, action: "fail", reason: "Aborted" }); } catch {}
@@ -1816,6 +1840,7 @@ function cancelBootstrapFetches(cdpCore = portableCdpCore) {
     }
   }
   bootstrapFetches.clear();
+  portableFetchWaiters.clear();
 }
 
 function validateNavigationUrl(value, allowPrivateNetwork = false) {
@@ -2020,6 +2045,76 @@ function fetchHeadersFromCdp(value, fallback) {
     headers[entry.name] = entry.value;
   }
   return headers;
+}
+
+function decodeFetchFulfillment(resolution, fallbackUrl) {
+  const bodyBase64 = String(resolution?.bodyBase64 ?? "");
+  const bytes = Buffer.from(bodyBase64, "base64");
+  if (bytes.byteLength > MAX_NAVIGATION_RESPONSE_BYTES) {
+    throw new RangeError(`Fetch fulfillment exceeds the ${MAX_NAVIGATION_RESPONSE_BYTES}-byte limit`);
+  }
+  const headers = {};
+  for (const entry of Array.isArray(resolution?.headers) ? resolution.headers : []) {
+    if (entry && typeof entry.name === "string" && typeof entry.value === "string") {
+      requireBoundedString(entry.name, 1024, "Fetch response header name");
+      requireBoundedString(entry.value, MAX_NAVIGATION_HEADERS_BYTES, "Fetch response header value");
+      headers[entry.name] = entry.value;
+    }
+  }
+  const url = typeof resolution?.url === "string" ? resolution.url : fallbackUrl;
+  return {
+    url: validateNavigationUrl(url, activeAllowPrivateNetwork).toString(),
+    status: Number.isSafeInteger(resolution?.status) ? resolution.status : 200,
+    headers,
+    bytes,
+  };
+}
+
+async function hostFetchInterception({
+  requestId,
+  url,
+  method = "GET",
+  headers = {},
+  postData,
+  resourceType = "Other",
+  frameId = "page-1",
+  record,
+} = {}) {
+  const resolution = awaitPortableFetchInterception({
+    requestId,
+    requestStage: "Request",
+    url: String(url),
+    method: String(method),
+    headers,
+    postData,
+    resourceType,
+    frameId,
+  }, record);
+  if (!resolution) return { url, method, headers, postData, fulfilled: null };
+  if (!resolution || resolution.action === "fail") {
+    throw new Error("Fetch request failed by interception");
+  }
+  if (resolution.action === "fulfill") {
+    return {
+      url,
+      method,
+      headers,
+      postData,
+      fulfilled: decodeFetchFulfillment(resolution, String(url)),
+    };
+  }
+  let effectiveUrl = url;
+  if (typeof resolution.url === "string") effectiveUrl = validateNavigationUrl(resolution.url, activeAllowPrivateNetwork).toString();
+  const effectiveMethod = typeof resolution.method === "string" ? resolution.method : method;
+  requireBoundedString(effectiveMethod, 32, "Fetch continue method");
+  const effectiveHeaders = fetchHeadersFromCdp(resolution.headers, headers);
+  return {
+    url: effectiveUrl,
+    method: effectiveMethod,
+    headers: effectiveHeaders,
+    postData: typeof resolution.postData === "string" ? resolution.postData : postData,
+    fulfilled: null,
+  };
 }
 
 function bootstrapFetchResolution(id, envelope) {
@@ -2321,11 +2416,36 @@ async function fetchClassicScript(url, requestTimeoutMs, allowPrivateNetwork, { 
     const headers = {};
     const cookie = cookieHeaderForUrl(url, "include");
     if (cookie) headers.Cookie = cookie;
-    response = await fetch(url, { headers, redirect: "follow", signal: controller.signal });
-    storeResponseCookies(response.url || url, response);
-    const { headers: responseHeaders } = responseHeadersObject(response);
-    const responseUrl = response.url || url;
-    if (!response.ok) {
+    const decision = await hostFetchInterception({
+      requestId,
+      url,
+      method: "GET",
+      headers,
+      resourceType: "Script",
+      frameId: "page-1",
+      record: { controller, generation: bridgeGeneration, runtime: bootstrapRuntime },
+    });
+    let responseHeaders;
+    let responseUrl;
+    let status;
+    let bytes;
+    if (decision.fulfilled) {
+      ({ headers: responseHeaders, url: responseUrl, status, bytes } = decision.fulfilled);
+    } else {
+      response = await fetch(decision.url, {
+        method: decision.method,
+        headers: decision.headers,
+        body: decision.method === "GET" || decision.method === "HEAD" ? undefined : binaryStringToBytes(decision.postData ?? ""),
+        redirect: "follow",
+        signal: controller.signal,
+      });
+      storeResponseCookies(response.url || decision.url, response);
+      ({ headers: responseHeaders } = responseHeadersObject(response));
+      responseUrl = response.url || decision.url;
+      status = response.status;
+      bytes = status >= 200 && status < 300 ? await readBoundedResponseBytes(response) : new Uint8Array();
+    }
+    if (status < 200 || status >= 300) {
       queueBootstrapNetworkEvent({
         generation: bridgeGeneration,
         runtime: bootstrapRuntime,
@@ -2333,9 +2453,9 @@ async function fetchClassicScript(url, requestTimeoutMs, allowPrivateNetwork, { 
           requestId,
           loaderId,
           url: responseUrl,
-          method: "GET",
-          requestHeaders: headers,
-          status: response.status,
+          method: decision.method,
+          requestHeaders: decision.headers,
+          status,
           responseHeaders,
           mimeType: responseHeaders["content-type"] ?? "",
           bodySize: 0,
@@ -2344,10 +2464,9 @@ async function fetchClassicScript(url, requestTimeoutMs, allowPrivateNetwork, { 
         }),
       });
       recorded = true;
-      try { await response.body?.cancel(); } catch {}
-      throw new Error(`script fetch returned HTTP ${response.status}`);
+      try { await response?.body?.cancel(); } catch {}
+      throw new Error(`script fetch returned HTTP ${status}`);
     }
-    const bytes = await readBoundedResponseBytes(response);
     queueBootstrapNetworkEvent({
       generation: bridgeGeneration,
       runtime: bootstrapRuntime,
@@ -2355,9 +2474,9 @@ async function fetchClassicScript(url, requestTimeoutMs, allowPrivateNetwork, { 
         requestId,
         loaderId,
         url: responseUrl,
-        method: "GET",
-        requestHeaders: headers,
-        status: response.status,
+        method: decision.method,
+        requestHeaders: decision.headers,
+        status,
         responseHeaders,
         mimeType: responseHeaders["content-type"] ?? "",
         body: bytes,
@@ -2449,12 +2568,13 @@ async function fetchStylesheetCss(url, requestTimeoutMs, allowPrivateNetwork, se
   const requestId = `stylesheet-${nextBootstrapNetworkRequestId++}`;
   if (nextBootstrapNetworkRequestId > 0xffff_ffff) nextBootstrapNetworkRequestId = 1;
   const loaderId = currentNavigationLoaderId();
-  const requestHeaders = {};
+  let requestHeaders = {};
   const cookie = cookieHeaderForUrl(targetUrl, "include");
   if (cookie) requestHeaders.Cookie = cookie;
   let response;
   let responseHeaders = {};
   let responseUrl = targetUrl.toString();
+  let responseStatus = 0;
   let recorded = false;
   let timer;
   const record = (status, body, bodySize = body?.byteLength ?? 0) => {
@@ -2491,19 +2611,39 @@ async function fetchStylesheetCss(url, requestTimeoutMs, allowPrivateNetwork, se
       timer = setTimeout(() => controller.abort(new Error("stylesheet fetch timed out")), requestTimeoutMs);
       timer.unref?.();
       const referrer = documentUrlForCookies();
-      const options = { headers: requestHeaders, redirect: "follow", signal: controller.signal };
-      if (/^https?:/iu.test(referrer)) options.referrer = referrer;
-      response = await fetch(targetUrl, options);
-      responseUrl = response.url || targetUrl.toString();
-      storeResponseCookies(responseUrl, response);
-      ({ headers: responseHeaders } = responseHeadersObject(response));
-      if (!response.ok) {
-        record(response.status, undefined, 0);
-        try { await response.body?.cancel(); } catch {}
-        throw new Error(`stylesheet fetch returned HTTP ${response.status}`);
+      const decision = await hostFetchInterception({
+        requestId,
+        url: targetUrl.toString(),
+        method: "GET",
+        headers: requestHeaders,
+        resourceType: "Stylesheet",
+        frameId: "page-1",
+        record: { controller, generation: bridgeGeneration, runtime: bootstrapRuntime },
+      });
+      requestHeaders = decision.headers;
+      if (decision.fulfilled) {
+        ({ headers: responseHeaders, url: responseUrl, status: responseStatus } = decision.fulfilled);
+        bytes = responseStatus >= 200 && responseStatus < 300 ? decision.fulfilled.bytes : new Uint8Array();
+      } else {
+        const options = { headers: decision.headers, redirect: "follow", signal: controller.signal };
+        if (/^https?:/iu.test(referrer)) options.referrer = referrer;
+        response = await fetch(decision.url, options);
+        responseUrl = response.url || decision.url;
+        storeResponseCookies(responseUrl, response);
+        ({ headers: responseHeaders } = responseHeadersObject(response));
+        responseStatus = response.status;
+        if (responseStatus >= 200 && responseStatus < 300) {
+          bytes = await readBoundedResponseBytes(response, MAX_STYLESHEET_SOURCE_BYTES);
+        } else {
+          bytes = new Uint8Array();
+        }
       }
-      bytes = await readBoundedResponseBytes(response, MAX_STYLESHEET_SOURCE_BYTES);
-      record(response.status, bytes, bytes.byteLength);
+      if (responseStatus < 200 || responseStatus >= 300) {
+        record(responseStatus, undefined, 0);
+        try { await response?.body?.cancel(); } catch {}
+        throw new Error(`stylesheet fetch returned HTTP ${responseStatus}`);
+      }
+      record(responseStatus, bytes, bytes.byteLength);
     }
     const css = new TextDecoder("utf-8", { fatal: false }).decode(bytes);
     requireBoundedString(css, MAX_STYLESHEET_SOURCE_BYTES, "stylesheet source");
@@ -2969,41 +3109,73 @@ async function navigatePortable({ url, options = {}, allowPrivateNetwork = false
       const navigationHeaders = { ...extraHTTPHeaders };
       const navigationCookie = cookieHeaderForUrl(targetUrl, "include");
       if (navigationCookie) navigationHeaders.Cookie = navigationCookie;
-      const response = await fetch(targetUrl, {
+      const requestId = `${action.loaderId}${action.redirectCount ? `-redirect-${action.redirectCount}` : ""}`;
+      const decision = await hostFetchInterception({
+        requestId,
+        url: targetUrl.toString(),
         method: action.method,
         headers: navigationHeaders,
-        body: action.method === "GET" || action.method === "HEAD" ? undefined : action.body,
-        redirect: "manual",
-        signal: controller.signal,
-        referrer: action.referrer || undefined,
+        postData: action.method === "GET" || action.method === "HEAD" ? undefined : action.body,
+        resourceType: "Document",
+        frameId: "page-1",
+        record: { controller, generation: bridgeGeneration, runtime: bootstrapRuntime },
       });
-      storeResponseCookies(response.url || targetUrl, response);
-      const { headers, serialized } = responseHeadersObject(response);
-      const requestId = `${action.loaderId}${action.redirectCount ? `-redirect-${action.redirectCount}` : ""}`;
+      let response = null;
+      let responseUrl;
+      let responseStatus;
+      let headers;
+      let serialized;
+      let fulfilledBytes = null;
+      if (decision.fulfilled) {
+        responseUrl = decision.fulfilled.url;
+        responseStatus = decision.fulfilled.status;
+        headers = decision.fulfilled.headers;
+        serialized = JSON.stringify(headers);
+        fulfilledBytes = decision.fulfilled.bytes;
+      } else {
+        response = await fetch(decision.url, {
+          method: decision.method,
+          headers: decision.headers,
+          body: decision.method === "GET" || decision.method === "HEAD" ? undefined : binaryStringToBytes(decision.postData ?? ""),
+          redirect: "manual",
+          signal: controller.signal,
+          referrer: action.referrer || undefined,
+        });
+        storeResponseCookies(response.url || decision.url, response);
+        ({ headers, serialized } = responseHeadersObject(response));
+        responseUrl = response.url || decision.url;
+        responseStatus = response.status;
+      }
       const responseRecord = networkRecord({
         requestId,
         loaderId: action.loaderId,
-        url: targetUrl.toString(),
-        method: action.method,
-        requestHeaders: navigationHeaders,
-        status: response.status,
+        url: responseUrl,
+        method: decision.method,
+        requestHeaders: decision.headers,
+        status: responseStatus,
         responseHeaders: headers,
         mimeType: headers["content-type"] ?? "",
-        redirect: response.status >= 300 && response.status < 400,
+        redirect: responseStatus >= 300 && responseStatus < 400,
       });
-      action = JSON.parse(syncCall(api.navigationResponseHeaders, navigationId, response.status, serialized));
+      action = JSON.parse(syncCall(api.navigationResponseHeaders, navigationId, responseStatus, serialized));
       if (action.kind === "redirect") {
         networkEvents.push(responseRecord);
-        try { await response.body?.cancel(); } catch {}
+        try { await response?.body?.cancel(); } catch {}
         continue;
       }
       if (action.kind === "responseError") {
-        const error = new Error(`navigation response status ${response.status}`);
+        const error = new Error(`navigation response status ${responseStatus}`);
         error.code = "ERR_OBSCURA_NAVIGATION_RESPONSE";
         throw error;
       }
-      const captured = await readNavigationBody(response, api, navigationId, controller.signal);
-      const commit = JSON.parse(syncCall(api.navigationResponseEnd, navigationId, targetUrl.toString(), responseEncoding(headers)));
+      let captured;
+      if (fulfilledBytes) {
+        syncCall(api.navigationResponseChunk, navigationId, fulfilledBytes);
+        captured = { bytes: fulfilledBytes, total: fulfilledBytes.byteLength };
+      } else {
+        captured = await readNavigationBody(response, api, navigationId, controller.signal);
+      }
+      const commit = JSON.parse(syncCall(api.navigationResponseEnd, navigationId, responseUrl, responseEncoding(headers)));
       networkEvents.push({ ...responseRecord, bodySize: captured.total, ...(captured.bytes.byteLength <= MAX_NETWORK_RESPONSE_BODY_BYTES ? { bodyBase64: Buffer.from(captured.bytes).toString("base64") } : {}) });
       resetBridgeRealmAfterNavigation();
       const stylesheets = await loadDocumentStylesheets({ requestTimeoutMs, allowPrivateNetwork });
@@ -3394,6 +3566,7 @@ async function fetchAndSeedRenderResource(
   let response;
   let responseHeaders = {};
   let responseUrl = url;
+  let responseStatus = 0;
   let requestHeaders = {};
   let recorded = false;
   let timer;
@@ -3461,23 +3634,42 @@ async function fetchAndSeedRenderResource(
     const controller = new AbortController();
     timer = setTimeout(() => controller.abort(new Error("render resource fetch timed out")), requestTimeoutMs);
     timer.unref?.();
-    response = await fetch(targetUrl, {
+    const decision = await hostFetchInterception({
+      requestId,
+      url: targetUrl.toString(),
+      method: "GET",
       headers: requestHeaders,
-      redirect: "follow",
-      signal: controller.signal,
-      referrer: documentUrlForCookies(),
+      resourceType,
+      frameId: "page-1",
+      record: { controller, generation, runtime: bootstrapRuntime },
     });
-    responseUrl = response.url || targetUrl.toString();
-    storeResponseCookies(responseUrl, response);
-    ({ headers: responseHeaders } = responseHeadersObject(response));
-    if (!response.ok) {
-      record(response.status, undefined, 0);
-      try { await response.body?.cancel(); } catch {}
-      seedMissing();
-      return { loaded: false, status: response.status, url: responseUrl };
+    requestHeaders = decision.headers;
+    let bytes;
+    if (decision.fulfilled) {
+      ({ headers: responseHeaders, url: responseUrl, status: responseStatus, bytes } = decision.fulfilled);
+    } else {
+      response = await fetch(decision.url, {
+        method: decision.method,
+        headers: decision.headers,
+        redirect: "follow",
+        signal: controller.signal,
+        referrer: documentUrlForCookies(),
+      });
+      responseUrl = response.url || decision.url;
+      responseStatus = response.status;
+      storeResponseCookies(responseUrl, response);
+      ({ headers: responseHeaders } = responseHeadersObject(response));
+      bytes = responseStatus >= 200 && responseStatus < 300
+        ? await readBoundedResponseBytes(response, MAX_RENDER_RESOURCE_BYTES)
+        : new Uint8Array();
     }
-    const bytes = await readBoundedResponseBytes(response, MAX_RENDER_RESOURCE_BYTES);
-    record(response.status, bytes, bytes.byteLength);
+    if (responseStatus < 200 || responseStatus >= 300) {
+      record(responseStatus, undefined, 0);
+      try { await response?.body?.cancel(); } catch {}
+      seedMissing();
+      return { loaded: false, status: responseStatus, url: responseUrl };
+    }
+    record(responseStatus, bytes, bytes.byteLength);
     seed(bytes);
     return { loaded: true, status: response.status, url: responseUrl };
   } catch (error) {
@@ -3997,7 +4189,19 @@ try {
     return operationQueue;
   };
   parentPort.on("message", (message) => {
-    void enqueueSerializedWork(() => handleMessage(message));
+    // CDP control and event-poll operations are deliberately re-entrant. A
+    // navigation or resource fetch may be awaiting host I/O at a portable
+    // Fetch pause; serializing its continue/fulfill/fail command behind that
+    // await would deadlock the request. The operation itself is synchronous
+    // with respect to the WASM core, while page/DOM/realm operations remain
+    // ordered through the main queue.
+    const reentrantPortableOperation = message?.operation === "portableCdp" &&
+      ["request", "poll", "recordNetwork"].includes(message?.payload?.operation);
+    if (reentrantPortableOperation) {
+      void handleMessage(message);
+    } else {
+      void enqueueSerializedWork(() => handleMessage(message));
+    }
   });
   parentPort.postMessage({
     type: "ready",

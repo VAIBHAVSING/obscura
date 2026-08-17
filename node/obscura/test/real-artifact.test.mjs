@@ -247,12 +247,76 @@ test("real WASM artifact is reachable through package CDP", { skip: !modulePath 
     assert.equal(responseFetchValue, "response-fulfilled");
     await client.command("Fetch.disable", {}, sessionId);
     stopResponseFetchEvents();
+
+    const staticFetchEvents = [];
+    const stopStaticFetchEvents = client.onEvent((event) => {
+      if (event.sessionId === sessionId && event.method === "Fetch.requestPaused") staticFetchEvents.push(event);
+    });
+    await client.command("Fetch.enable", {
+      patterns: [{ urlPattern: `${new URL(fixtureUrl).origin}/script.js` }],
+    }, sessionId);
+    const pendingStaticNavigation = client.command("Page.navigate", { url: fixtureUrl }, sessionId);
+    let staticPaused;
+    for (let attempt = 0; attempt < 200; attempt += 1) {
+      staticPaused = staticFetchEvents.find((event) => !event.__continued);
+      if (staticPaused) {
+        staticPaused.__continued = true;
+        await client.command("Fetch.continueRequest", { requestId: staticPaused.params.requestId }, sessionId);
+        break;
+      }
+      await new Promise((resolve) => setTimeout(resolve, 10));
+    }
+    assert.equal(staticPaused?.params?.request?.url, scriptUrl);
+    await pendingStaticNavigation;
+    await client.command("Fetch.disable", {}, sessionId);
+    stopStaticFetchEvents();
+    const staticScriptLoaded = await client.command("Runtime.evaluate", {
+      expression: "globalThis.__portableScriptLoaded === true",
+      returnByValue: true,
+    }, sessionId);
+    assert.equal(staticScriptLoaded.result.value, true);
     const renderUrl = new URL("/render", fixtureUrl).href;
-    await client.command("Page.navigate", { url: renderUrl }, sessionId);
-    const renderScreenshot = await client.command("Page.captureScreenshot", {}, sessionId);
-    assert.deepEqual(Buffer.from(renderScreenshot.data, "base64").subarray(0, 8), Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]));
     const imageUrl = new URL("/pixel.png", renderUrl).href;
     const stylesheetUrl = new URL("/style.css", renderUrl).href;
+    const resourceFetchEvents = [];
+    const stopResourceFetchEvents = client.onEvent((event) => {
+      if (event.sessionId === sessionId && event.method === "Fetch.requestPaused") resourceFetchEvents.push(event);
+    });
+    await client.command("Fetch.enable", {
+      patterns: [
+        { urlPattern: `${new URL(fixtureUrl).origin}/style.css` },
+        { urlPattern: `${new URL(fixtureUrl).origin}/pixel.png` },
+      ],
+    }, sessionId);
+    const pendingRenderNavigation = client.command("Page.navigate", { url: renderUrl }, sessionId);
+    let stylesheetPaused;
+    for (let attempt = 0; attempt < 200; attempt += 1) {
+      stylesheetPaused = resourceFetchEvents.find((event) => event.params?.request?.url === stylesheetUrl && !event.__continued);
+      if (stylesheetPaused) {
+        stylesheetPaused.__continued = true;
+        await client.command("Fetch.continueRequest", { requestId: stylesheetPaused.params.requestId }, sessionId);
+        break;
+      }
+      await new Promise((resolve) => setTimeout(resolve, 10));
+    }
+    assert.equal(stylesheetPaused?.params?.request?.url, stylesheetUrl);
+    await pendingRenderNavigation;
+    const pendingRenderScreenshot = client.command("Page.captureScreenshot", {}, sessionId);
+    let imagePaused;
+    for (let attempt = 0; attempt < 200; attempt += 1) {
+      imagePaused = resourceFetchEvents.find((event) => event.params?.request?.url === imageUrl && !event.__continued);
+      if (imagePaused) {
+        imagePaused.__continued = true;
+        await client.command("Fetch.continueRequest", { requestId: imagePaused.params.requestId }, sessionId);
+        break;
+      }
+      await new Promise((resolve) => setTimeout(resolve, 10));
+    }
+    assert.equal(imagePaused?.params?.request?.url, imageUrl);
+    const renderScreenshot = await pendingRenderScreenshot;
+    await client.command("Fetch.disable", {}, sessionId);
+    stopResourceFetchEvents();
+    assert.deepEqual(Buffer.from(renderScreenshot.data, "base64").subarray(0, 8), Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]));
     const stylesheetRequestEvent = networkEvents.find(
       (event) => event.method === "Network.requestWillBeSent" && event.params.request.url === stylesheetUrl,
     );
