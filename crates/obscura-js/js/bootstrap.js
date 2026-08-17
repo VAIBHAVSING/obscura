@@ -6642,6 +6642,28 @@ function _serializeBody(initBody, headers) {
   return typeof initBody === 'string' ? initBody : String(initBody);
 }
 
+// Keep fetch cancellation in the page realm. The host request remains behind
+// its own bounded deadline, while an AbortSignal immediately rejects the
+// page-owned promise without exposing a host Promise or controller.
+function _fetchAbortReason(signal) {
+  if (signal && signal.reason !== undefined && signal.reason !== null) return signal.reason;
+  return new DOMException('The operation was aborted.', 'AbortError');
+}
+function _awaitFetchWithSignal(promise, signal) {
+  if (!signal || typeof signal.addEventListener !== 'function') return promise;
+  if (signal.aborted) return Promise.reject(_fetchAbortReason(signal));
+  let remove = null;
+  const aborted = new Promise((resolve, reject) => {
+    const onAbort = () => reject(_fetchAbortReason(signal));
+    remove = () => {
+      try { signal.removeEventListener('abort', onAbort); } catch (_) {}
+    };
+    try { signal.addEventListener('abort', onAbort); } catch (_) {}
+    if (signal.aborted) onAbort();
+  });
+  return Promise.race([promise, aborted]).finally(() => { if (remove) remove(); });
+}
+
 globalThis.fetch = async (input, init = {}) => {
   init = init || {};
   let url = typeof input === "string"
@@ -6666,8 +6688,13 @@ globalThis.fetch = async (input, init = {}) => {
   if (fetchCredentials !== "omit" && fetchCredentials !== "same-origin" && fetchCredentials !== "include") {
     throw new TypeError("Failed to execute 'fetch': '" + fetchCredentials + "' is not a valid RequestCredentials value");
   }
+  const fetchSignal = init.signal || (input instanceof Request ? input.signal : undefined);
+  if (fetchSignal && fetchSignal.aborted) throw _fetchAbortReason(fetchSignal);
   const pageOrigin = (function() { try { const u = new URL(_domParse("document_url") || "about:blank"); return u.origin; } catch(e) { return ""; } })();
-  const raw = await Deno.core.ops.op_fetch_url(url, method, hdrs, body, pageOrigin, fetchMode, fetchCredentials);
+  const raw = await _awaitFetchWithSignal(
+    Deno.core.ops.op_fetch_url(url, method, hdrs, body, pageOrigin, fetchMode, fetchCredentials),
+    fetchSignal,
+  );
   const parsed = JSON.parse(raw);
   if (parsed.blocked) {
     const err = new TypeError('net::ERR_FAILED');
@@ -6772,6 +6799,12 @@ globalThis.XMLHttpRequest = class XMLHttpRequest extends XMLHttpRequestEventTarg
     this._headers = {};
     this._responseHeaders = {};
     this._aborted = false;
+    this._timedOut = false;
+    this._requestToken = 0;
+    this._requestController = null;
+    this._timeoutId = null;
+    this._sendActive = false;
+    this._async = true;
     this._listeners = {};
     this.onreadystatechange = null;
     this.onload = null;
@@ -6784,8 +6817,17 @@ globalThis.XMLHttpRequest = class XMLHttpRequest extends XMLHttpRequestEventTarg
   }
 
   open(method, url, async_) {
-    this._method = method;
-    this._url = url;
+    if (async_ === false) {
+      throw new DOMException('Synchronous XMLHttpRequest is not supported.', 'NotSupportedError');
+    }
+    if (this._timeoutId !== null) { clearTimeout(this._timeoutId); this._timeoutId = null; }
+    try { this._requestController?.abort(); } catch (_) {}
+    this._requestController = null;
+    this._requestToken += 1;
+    this._sendActive = false;
+    this._method = String(method || 'GET').toUpperCase();
+    this._url = String(url || '');
+    this._async = true;
     this._headers = {};
     this._responseHeaders = {};
     this._aborted = false;
@@ -6797,7 +6839,13 @@ globalThis.XMLHttpRequest = class XMLHttpRequest extends XMLHttpRequestEventTarg
   }
 
   setRequestHeader(name, value) {
-    this._headers[name] = value;
+    if (this.readyState !== this.OPENED || this._sendActive) {
+      throw new DOMException('The XHR is not in the OPENED state.', 'InvalidStateError');
+    }
+    const key = String(name);
+    const next = String(value);
+    const previous = Object.keys(this._headers).find((entry) => entry.toLowerCase() === key.toLowerCase());
+    this._headers[previous || key] = previous ? `${this._headers[previous]}, ${next}` : next;
   }
 
   getResponseHeader(name) {
@@ -6817,11 +6865,30 @@ globalThis.XMLHttpRequest = class XMLHttpRequest extends XMLHttpRequestEventTarg
   overrideMimeType(mime) { this._overrideMime = mime; }
 
   send(body) {
-    if (this.readyState !== 1) return;
+    if (this.readyState !== this.OPENED || this._sendActive) {
+      throw new DOMException('The XHR is not in the OPENED state.', 'InvalidStateError');
+    }
     if (this._aborted) return;
 
     const xhr = this;
+    const token = ++this._requestToken;
+    this._sendActive = true;
+    this._timedOut = false;
+    this._requestController = typeof AbortController === 'function' ? new AbortController() : null;
     this._fireEvent('loadstart');
+
+    const current = () => xhr._requestToken === token && !xhr._aborted && !xhr._timedOut;
+    const clearRequestTimer = () => {
+      if (xhr._timeoutId !== null) {
+        clearTimeout(xhr._timeoutId);
+        xhr._timeoutId = null;
+      }
+    };
+    const completeRequest = () => {
+      clearRequestTimer();
+      xhr._sendActive = false;
+      xhr._requestController = null;
+    };
 
     let url = this._url;
     if (url && !url.includes('://')) {
@@ -6831,14 +6898,35 @@ globalThis.XMLHttpRequest = class XMLHttpRequest extends XMLHttpRequestEventTarg
       } catch(e) {}
     }
 
+    const timeout = Number(xhr.timeout);
+    if (Number.isFinite(timeout) && timeout > 0) {
+      xhr._timeoutId = setTimeout(() => {
+        if (!current()) return;
+        xhr._timedOut = true;
+        xhr._aborted = true;
+        xhr._requestToken += 1;
+        const controller = xhr._requestController;
+        try { controller?.abort(new DOMException('The XHR request timed out.', 'TimeoutError')); } catch (_) {}
+        completeRequest();
+        xhr.status = 0;
+        xhr.statusText = '';
+        xhr.response = null;
+        xhr.responseText = '';
+        xhr._setReadyState(4);
+        xhr._fireEvent('timeout');
+        xhr._fireEvent('loadend');
+      }, Math.min(timeout, 2 ** 31 - 1));
+    }
+
     fetch(url, {
       method: this._method,
       headers: this._headers,
       body: body || undefined,
       mode: 'cors',
       credentials: this.withCredentials ? 'include' : 'same-origin',
+      signal: this._requestController?.signal,
     }).then(async (resp) => {
-      if (xhr._aborted) return;
+      if (!current()) return;
 
       xhr.status = resp.status;
       xhr.statusText = resp.statusText || '';
@@ -6851,10 +6939,11 @@ globalThis.XMLHttpRequest = class XMLHttpRequest extends XMLHttpRequestEventTarg
       xhr._setReadyState(2); // HEADERS_RECEIVED
 
       const text = await resp.text();
-      if (xhr._aborted) return;
+      if (!current()) return;
 
       xhr.responseText = text;
       xhr._setReadyState(3); // LOADING
+      xhr._fireEvent('progress', { loaded: text.length, total: text.length, lengthComputable: true });
 
       switch (xhr.responseType) {
         case 'json':
@@ -6878,10 +6967,12 @@ globalThis.XMLHttpRequest = class XMLHttpRequest extends XMLHttpRequestEventTarg
       }
 
       xhr._setReadyState(4); // DONE
+      completeRequest();
       xhr._fireEvent('load');
       xhr._fireEvent('loadend');
     }).catch((err) => {
-      if (xhr._aborted) return;
+      if (xhr._requestToken !== token || xhr._aborted || xhr._timedOut) return;
+      completeRequest();
       xhr.status = 0;
       xhr.readyState = 4;
       xhr._fireEvent('readystatechange');
@@ -6889,18 +6980,23 @@ globalThis.XMLHttpRequest = class XMLHttpRequest extends XMLHttpRequestEventTarg
         xhr._aborted = true;
         xhr._fireEvent('abort');
         xhr._fireEvent('loadend');
-        if (xhr.onabort) xhr.onabort(err);
       } else {
         xhr._fireEvent('error');
         xhr._fireEvent('loadend');
-        if (xhr.onerror) xhr.onerror(err);
       }
     });
   }
 
   abort() {
+    if (this.readyState === this.UNSENT || (this.readyState === this.DONE && !this._sendActive)) return;
     this._aborted = true;
+    this._requestToken += 1;
+    if (this._timeoutId !== null) { clearTimeout(this._timeoutId); this._timeoutId = null; }
+    try { this._requestController?.abort(); } catch (_) {}
+    this._requestController = null;
+    this._sendActive = false;
     if (this.readyState > 0 && this.readyState < 4) {
+      this.status = 0;
       this._setReadyState(4);
       this._fireEvent('abort');
       this._fireEvent('loadend');
@@ -6944,8 +7040,8 @@ globalThis.XMLHttpRequest = class XMLHttpRequest extends XMLHttpRequestEventTarg
     }
   }
 
-  _fireEvent(type) {
-    const event = { type, target: this, currentTarget: this, bubbles: false };
+  _fireEvent(type, detail = {}) {
+    const event = { type, target: this, currentTarget: this, bubbles: false, ...detail };
     const handlers = this._listeners[type] || [];
     for (const h of handlers) { try { h.call(this, event); } catch(e) {} }
     const prop = 'on' + type;

@@ -30,6 +30,13 @@ test("portable navigation owns redirects, document identity, history, and HTML c
       response.end('{"answer":42}');
       return;
     }
+    if (request.url === "/slow") {
+      setTimeout(() => {
+        response.writeHead(200, { "content-type": "text/plain" });
+        response.end("slow");
+      }, 200);
+      return;
+    }
     if (request.url === "/set-cookie") {
       response.writeHead(200, {
         "content-type": "text/html; charset=UTF-8",
@@ -99,6 +106,37 @@ test("portable navigation owns redirects, document identity, history, and HTML c
     await worker.bootstrapEvaluate("globalThis.__xhrValue = null; const request = new XMLHttpRequest(); request.open('GET', '/api'); request.onload = () => { globalThis.__xhrValue = request.responseText; }; request.onerror = () => { globalThis.__xhrValue = 'error'; }; request.send(); undefined");
     await new Promise((resolve) => setTimeout(resolve, 100));
     assert.equal(await worker.bootstrapEvaluate("globalThis.__xhrValue"), '{"answer":42}');
+    await worker.bootstrapEvaluate(`globalThis.__xhrTimeout = []; (() => {
+      const xhr = new XMLHttpRequest();
+      xhr.open('GET', '/slow');
+      xhr.timeout = 20;
+      xhr.ontimeout = () => globalThis.__xhrTimeout.push('timeout');
+      xhr.onload = () => globalThis.__xhrTimeout.push('load');
+      xhr.onloadend = () => globalThis.__xhrTimeout.push('loadend');
+      xhr.send();
+    })(); undefined`);
+    await new Promise((resolve) => setTimeout(resolve, 80));
+    assert.deepEqual(await worker.bootstrapEvaluate("globalThis.__xhrTimeout"), ["timeout", "loadend"]);
+    await worker.bootstrapEvaluate(`globalThis.__xhrAbort = []; (() => {
+      const xhr = new XMLHttpRequest();
+      xhr.open('GET', '/slow');
+      xhr.onabort = () => globalThis.__xhrAbort.push('abort');
+      xhr.onload = () => globalThis.__xhrAbort.push('load');
+      xhr.onloadend = () => globalThis.__xhrAbort.push('loadend');
+      xhr.send();
+      setTimeout(() => xhr.abort(), 10);
+    })(); undefined`);
+    await new Promise((resolve) => setTimeout(resolve, 80));
+    assert.deepEqual(await worker.bootstrapEvaluate("globalThis.__xhrAbort"), ["abort", "loadend"]);
+    await worker.bootstrapEvaluate(`globalThis.__fetchAbort = null; (() => {
+      const controller = new AbortController();
+      fetch('/slow', { signal: controller.signal })
+        .then(() => { globalThis.__fetchAbort = 'resolved'; })
+        .catch((error) => { globalThis.__fetchAbort = [error.name, error instanceof DOMException]; });
+      setTimeout(() => controller.abort(), 10);
+    })(); undefined`);
+    await new Promise((resolve) => setTimeout(resolve, 80));
+    assert.deepEqual(await worker.bootstrapEvaluate("globalThis.__fetchAbort"), ["AbortError", true]);
 
     await worker.navigate(`http://127.0.0.1:${port}/set-cookie`, { allowPrivateNetwork: true });
     await worker.bootstrapEvaluate("document.cookie = 'client=ok; Path=/'; undefined");
