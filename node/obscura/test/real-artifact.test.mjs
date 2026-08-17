@@ -284,7 +284,7 @@ test("real WASM artifact is reachable through package CDP", { skip: !modulePath 
     });
     await client.command("Fetch.enable", {
       patterns: [
-        { urlPattern: `${new URL(fixtureUrl).origin}/style.css` },
+        { urlPattern: `${new URL(fixtureUrl).origin}/style.css`, requestStage: "Response" },
         { urlPattern: `${new URL(fixtureUrl).origin}/pixel.png` },
       ],
     }, sessionId);
@@ -300,6 +300,11 @@ test("real WASM artifact is reachable through package CDP", { skip: !modulePath 
       await new Promise((resolve) => setTimeout(resolve, 10));
     }
     assert.equal(stylesheetPaused?.params?.request?.url, stylesheetUrl);
+    assert.equal(stylesheetPaused?.params?.responseStatusCode, 200);
+    const pausedStylesheetBody = await client.command("Fetch.getResponseBody", {
+      requestId: stylesheetPaused.params.requestId,
+    }, sessionId);
+    assert.match(Buffer.from(pausedStylesheetBody.body, "base64").toString("utf8"), /render-target/);
     await pendingRenderNavigation;
     const pendingRenderScreenshot = client.command("Page.captureScreenshot", {}, sessionId);
     let imagePaused;

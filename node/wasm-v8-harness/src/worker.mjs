@@ -2117,6 +2117,41 @@ async function hostFetchInterception({
   };
 }
 
+async function hostFetchResponseInterception({
+  requestId,
+  url,
+  method = "GET",
+  headers = {},
+  postData,
+  status,
+  responseHeaders = {},
+  bytes = new Uint8Array(),
+  resourceType = "Other",
+  frameId = "page-1",
+  record,
+} = {}) {
+  const body = bytes instanceof Uint8Array ? bytes : new Uint8Array(bytes);
+  const resolution = awaitPortableFetchInterception({
+    requestId,
+    requestStage: "Response",
+    url: String(url),
+    method: String(method),
+    headers,
+    postData,
+    responseStatusCode: status,
+    responseHeaders,
+    responseBodyBase64: Buffer.from(body).toString("base64"),
+    resourceType,
+    frameId,
+  }, record);
+  if (!resolution) return { url, status, headers: responseHeaders, bytes: body };
+  if (!resolution || resolution.action === "fail") {
+    throw new Error("Fetch response failed by interception");
+  }
+  if (resolution.action === "fulfill") return decodeFetchFulfillment(resolution, String(url));
+  return { url, status, headers: responseHeaders, bytes: body };
+}
+
 function bootstrapFetchResolution(id, envelope) {
   const record = bootstrapFetches.get(id);
   if (!record) return;
@@ -2416,6 +2451,7 @@ async function fetchClassicScript(url, requestTimeoutMs, allowPrivateNetwork, { 
     const headers = {};
     const cookie = cookieHeaderForUrl(url, "include");
     if (cookie) headers.Cookie = cookie;
+    const interceptionRecord = { controller, generation: bridgeGeneration, runtime: bootstrapRuntime };
     const decision = await hostFetchInterception({
       requestId,
       url,
@@ -2423,7 +2459,7 @@ async function fetchClassicScript(url, requestTimeoutMs, allowPrivateNetwork, { 
       headers,
       resourceType: "Script",
       frameId: "page-1",
-      record: { controller, generation: bridgeGeneration, runtime: bootstrapRuntime },
+      record: interceptionRecord,
     });
     let responseHeaders;
     let responseUrl;
@@ -2444,6 +2480,19 @@ async function fetchClassicScript(url, requestTimeoutMs, allowPrivateNetwork, { 
       responseUrl = response.url || decision.url;
       status = response.status;
       bytes = status >= 200 && status < 300 ? await readBoundedResponseBytes(response) : new Uint8Array();
+      const responseDecision = await hostFetchResponseInterception({
+        requestId,
+        url: responseUrl,
+        method: decision.method,
+        headers: decision.headers,
+        status,
+        responseHeaders,
+        bytes,
+        resourceType: "Script",
+        frameId: "page-1",
+        record: interceptionRecord,
+      });
+      ({ headers: responseHeaders, url: responseUrl, status, bytes } = responseDecision);
     }
     if (status < 200 || status >= 300) {
       queueBootstrapNetworkEvent({
@@ -2611,6 +2660,7 @@ async function fetchStylesheetCss(url, requestTimeoutMs, allowPrivateNetwork, se
       timer = setTimeout(() => controller.abort(new Error("stylesheet fetch timed out")), requestTimeoutMs);
       timer.unref?.();
       const referrer = documentUrlForCookies();
+      const interceptionRecord = { controller, generation: bridgeGeneration, runtime: bootstrapRuntime };
       const decision = await hostFetchInterception({
         requestId,
         url: targetUrl.toString(),
@@ -2618,7 +2668,7 @@ async function fetchStylesheetCss(url, requestTimeoutMs, allowPrivateNetwork, se
         headers: requestHeaders,
         resourceType: "Stylesheet",
         frameId: "page-1",
-        record: { controller, generation: bridgeGeneration, runtime: bootstrapRuntime },
+        record: interceptionRecord,
       });
       requestHeaders = decision.headers;
       if (decision.fulfilled) {
@@ -2637,6 +2687,19 @@ async function fetchStylesheetCss(url, requestTimeoutMs, allowPrivateNetwork, se
         } else {
           bytes = new Uint8Array();
         }
+        const responseDecision = await hostFetchResponseInterception({
+          requestId,
+          url: responseUrl,
+          method: decision.method,
+          headers: decision.headers,
+          status: responseStatus,
+          responseHeaders,
+          bytes,
+          resourceType: "Stylesheet",
+          frameId: "page-1",
+          record: interceptionRecord,
+        });
+        ({ headers: responseHeaders, url: responseUrl, status: responseStatus, bytes } = responseDecision);
       }
       if (responseStatus < 200 || responseStatus >= 300) {
         record(responseStatus, undefined, 0);
@@ -3110,6 +3173,7 @@ async function navigatePortable({ url, options = {}, allowPrivateNetwork = false
       const navigationCookie = cookieHeaderForUrl(targetUrl, "include");
       if (navigationCookie) navigationHeaders.Cookie = navigationCookie;
       const requestId = `${action.loaderId}${action.redirectCount ? `-redirect-${action.redirectCount}` : ""}`;
+      const interceptionRecord = { controller, generation: bridgeGeneration, runtime: bootstrapRuntime };
       const decision = await hostFetchInterception({
         requestId,
         url: targetUrl.toString(),
@@ -3118,7 +3182,7 @@ async function navigatePortable({ url, options = {}, allowPrivateNetwork = false
         postData: action.method === "GET" || action.method === "HEAD" ? undefined : action.body,
         resourceType: "Document",
         frameId: "page-1",
-        record: { controller, generation: bridgeGeneration, runtime: bootstrapRuntime },
+        record: interceptionRecord,
       });
       let response = null;
       let responseUrl;
@@ -3145,6 +3209,27 @@ async function navigatePortable({ url, options = {}, allowPrivateNetwork = false
         ({ headers, serialized } = responseHeadersObject(response));
         responseUrl = response.url || decision.url;
         responseStatus = response.status;
+        const responseBytes = responseStatus >= 200 && responseStatus < 300
+          ? await readBoundedResponseBytes(response, MAX_NAVIGATION_RESPONSE_BYTES)
+          : new Uint8Array();
+        const responseDecision = await hostFetchResponseInterception({
+          requestId,
+          url: responseUrl,
+          method: decision.method,
+          headers: decision.headers,
+          status: responseStatus,
+          responseHeaders: headers,
+          bytes: responseBytes,
+          resourceType: "Document",
+          frameId: "page-1",
+          record: interceptionRecord,
+        });
+        responseUrl = responseDecision.url;
+        responseStatus = responseDecision.status;
+        headers = responseDecision.headers;
+        serialized = JSON.stringify(headers);
+        fulfilledBytes = responseDecision.bytes;
+        response = null;
       }
       const responseRecord = networkRecord({
         requestId,
@@ -3634,6 +3719,7 @@ async function fetchAndSeedRenderResource(
     const controller = new AbortController();
     timer = setTimeout(() => controller.abort(new Error("render resource fetch timed out")), requestTimeoutMs);
     timer.unref?.();
+    const interceptionRecord = { controller, generation, runtime: bootstrapRuntime };
     const decision = await hostFetchInterception({
       requestId,
       url: targetUrl.toString(),
@@ -3641,7 +3727,7 @@ async function fetchAndSeedRenderResource(
       headers: requestHeaders,
       resourceType,
       frameId: "page-1",
-      record: { controller, generation, runtime: bootstrapRuntime },
+      record: interceptionRecord,
     });
     requestHeaders = decision.headers;
     let bytes;
@@ -3662,6 +3748,19 @@ async function fetchAndSeedRenderResource(
       bytes = responseStatus >= 200 && responseStatus < 300
         ? await readBoundedResponseBytes(response, MAX_RENDER_RESOURCE_BYTES)
         : new Uint8Array();
+      const responseDecision = await hostFetchResponseInterception({
+        requestId,
+        url: responseUrl,
+        method: decision.method,
+        headers: decision.headers,
+        status: responseStatus,
+        responseHeaders,
+        bytes,
+        resourceType,
+        frameId: "page-1",
+        record: interceptionRecord,
+      });
+      ({ headers: responseHeaders, url: responseUrl, status: responseStatus, bytes } = responseDecision);
     }
     if (responseStatus < 200 || responseStatus >= 300) {
       record(responseStatus, undefined, 0);
