@@ -374,6 +374,7 @@ class PageTarget {
 
   async navigate(url, params = {}) {
     await this.start();
+    const holdNetworkFlush = params.holdNetworkFlush === true;
     this.networkFlushPaused = true;
     let result;
     try {
@@ -385,7 +386,7 @@ class PageTarget {
         allowPrivateNetwork: params.allowPrivateNetwork === true,
       });
     } finally {
-      this.networkFlushPaused = false;
+      if (!holdNetworkFlush) this.networkFlushPaused = false;
     }
     this.url = result.url || safeUrl(url);
     this.loaderId = result.loaderId ? String(result.loaderId) : `${this.id}-loader-${Date.now()}`;
@@ -408,6 +409,20 @@ class PageTarget {
     }
     this.remoteObjects.clear();
     return result;
+  }
+
+  async setDocumentContent(html, { holdNetworkFlush = false } = {}) {
+    await this.start();
+    this.networkFlushPaused = true;
+    try {
+      return await this.worker.setDocumentContent(html, {
+        documentMetadata: { url: this.url, referrer: "", encoding: "UTF-8" },
+        allowPrivateNetwork: this.server.allowPrivateNetwork,
+        requestTimeoutMs: this.server.requestTimeoutMs,
+      });
+    } finally {
+      if (!holdNetworkFlush) this.networkFlushPaused = false;
+    }
   }
 
   async screenshot(params = {}) {
@@ -987,6 +1002,7 @@ export class ObscuraCdpServer {
       if (typeof event?.method === "string") connection.event(event.method, event.params ?? {}, command.sessionId);
     }
     if (response?.error) {
+      if (deferNetworkFlush) target.networkFlushPaused = false;
       throw cdpError(response.error.code ?? -32603, response.error.message ?? "Portable CDP command failed", response.error.data);
     }
     if (method === "Network.setCookies" || method === "Storage.setCookies") {
@@ -1004,7 +1020,10 @@ export class ObscuraCdpServer {
       await target.cookies("clear");
     }
     const action = response?.result?.obscuraAction;
-    if (!action) return response?.result ?? {};
+    if (!action) {
+      if (deferNetworkFlush) target.networkFlushPaused = false;
+      return response?.result ?? {};
+    }
     const hostParams = { ...(command.params ?? {}) };
     if (action.payload?.extraHTTPHeaders && typeof action.payload.extraHTTPHeaders === "object") {
       hostParams._obscuraExtraHTTPHeaders = action.payload.extraHTTPHeaders;
@@ -1042,7 +1061,12 @@ export class ObscuraCdpServer {
         },
       };
     }
-    const completed = await target.portableCdpComplete(routed.record, action.actionId, completion);
+    let completed;
+    try {
+      completed = await target.portableCdpComplete(routed.record, action.actionId, completion);
+    } finally {
+      if (deferNetworkFlush) target.networkFlushPaused = false;
+    }
     if (completed?.error) {
       throw cdpError(completed.error.code ?? -32603, completed.error.message ?? "Portable CDP action failed", completed.error.data);
     }
@@ -1239,9 +1263,11 @@ export class ObscuraCdpServer {
         return {};
       case "Page.setDocumentContent":
         if (typeof params.html !== "string") throw cdpError(-32602, "Page.setDocumentContent requires html");
-        await target.worker.bootstrapEvaluate("undefined", { html: params.html, documentMetadata: { url: target.url, referrer: "", encoding: "UTF-8" } });
-        target.remoteObjects.clear();
-        return {};
+        {
+          const content = await target.setDocumentContent(params.html, { holdNetworkFlush: true });
+          target.remoteObjects.clear();
+          return { result: { __obscuraNetwork: content?.__obscuraNetwork ?? [] } };
+        }
       case "Input.dispatchMouseEvent": {
         const eventTypes = { mousePressed: "mousedown", mouseReleased: "mouseup", mouseMoved: "mousemove", mouseWheel: "wheel" };
         const eventType = eventTypes[params.type];
@@ -1327,6 +1353,7 @@ export class ObscuraCdpServer {
             allowPrivateNetwork: this.allowPrivateNetwork,
             requestTimeoutMs: params.timeout,
             extraHTTPHeaders: params._obscuraExtraHTTPHeaders,
+            holdNetworkFlush: true,
           });
           connection.event("Page.frameNavigated", { frame: frameTree(target).frameTree.frame }, sessionId);
           // A committed navigation replaces both the default and utility
@@ -1351,6 +1378,7 @@ export class ObscuraCdpServer {
         await target.navigate(target.url, {
           allowPrivateNetwork: this.allowPrivateNetwork,
           extraHTTPHeaders: params._obscuraExtraHTTPHeaders,
+          holdNetworkFlush: true,
         });
         return {};
       case "Page.captureScreenshot": {

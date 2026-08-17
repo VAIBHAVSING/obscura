@@ -669,6 +669,25 @@ export class WasmV8Worker {
     }
   }
 
+  setDocumentContent(html, options = {}) {
+    try {
+      requireBoundedString(html, MAX_HTML_INPUT_BYTES, "HTML input");
+      const documentMetadata = boundedDocumentMetadata(options.documentMetadata);
+      return this.request(
+        "setDocumentContent",
+        {
+          html,
+          documentMetadata,
+          allowPrivateNetwork: options.allowPrivateNetwork === true,
+          requestTimeoutMs: options.requestTimeoutMs,
+        },
+        options.requestTimeoutMs,
+      );
+    } catch (error) {
+      return Promise.reject(error);
+    }
+  }
+
   bridgeStatus() {
     return this.request("bridgeStatus");
   }

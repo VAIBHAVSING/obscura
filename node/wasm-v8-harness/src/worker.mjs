@@ -2848,6 +2848,22 @@ async function navigatePortable({ url, options = {}, allowPrivateNetwork = false
   }
 }
 
+async function setDocumentContentPortable({ html, documentMetadata, allowPrivateNetwork = false, requestTimeoutMs = 30_000 } = {}) {
+  if (typeof html !== "string") throw new TypeError("document HTML must be a string");
+  if (!Number.isSafeInteger(requestTimeoutMs) || requestTimeoutMs < 1 || requestTimeoutMs > MAX_NAVIGATION_REQUEST_TIMEOUT_MS) {
+    throw new RangeError(`document content request timeout must be between 1 and ${MAX_NAVIGATION_REQUEST_TIMEOUT_MS}ms`);
+  }
+  requireBoundedString(html, MAX_HTML_INPUT_BYTES, "HTML input");
+  activeAllowPrivateNetwork = Boolean(allowPrivateNetwork);
+  await replaceBridgeCore(html, documentMetadata);
+  resetBridgeRealmAfterNavigation();
+  const stylesheets = await loadDocumentStylesheets({ requestTimeoutMs, allowPrivateNetwork });
+  const scripts = await executeDocumentScripts({ requestTimeoutMs, allowPrivateNetwork });
+  const network = bootstrapNetworkEvents.splice(0);
+  bootstrapNetworkEventBytes = 0;
+  return { stylesheets, scripts, __obscuraNetwork: network };
+}
+
 async function bridgeStatus() {
   const api = bridgeCore ? bridgeApi() : {};
   if (bridgeCore && (api.domOp || api.domBatch)) synchronizeBridgeIdentity();
@@ -3695,6 +3711,8 @@ async function dispatch(operation, payload) {
       return await pdf(payload);
     case "navigate":
       return await navigatePortable(payload);
+    case "setDocumentContent":
+      return await setDocumentContentPortable(payload);
     case "navigationStatus": {
       const api = bridgeApi();
       await requireNavigationCompatibility(api);

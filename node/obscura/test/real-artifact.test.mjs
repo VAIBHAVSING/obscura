@@ -223,11 +223,18 @@ test("real WASM artifact is reachable through package CDP", { skip: !modulePath 
     unsubscribe();
     assert.equal(childEvents.at(-1)?.params.parentId, htmlNode.nodeId);
     await client.command("Page.setDocumentContent", {
-      html: "<html><body><p id=next>Next</p></body></html>",
+      html: `<html><head><link rel="stylesheet" href="${stylesheetUrl}"></head><body><p id=next>Next</p></body></html>`,
     }, sessionId);
     const replaced = await client.command("DOM.getDocument", { depth: -1 }, sessionId);
     const paragraph = await client.command("DOM.querySelector", { nodeId: replaced.root.nodeId, selector: "#next" }, sessionId);
     assert.ok(paragraph.nodeId > 0);
+    const replacedStylesheet = await client.command("Runtime.evaluate", {
+      expression: "({ sheets: document.styleSheets.length, linkSheet: !!document.querySelector('link').sheet, rules: document.querySelector('link').sheet?.cssRules?.length ?? 0 })",
+      returnByValue: true,
+    }, sessionId);
+    assert.equal(replacedStylesheet.result.value.sheets, 1);
+    assert.equal(replacedStylesheet.result.value.linkSheet, true);
+    assert.ok(replacedStylesheet.result.value.rules >= 1);
     const screenshot = await client.command("Page.captureScreenshot", {}, sessionId);
     assert.deepEqual(Buffer.from(screenshot.data, "base64").subarray(0, 8), Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]));
     const pdf = await client.command("Page.printToPDF", {}, sessionId);
