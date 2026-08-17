@@ -28,6 +28,7 @@ const MAX_VM_TIMEOUT_MS = 4_294_967_295;
 const MAX_NAVIGATION_URL_BYTES = 64 * 1024;
 const MAX_NAVIGATION_RESPONSE_BYTES = 32 * 1024 * 1024;
 const MAX_NAVIGATION_REDIRECTS = 10;
+const MAX_CDP_STREAM_BASE64_BYTES = 12 * 1024 * 1024;
 const require = createRequire(import.meta.url);
 
 function nativeInitializationError(message) {
@@ -683,6 +684,17 @@ export class WasmV8Worker {
 
   portableCdpClose(connectionId, options = {}) {
     return this.request("portableCdp", { operation: "close", connectionId }, options.requestTimeoutMs);
+  }
+
+  portableCdpOpenStream(connectionId, data, options = {}) {
+    if (!Number.isSafeInteger(connectionId) || connectionId < 0 || connectionId > 0xffff_ffff) {
+      return Promise.reject(new TypeError("CDP connection ID must be an unsigned 32-bit integer"));
+    }
+    if (typeof data !== "string") return Promise.reject(new TypeError("CDP stream data must be base64 text"));
+    if (Buffer.byteLength(data, "utf8") > MAX_CDP_STREAM_BASE64_BYTES) {
+      return Promise.reject(new RangeError(`CDP stream data exceeds the ${MAX_CDP_STREAM_BASE64_BYTES}-byte limit`));
+    }
+    return this.request("portableCdp", { operation: "openStream", connectionId, data }, options.requestTimeoutMs);
   }
 
   allCookies(options = {}) {

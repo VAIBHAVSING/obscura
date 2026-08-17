@@ -1261,6 +1261,11 @@ function portableCdpOperation(payload = {}) {
     core.closeConnection(requireUnsignedU32(payload.connectionId, "CDP connection ID"));
     return {};
   }
+  if (operation === "openStream") {
+    const connectionId = requireUnsignedU32(payload.connectionId, "CDP connection ID");
+    requireBoundedString(payload.data, MAX_PLATFORM_RESPONSE_BYTES, "CDP stream data");
+    return core.openStream(connectionId, payload.data);
+  }
   if (operation === "request") {
     const connectionId = requireUnsignedU32(payload.connectionId, "CDP connection ID");
     requireBoundedString(payload.message, MAX_PLATFORM_REQUEST_BYTES, "CDP message");

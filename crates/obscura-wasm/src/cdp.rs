@@ -9,6 +9,7 @@
 
 use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
 
+use base64::{engine::general_purpose::STANDARD as BASE64, Engine as _};
 use serde::Deserialize;
 use serde_json::{json, Map, Value};
 use url::Url;
@@ -23,6 +24,8 @@ const MAX_SESSION_BYTES: usize = 256;
 const MAX_EVENT_QUEUE: usize = 512;
 const MAX_EVENT_BYTES: usize = 4 * 1024 * 1024;
 const MAX_ACTION_RESULT_BYTES: usize = 16 * 1024 * 1024;
+const MAX_STREAM_BYTES: usize = 12 * 1024 * 1024;
+const MAX_STREAM_CHUNK_BYTES: usize = 1 * 1024 * 1024;
 
 fn js_error(message: &str) -> JsValue {
     #[cfg(target_arch = "wasm32")]
@@ -117,6 +120,12 @@ struct Action {
     kind: String,
 }
 
+struct Stream {
+    connection_id: u32,
+    data: Vec<u8>,
+    offset: usize,
+}
+
 #[derive(Clone, Copy)]
 struct Viewport {
     width: u32,
@@ -170,6 +179,8 @@ pub struct PortableCdp {
     next_session_id: u32,
     next_action_id: u32,
     next_loader_id: u32,
+    streams: BTreeMap<String, Stream>,
+    next_stream_id: u32,
 }
 
 #[wasm_bindgen]
@@ -211,7 +222,36 @@ impl PortableCdp {
             next_session_id: 0,
             next_action_id: 0,
             next_loader_id: 0,
+            streams: BTreeMap::new(),
+            next_stream_id: 0,
         })
+    }
+
+    /// Copy one bounded host-produced base64 payload into a WASM-owned stream.
+    /// The returned opaque handle is consumed by IO.read/IO.close through the
+    /// same portable CDP command envelope.
+    #[wasm_bindgen(js_name = openStream)]
+    pub fn open_stream(&mut self, connection_id: u32, data_base64: &str) -> Result<String, JsValue> {
+        if !self.connections.contains_key(&connection_id) {
+            return Err(js_error("unknown CDP connection"));
+        }
+        bounded(data_base64, MAX_ACTION_RESULT_BYTES, "CDP stream data")?;
+        let data = BASE64
+            .decode(data_base64)
+            .map_err(|_| js_error("CDP stream data is not valid base64"))?;
+        if data.len() > MAX_STREAM_BYTES {
+            return Err(js_range_error(&format!(
+                "CDP stream data exceeds the {MAX_STREAM_BYTES}-byte limit"
+            )));
+        }
+        let id = self
+            .next_stream_id
+            .checked_add(1)
+            .ok_or_else(|| js_error("CDP stream ID space is exhausted"))?;
+        self.next_stream_id = id;
+        let handle = format!("portable-stream-{id}");
+        self.streams.insert(handle.clone(), Stream { connection_id, data, offset: 0 });
+        Ok(handle)
     }
 
     /// Register one host connection and return its opaque ID.
@@ -251,6 +291,8 @@ impl PortableCdp {
         }
         self.actions
             .retain(|_, action| action.connection_id != connection_id);
+        self.streams
+            .retain(|_, stream| stream.connection_id != connection_id);
         Ok(())
     }
 
@@ -399,6 +441,9 @@ impl PortableCdp {
             "pendingActions": self.actions.len(),
             "eventQueueLimit": MAX_EVENT_QUEUE,
             "actionResultBytes": MAX_ACTION_RESULT_BYTES,
+            "streamBytes": MAX_STREAM_BYTES,
+            "streamChunkBytes": MAX_STREAM_CHUNK_BYTES,
+            "streams": self.streams.len(),
         })
         .to_string()
     }
@@ -850,6 +895,62 @@ impl PortableCdp {
                 };
                 if let Some(connection) = self.connections.get_mut(&connection_id) {
                     queue_event(connection, "DOM.setChildNodes", json!({"parentId": node_id, "nodes": children}), session);
+                }
+                cdp_result_response(&request.id, json!({}), session)
+            }
+            "IO.read" => {
+                let Some(handle) = request.params.get("handle").and_then(Value::as_str) else {
+                    return cdp_error_response(&request.id, -32602, "handle is required", session);
+                };
+                let requested = request
+                    .params
+                    .get("size")
+                    .and_then(Value::as_u64)
+                    .unwrap_or(MAX_STREAM_CHUNK_BYTES as u64);
+                if requested == 0 {
+                    return cdp_error_response(&request.id, -32602, "size must be greater than zero", session);
+                }
+                let size = usize::try_from(requested)
+                    .unwrap_or(MAX_STREAM_CHUNK_BYTES)
+                    .min(MAX_STREAM_CHUNK_BYTES);
+                let Some(stream) = self.streams.get_mut(handle) else {
+                    return cdp_error_response(&request.id, -32000, "Invalid stream handle", session);
+                };
+                if stream.connection_id != connection_id {
+                    return cdp_error_response(&request.id, -32000, "Invalid stream handle", session);
+                }
+                let offset = request
+                    .params
+                    .get("offset")
+                    .and_then(Value::as_u64)
+                    .and_then(|value| usize::try_from(value).ok())
+                    .unwrap_or(stream.offset);
+                if offset > stream.data.len() {
+                    return cdp_error_response(&request.id, -32602, "stream offset is out of range", session);
+                }
+                let end = offset.saturating_add(size).min(stream.data.len());
+                let data = BASE64.encode(&stream.data[offset..end]);
+                stream.offset = end;
+                let eof = end >= stream.data.len();
+                if eof {
+                    self.streams.remove(handle);
+                }
+                cdp_result_response(
+                    &request.id,
+                    json!({"base64Encoded": true, "data": data, "eof": eof}),
+                    session,
+                )
+            }
+            "IO.close" => {
+                let Some(handle) = request.params.get("handle").and_then(Value::as_str) else {
+                    return cdp_error_response(&request.id, -32602, "handle is required", session);
+                };
+                if self
+                    .streams
+                    .get(handle)
+                    .is_some_and(|stream| stream.connection_id == connection_id)
+                {
+                    self.streams.remove(handle);
                 }
                 cdp_result_response(&request.id, json!({}), session)
             }
@@ -1555,6 +1656,38 @@ mod tests {
         assert_eq!(json(&cdp.cdp_request(connection, &delete).unwrap())["result"], json!({}));
         let empty = json(&cdp.cdp_request(connection, &get).unwrap());
         assert!(empty["result"]["cookies"].as_array().unwrap().is_empty());
+    }
+
+    #[test]
+    fn portable_io_streams_are_bounded_and_owned_by_wasm() {
+        let mut cdp = PortableCdp::new("").unwrap();
+        let connection = cdp.open_connection().unwrap();
+        let attached = json(&cdp.cdp_request(
+            connection,
+            r#"{"id":1,"method":"Target.attachToTarget","params":{"targetId":"page-1"}}"#,
+        ).unwrap());
+        let session = attached["result"]["sessionId"].as_str().unwrap();
+        let handle = cdp.open_stream(connection, &BASE64.encode(b"portable-stream-data")).unwrap();
+        let first = json(&cdp.cdp_request(
+            connection,
+            &format!(r#"{{"id":2,"sessionId":"{session}","method":"IO.read","params":{{"handle":"{handle}","size":8}}}}"#),
+        ).unwrap());
+        assert_eq!(first["result"]["base64Encoded"], true);
+        assert_eq!(BASE64.decode(first["result"]["data"].as_str().unwrap()).unwrap(), b"portable");
+        assert_eq!(first["result"]["eof"], false);
+
+        let second = json(&cdp.cdp_request(
+            connection,
+            &format!(r#"{{"id":3,"sessionId":"{session}","method":"IO.read","params":{{"handle":"{handle}"}}}}"#),
+        ).unwrap());
+        assert_eq!(BASE64.decode(second["result"]["data"].as_str().unwrap()).unwrap(), b"-stream-data");
+        assert_eq!(second["result"]["eof"], true);
+
+        let closed = json(&cdp.cdp_request(
+            connection,
+            &format!(r#"{{"id":4,"sessionId":"{session}","method":"IO.close","params":{{"handle":"{handle}"}}}}"#),
+        ).unwrap());
+        assert_eq!(closed["result"], json!({}));
     }
 
     #[test]

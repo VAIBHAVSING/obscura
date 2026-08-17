@@ -495,6 +495,16 @@ class PageTarget {
     );
   }
 
+  async portableCdpOpenStream(connectionId, data) {
+    const record = this.portableCdpConnections.get(connectionId);
+    if (!record || typeof this.worker.portableCdpOpenStream !== "function") return null;
+    return this.worker.portableCdpOpenStream(
+      record.connectionId,
+      data,
+      { requestTimeoutMs: this.server.requestTimeoutMs },
+    );
+  }
+
   async cookies(operation, payload = {}) {
     await this.start();
     if (operation === "getAll") return this.worker.allCookies({ requestTimeoutMs: this.server.requestTimeoutMs });
@@ -857,6 +867,8 @@ export class ObscuraCdpServer {
       "Page.setDocumentContent",
       "Page.captureScreenshot",
       "Page.printToPDF",
+      "IO.read",
+      "IO.close",
       "Network.getAllCookies",
       "Network.setCookies",
       "Network.deleteCookies",
@@ -1246,6 +1258,8 @@ export class ObscuraCdpServer {
           marginRight: params.marginRight,
         });
         if (params.transferMode === "ReturnAsStream") {
+          const portableHandle = await target.portableCdpOpenStream(connection.id, Buffer.from(data).toString("base64"));
+          if (portableHandle) return { stream: portableHandle };
           const handle = `obscura-stream-${++this.streamCounter}`;
           this.streams.set(handle, { data: Buffer.from(data), offset: 0 });
           return { stream: handle };

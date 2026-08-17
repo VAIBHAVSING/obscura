@@ -104,6 +104,22 @@ test("real WASM artifact is reachable through package CDP", { skip: !modulePath 
     assert.deepEqual(Buffer.from(screenshot.data, "base64").subarray(0, 8), Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]));
     const pdf = await client.command("Page.printToPDF", {}, sessionId);
     assert.match(Buffer.from(pdf.data, "base64").toString("utf8", 0, 5), /^%PDF-/);
+    const streamedPdf = await client.command("Page.printToPDF", { transferMode: "ReturnAsStream" }, sessionId);
+    assert.equal(typeof streamedPdf.stream, "string");
+    const streamChunks = [];
+    let streamEof = false;
+    let streamBytes = 0;
+    while (!streamEof) {
+      const chunk = await client.command("IO.read", { handle: streamedPdf.stream, size: 64 * 1024 }, sessionId);
+      assert.equal(chunk.base64Encoded, true);
+      streamChunks.push(Buffer.from(chunk.data, "base64"));
+      streamBytes += streamChunks.at(-1).length;
+      assert.ok(streamBytes <= 12 * 1024 * 1024);
+      streamEof = chunk.eof === true;
+    }
+    const streamedBytes = Buffer.concat(streamChunks);
+    assert.match(streamedBytes.toString("utf8", 0, 5), /^%PDF-/);
+    await client.command("IO.close", { handle: streamedPdf.stream }, sessionId);
   } finally {
     await client?.close();
     await server.close();
