@@ -16,6 +16,11 @@ test("real WASM artifact is reachable through package CDP", { skip: !modulePath 
       response.end("fetch-body");
       return;
     }
+    if (request.url === "/continued") {
+      response.setHeader("content-type", "text/plain; charset=utf-8");
+      response.end("continued-body");
+      return;
+    }
     if (request.url === "/script.js") {
       response.setHeader("content-type", "application/javascript; charset=utf-8");
       response.end("globalThis.__portableScriptLoaded = true;");
@@ -118,9 +123,23 @@ test("real WASM artifact is reachable through package CDP", { skip: !modulePath 
     }, sessionId);
     assert.equal(scriptLoaded.result.value, true);
     const apiUrl = new URL("/api", fixtureUrl).href;
+    const continuedUrl = new URL("/continued", fixtureUrl).href;
+    const fetchEvents = [];
+    const stopFetchEvents = client.onEvent((event) => {
+      if (event.sessionId === sessionId && event.method === "Fetch.requestPaused") fetchEvents.push(event);
+    });
+    await client.command("Fetch.enable", { patterns: [{ urlPattern: `${new URL(fixtureUrl).origin}/*` }] }, sessionId);
     await client.command("Runtime.evaluate", {
       expression: "globalThis.__fetchValue = null; fetch('/api').then((response) => response.text()).then((value) => { globalThis.__fetchValue = value; }); undefined",
     }, sessionId);
+    let paused;
+    for (let attempt = 0; attempt < 100; attempt += 1) {
+      paused = fetchEvents.at(-1);
+      if (paused) break;
+      await new Promise((resolve) => setTimeout(resolve, 10));
+    }
+    assert.equal(paused?.params?.request?.url, apiUrl);
+    await client.command("Fetch.continueRequest", { requestId: paused.params.requestId, url: continuedUrl }, sessionId);
     let fetchValue;
     for (let attempt = 0; attempt < 100; attempt += 1) {
       const evaluatedFetch = await client.command("Runtime.evaluate", {
@@ -128,17 +147,64 @@ test("real WASM artifact is reachable through package CDP", { skip: !modulePath 
         returnByValue: true,
       }, sessionId);
       fetchValue = evaluatedFetch.result.value;
-      if (fetchValue === "fetch-body") break;
+      if (fetchValue === "continued-body") break;
       await new Promise((resolve) => setTimeout(resolve, 10));
     }
-    assert.equal(fetchValue, "fetch-body");
-    const fetchRequestEvent = networkEvents.find((event) => event.method === "Network.requestWillBeSent" && event.params.request.url === apiUrl);
+    assert.equal(fetchValue, "continued-body");
+    await client.command("Runtime.evaluate", {
+      expression: "globalThis.__fetchValue = null; fetch('/api').then((response) => response.text()).then((value) => { globalThis.__fetchValue = value; }); undefined",
+    }, sessionId);
+    for (let attempt = 0; attempt < 100; attempt += 1) {
+      paused = fetchEvents.at(-1);
+      if (paused?.params?.request?.url === apiUrl && paused.params.requestId !== fetchEvents.at(-2)?.params?.requestId) break;
+      await new Promise((resolve) => setTimeout(resolve, 10));
+    }
+    assert.equal(paused?.params?.request?.url, apiUrl);
+    await client.command("Fetch.fulfillRequest", {
+      requestId: paused.params.requestId,
+      responseCode: 202,
+      responseHeaders: [{ name: "content-type", value: "text/plain" }],
+      body: Buffer.from("fulfilled-body").toString("base64"),
+    }, sessionId);
+    for (let attempt = 0; attempt < 100; attempt += 1) {
+      const evaluatedFetch = await client.command("Runtime.evaluate", {
+        expression: "globalThis.__fetchValue",
+        returnByValue: true,
+      }, sessionId);
+      fetchValue = evaluatedFetch.result.value;
+      if (fetchValue === "fulfilled-body") break;
+      await new Promise((resolve) => setTimeout(resolve, 10));
+    }
+    assert.equal(fetchValue, "fulfilled-body");
+    await client.command("Runtime.evaluate", {
+      expression: "globalThis.__fetchValue = 'pending'; fetch('/api').then(() => { globalThis.__fetchValue = 'unexpected'; }, (error) => { globalThis.__fetchValue = error.name; }); undefined",
+    }, sessionId);
+    for (let attempt = 0; attempt < 100; attempt += 1) {
+      paused = fetchEvents.at(-1);
+      if (paused?.params?.request?.url === apiUrl && paused.params.requestId !== fetchEvents.at(-2)?.params?.requestId) break;
+      await new Promise((resolve) => setTimeout(resolve, 10));
+    }
+    assert.equal(paused?.params?.request?.url, apiUrl);
+    await client.command("Fetch.failRequest", { requestId: paused.params.requestId, errorReason: "Aborted" }, sessionId);
+    for (let attempt = 0; attempt < 100; attempt += 1) {
+      const evaluatedFetch = await client.command("Runtime.evaluate", {
+        expression: "globalThis.__fetchValue",
+        returnByValue: true,
+      }, sessionId);
+      fetchValue = evaluatedFetch.result.value;
+      if (fetchValue === "TypeError") break;
+      await new Promise((resolve) => setTimeout(resolve, 10));
+    }
+    assert.equal(fetchValue, "TypeError");
+    await client.command("Fetch.disable", {}, sessionId);
+    stopFetchEvents();
+    const fetchRequestEvent = networkEvents.find((event) => event.method === "Network.requestWillBeSent" && event.params.requestId === fetchEvents[0]?.params?.requestId);
     assert.ok(fetchRequestEvent?.params?.requestId);
     const fetchResponseBody = await client.command("Network.getResponseBody", { requestId: fetchRequestEvent.params.requestId }, sessionId);
     const fetchText = fetchResponseBody.base64Encoded
       ? Buffer.from(fetchResponseBody.body, "base64").toString("utf8")
       : fetchResponseBody.body;
-    assert.equal(fetchText, "fetch-body");
+    assert.equal(fetchText, "continued-body");
     const renderUrl = new URL("/render", fixtureUrl).href;
     await client.command("Page.navigate", { url: renderUrl }, sessionId);
     const renderScreenshot = await client.command("Page.captureScreenshot", {}, sessionId);

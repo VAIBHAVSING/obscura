@@ -1256,6 +1256,43 @@ function portableCdpInstance(html = "") {
   return portableCdpCore;
 }
 
+function drainPortableFetchResolutions() {
+  const drainer = member(portableCdpCore, ["drainFetchResolutions", "drain_fetch_resolutions"]);
+  if (!drainer) return 0;
+  let resolutions;
+  try {
+    resolutions = decodeJsonText(drainer.fn());
+  } catch {
+    return 0;
+  }
+  if (!Array.isArray(resolutions)) return 0;
+  let applied = 0;
+  for (const resolution of resolutions) {
+    if (!resolution || typeof resolution !== "object" || typeof resolution.requestId !== "string") continue;
+    const record = [...bootstrapFetches.values()].find((candidate) => candidate.requestId === resolution.requestId);
+    if (!record || typeof record.interceptionResolve !== "function") continue;
+    const resolve = record.interceptionResolve;
+    record.interceptionResolve = null;
+    record.interceptionReject = null;
+    resolve(resolution);
+    applied += 1;
+  }
+  return applied;
+}
+
+function portableCdpInterceptFetch(metadata) {
+  const interceptor = member(portableCdpCore, ["interceptFetchRequest", "intercept_fetch_request"]);
+  if (!interceptor) return { paused: false };
+  try {
+    requireBoundedString(metadata?.requestId, 256, "Fetch request ID");
+    const result = decodeJsonText(interceptor.fn("page-1", JSON.stringify(metadata)));
+    return result && typeof result === "object" ? result : { paused: false };
+  } catch (error) {
+    if (error?.code === "ERR_OBSCURA_CDP_ABI") throw error;
+    return { paused: false };
+  }
+}
+
 function portableCdpOperation(payload = {}) {
   const operation = payload.operation;
   if (operation === "abi") {
@@ -1291,7 +1328,9 @@ function portableCdpOperation(payload = {}) {
   if (operation === "request") {
     const connectionId = requireUnsignedU32(payload.connectionId, "CDP connection ID");
     requireBoundedString(payload.message, MAX_PLATFORM_REQUEST_BYTES, "CDP message");
-    return decodeJsonText(core.cdpRequest(connectionId, payload.message));
+    const response = decodeJsonText(core.cdpRequest(connectionId, payload.message));
+    drainPortableFetchResolutions();
+    return response;
   }
   if (operation === "complete") {
     const actionId = requireUnsignedU32(payload.actionId, "CDP action ID");
@@ -1620,9 +1659,10 @@ function installDocumentFacade() {
 
 async function disposeBridgeCore() {
   const core = bridgeCore;
+  const cdpCore = portableCdpCore;
   bridgeCore = null;
+  cancelBootstrapFetches(cdpCore);
   portableCdpCore = null;
-  cancelBootstrapFetches();
   bootstrapNetworkEvents.length = 0;
   bootstrapNetworkEventBytes = 0;
   bootstrapRuntime = null;
@@ -1739,7 +1779,7 @@ async function replaceBridgeCore(html, documentMetadata) {
 }
 
 function resetBridgeRealmAfterNavigation() {
-  cancelBootstrapFetches();
+  cancelBootstrapFetches(portableCdpCore);
   bootstrapNetworkEvents.length = 0;
   bootstrapNetworkEventBytes = 0;
   bootstrapRuntime = null;
@@ -1763,9 +1803,16 @@ function resetBridgeRealmAfterNavigation() {
   }
 }
 
-function cancelBootstrapFetches() {
-  for (const { controller } of bootstrapFetches.values()) {
+function cancelBootstrapFetches(cdpCore = portableCdpCore) {
+  const cancel = member(cdpCore, ["cancelFetchRequest", "cancel_fetch_request"]);
+  for (const { controller, requestId, interceptionResolve } of bootstrapFetches.values()) {
     try { controller.abort(new Error("page realm was reset")); } catch {}
+    if (typeof interceptionResolve === "function") {
+      try { interceptionResolve({ requestId, action: "fail", reason: "Aborted" }); } catch {}
+    }
+    if (cancel && typeof requestId === "string") {
+      try { cancel.fn("page-1", requestId); } catch {}
+    }
   }
   bootstrapFetches.clear();
 }
@@ -1959,6 +2006,21 @@ function binaryStringToBytes(value) {
   return bytes;
 }
 
+function fetchHeadersFromCdp(value, fallback) {
+  if (value == null) return { ...fallback };
+  if (!Array.isArray(value)) throw new TypeError("Fetch continue headers must be an array");
+  const headers = {};
+  for (const entry of value) {
+    if (!entry || typeof entry !== "object" || typeof entry.name !== "string" || typeof entry.value !== "string") {
+      throw new TypeError("Fetch continue header must contain string name and value");
+    }
+    requireBoundedString(entry.name, 1024, "Fetch header name");
+    requireBoundedString(entry.value, MAX_NAVIGATION_HEADERS_BYTES, "Fetch header value");
+    headers[entry.name] = entry.value;
+  }
+  return headers;
+}
+
 function bootstrapFetchResolution(id, envelope) {
   const record = bootstrapFetches.get(id);
   if (!record) return;
@@ -1992,37 +2054,111 @@ function startBootstrapFetch(url, method, headersJson, body, pageOrigin, mode, c
     requireBoundedString(value, MAX_NAVIGATION_HEADERS_BYTES, "fetch header value");
   }
   const controller = new AbortController();
-  const record = { controller, runtime: bootstrapRuntime, generation: bridgeGeneration };
+  const requestId = `fetch-${nextBootstrapNetworkRequestId++}`;
+  if (nextBootstrapNetworkRequestId > 0xffff_ffff) nextBootstrapNetworkRequestId = 1;
+  const record = {
+    controller,
+    runtime: bootstrapRuntime,
+    generation: bridgeGeneration,
+    requestId,
+    interceptionResolve: null,
+    interceptionReject: null,
+  };
   bootstrapFetches.set(id, record);
   void (async () => {
-    const requestId = `fetch-${nextBootstrapNetworkRequestId++}`;
-    if (nextBootstrapNetworkRequestId > 0xffff_ffff) nextBootstrapNetworkRequestId = 1;
     const loaderId = currentNavigationLoaderId();
     try {
-      const requestHeaders = { ...headers };
+      let effectiveUrl = targetUrl;
+      let effectiveMethod = method;
+      let effectiveBody = body;
+      let requestHeaders = { ...headers };
       const requestOrigin = (() => {
         try { return new URL(pageOrigin).origin; } catch { return ""; }
       })();
-      const targetOrigin = targetUrl.origin;
+      const targetOrigin = effectiveUrl.origin;
       const sameRequestOrigin = requestOrigin !== "" && requestOrigin === targetOrigin;
       if ((credentials === "include" || (credentials === "same-origin" && sameRequestOrigin)) &&
           !Object.keys(requestHeaders).some((name) => name.toLowerCase() === "cookie")) {
-        const cookie = cookieHeaderForUrl(targetUrl, credentials);
+        const cookie = cookieHeaderForUrl(effectiveUrl, credentials);
         if (cookie) requestHeaders.Cookie = cookie;
       }
-      const response = await fetch(targetUrl, {
-        method,
+      const interception = portableCdpInterceptFetch({
+        requestId,
+        url: effectiveUrl.toString(),
+        method: effectiveMethod,
         headers: requestHeaders,
-        body: method === "GET" || method === "HEAD" ? undefined : binaryStringToBytes(body),
+        postData: effectiveMethod === "GET" || effectiveMethod === "HEAD" ? undefined : effectiveBody,
+        resourceType: "Fetch",
+        frameId: "page-1",
+      });
+      if (interception.paused === true) {
+        const resolution = await new Promise((resolve, reject) => {
+          record.interceptionResolve = resolve;
+          record.interceptionReject = reject;
+        });
+        if (!resolution || resolution.action === "fail") {
+          throw new Error("Fetch request failed by interception");
+        }
+        if (resolution.action === "fulfill") {
+          const fulfilledBytes = Buffer.from(String(resolution.bodyBase64 ?? ""), "base64");
+          const fulfilledHeaders = {};
+          for (const entry of Array.isArray(resolution.headers) ? resolution.headers : []) {
+            if (entry && typeof entry.name === "string" && typeof entry.value === "string") fulfilledHeaders[entry.name] = entry.value;
+          }
+          queueBootstrapNetworkEvent({
+            generation: record.generation,
+            runtime: record.runtime,
+            ...networkRecord({
+              requestId,
+              loaderId,
+              url: effectiveUrl.toString(),
+              method: effectiveMethod,
+              requestHeaders,
+              status: Number.isSafeInteger(resolution.status) ? resolution.status : 200,
+              responseHeaders: fulfilledHeaders,
+              mimeType: fulfilledHeaders["content-type"] ?? fulfilledHeaders["Content-Type"] ?? "",
+              body: fulfilledBytes,
+              bodySize: fulfilledBytes.byteLength,
+              resourceType: "Fetch",
+              initiatorType: "script",
+            }),
+          });
+          bootstrapFetchResolution(id, {
+            ok: true,
+            value: JSON.stringify({
+              blocked: false,
+              corsBlocked: false,
+              status: Number.isSafeInteger(resolution.status) ? resolution.status : 200,
+              headers: fulfilledHeaders,
+              body: fulfilledBytes.toString("utf8"),
+              bodyBase64: fulfilledBytes.toString("base64"),
+              url: effectiveUrl.toString(),
+              redirected: false,
+            }),
+          });
+          return;
+        }
+        if (typeof resolution.url === "string") effectiveUrl = validateNavigationUrl(resolution.url, activeAllowPrivateNetwork);
+        if (typeof resolution.method === "string") {
+          requireBoundedString(resolution.method, 32, "Fetch continue method");
+          effectiveMethod = resolution.method;
+        }
+        requestHeaders = fetchHeadersFromCdp(resolution.headers, requestHeaders);
+        if (typeof resolution.postData === "string") effectiveBody = resolution.postData;
+      }
+      const response = await fetch(effectiveUrl, {
+        method: effectiveMethod,
+        headers: requestHeaders,
+        body: effectiveMethod === "GET" || effectiveMethod === "HEAD" ? undefined : binaryStringToBytes(effectiveBody),
         redirect: "follow",
         signal: controller.signal,
       });
       const { headers: responseHeaders } = responseHeadersObject(response);
       const sameOrigin = (() => {
-        try { return new URL(pageOrigin).origin === new URL(response.url || targetUrl).origin; } catch { return false; }
+        try { return new URL(pageOrigin).origin === new URL(response.url || effectiveUrl).origin; } catch { return false; }
       })();
       if (credentials !== "omit" && (sameOrigin || credentials === "include")) {
-        storeResponseCookies(response.url || targetUrl, response);
+        storeResponseCookies(response.url || effectiveUrl, response);
       }
       if (mode === "cors" && !sameOrigin) {
         const allowedOrigin = responseHeaders["access-control-allow-origin"];
@@ -2035,8 +2171,8 @@ function startBootstrapFetch(url, method, headersJson, body, pageOrigin, mode, c
             ...networkRecord({
               requestId,
               loaderId,
-              url: response.url || targetUrl.toString(),
-              method,
+              url: response.url || effectiveUrl.toString(),
+              method: effectiveMethod,
               requestHeaders,
               status: response.status,
               responseHeaders,
@@ -2058,8 +2194,8 @@ function startBootstrapFetch(url, method, headersJson, body, pageOrigin, mode, c
           ...networkRecord({
             requestId,
             loaderId,
-            url: response.url || targetUrl.toString(),
-            method,
+            url: response.url || effectiveUrl.toString(),
+            method: effectiveMethod,
             requestHeaders,
             status: response.status,
             responseHeaders: {},
@@ -2080,8 +2216,8 @@ function startBootstrapFetch(url, method, headersJson, body, pageOrigin, mode, c
         ...networkRecord({
           requestId,
           loaderId,
-          url: response.url || targetUrl.toString(),
-          method,
+          url: response.url || effectiveUrl.toString(),
+          method: effectiveMethod,
           requestHeaders,
           status: response.status,
           responseHeaders,

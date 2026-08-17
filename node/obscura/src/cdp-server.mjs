@@ -321,7 +321,10 @@ class PageTarget {
       } catch {
         return;
       }
-      if (!recorded?.recorded || !recorded.count) return;
+      // Poll even when no asynchronous Network metadata was recorded. Fetch
+      // interception emits requestPaused directly from the portable CDP core,
+      // so an idle network recorder must not suppress those events.
+      if (!recorded?.recorded) return;
       for (const connection of this.sessions) {
         const core = this.portableCdpConnections.get(connection.id);
         if (!core || connection.closed) continue;
@@ -955,6 +958,12 @@ export class ObscuraCdpServer {
       "Runtime.releaseObjectGroup",
       "Runtime.getProperties",
       "Runtime.getIsolateId",
+      "Fetch.enable",
+      "Fetch.disable",
+      "Fetch.continueRequest",
+      "Fetch.fulfillRequest",
+      "Fetch.failRequest",
+      "Fetch.getResponseBody",
       "Input.dispatchMouseEvent",
       "Input.dispatchKeyEvent",
       "Input.insertText",

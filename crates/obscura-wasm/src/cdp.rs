@@ -16,7 +16,7 @@ use url::Url;
 use wasm_bindgen::prelude::*;
 
 use crate::ObscuraCore;
-use crate::navigation::MAX_NAVIGATION_URL_BYTES;
+use crate::navigation::{MAX_NAVIGATION_HEADERS_BYTES, MAX_NAVIGATION_URL_BYTES};
 
 pub const CDP_ABI_VERSION: u32 = 1;
 const MAX_MESSAGE_BYTES: usize = 8 * 1024 * 1024;
@@ -29,6 +29,10 @@ const MAX_STREAM_BYTES: usize = 12 * 1024 * 1024;
 const MAX_STREAM_CHUNK_BYTES: usize = 1 * 1024 * 1024;
 const MAX_RESPONSE_BODY_BYTES: usize = 4 * 1024 * 1024;
 const MAX_RESPONSE_BODIES: usize = 128;
+const MAX_FETCH_PATTERNS: usize = 64;
+const MAX_FETCH_PATTERN_BYTES: usize = 2048;
+const MAX_FETCH_REQUESTS: usize = 256;
+const MAX_FETCH_RESOLUTIONS: usize = 256;
 
 fn js_error(message: &str) -> JsValue {
     #[cfg(target_arch = "wasm32")]
@@ -61,6 +65,40 @@ fn bounded(value: &str, maximum: usize, label: &str) -> Result<(), JsValue> {
         )));
     }
     Ok(())
+}
+
+fn fetch_url_matches(pattern: &str, url: &str) -> bool {
+    if pattern == "*" || pattern.is_empty() {
+        return pattern == "*";
+    }
+    let pattern: Vec<char> = pattern.chars().collect();
+    let url: Vec<char> = url.chars().collect();
+    let mut pattern_index = 0;
+    let mut url_index = 0;
+    let mut star_index = None;
+    let mut star_match = 0;
+    while url_index < url.len() {
+        if pattern_index < pattern.len()
+            && (pattern[pattern_index] == '?' || pattern[pattern_index] == url[url_index])
+        {
+            pattern_index += 1;
+            url_index += 1;
+        } else if pattern_index < pattern.len() && pattern[pattern_index] == '*' {
+            star_index = Some(pattern_index);
+            star_match = url_index;
+            pattern_index += 1;
+        } else if let Some(star) = star_index {
+            pattern_index = star + 1;
+            star_match += 1;
+            url_index = star_match;
+        } else {
+            return false;
+        }
+    }
+    while pattern_index < pattern.len() && pattern[pattern_index] == '*' {
+        pattern_index += 1;
+    }
+    pattern_index == pattern.len()
 }
 
 fn error_value(code: i32, message: impl Into<String>) -> Value {
@@ -134,6 +172,16 @@ struct ResponseBody {
     base64_encoded: bool,
 }
 
+struct PausedFetch {
+    request_id: String,
+    url: String,
+    method: String,
+    headers: BTreeMap<String, String>,
+    post_data: Option<String>,
+    resource_type: String,
+    frame_id: String,
+}
+
 #[derive(Clone, Copy)]
 struct Viewport {
     width: u32,
@@ -160,6 +208,8 @@ struct Target {
     focus_emulation: bool,
     extra_headers: BTreeMap<String, String>,
     network_enabled_sessions: BTreeSet<String>,
+    fetch_patterns: BTreeMap<String, Vec<String>>,
+    paused_fetches: BTreeMap<String, PausedFetch>,
     response_bodies: BTreeMap<String, ResponseBody>,
     core: ObscuraCore,
     sessions: BTreeSet<String>,
@@ -191,6 +241,7 @@ pub struct PortableCdp {
     next_loader_id: u32,
     streams: BTreeMap<String, Stream>,
     next_stream_id: u32,
+    fetch_resolutions: VecDeque<Value>,
 }
 
 #[wasm_bindgen]
@@ -217,6 +268,8 @@ impl PortableCdp {
                 focus_emulation: false,
                 extra_headers: BTreeMap::new(),
                 network_enabled_sessions: BTreeSet::new(),
+                fetch_patterns: BTreeMap::new(),
+                paused_fetches: BTreeMap::new(),
                 response_bodies: BTreeMap::new(),
                 core,
                 sessions: BTreeSet::new(),
@@ -236,6 +289,7 @@ impl PortableCdp {
             next_loader_id: 0,
             streams: BTreeMap::new(),
             next_stream_id: 0,
+            fetch_resolutions: VecDeque::new(),
         })
     }
 
@@ -299,7 +353,9 @@ impl PortableCdp {
                 if let Some(target) = self.targets.get_mut(target_id) {
                     target.sessions.remove(&session_id);
                     target.network_enabled_sessions.remove(&session_id);
+                    target.fetch_patterns.remove(&session_id);
                 }
+                let _ = self.disable_fetch_for_session(target_id, &session_id);
             }
         }
         self.actions
@@ -448,6 +504,51 @@ impl PortableCdp {
         self.record_network_metadata(target_id, &metadata)
     }
 
+    /// Ask the portable CDP state whether a host-owned request must pause for
+    /// Fetch interception. The host supplies only bounded, clone-safe request
+    /// metadata; the returned resolution is drained after a CDP client calls
+    /// Fetch.continueRequest/fulfillRequest/failRequest.
+    #[wasm_bindgen(js_name = interceptFetchRequest)]
+    pub fn intercept_fetch_request_json(
+        &mut self,
+        target_id: &str,
+        metadata_json: &str,
+    ) -> Result<String, JsValue> {
+        bounded(target_id, MAX_METHOD_BYTES, "CDP target ID")?;
+        bounded(metadata_json, MAX_ACTION_RESULT_BYTES, "Fetch request metadata")?;
+        let metadata: Value = serde_json::from_str(metadata_json)
+            .map_err(|error| js_error(&format!("invalid Fetch request metadata: {error}")))?;
+        let result = self.intercept_fetch_request(target_id, &metadata)?;
+        serde_json::to_string(&result)
+            .map_err(|error| js_error(&format!("Fetch interception result serialization failed: {error}")))
+    }
+
+    /// Drain host-facing Fetch resolutions produced by portable CDP commands.
+    /// Each entry is consumed exactly once by the Node transport adapter.
+    #[wasm_bindgen(js_name = drainFetchResolutions)]
+    pub fn drain_fetch_resolutions_json(&mut self) -> Result<String, JsValue> {
+        let mut resolutions = Vec::new();
+        while let Some(resolution) = self.fetch_resolutions.pop_front() {
+            resolutions.push(resolution);
+        }
+        let text = serde_json::to_string(&resolutions)
+            .map_err(|error| js_error(&format!("Fetch resolution serialization failed: {error}")))?;
+        bounded(&text, MAX_EVENT_BYTES, "Fetch resolution batch")?;
+        Ok(text)
+    }
+
+    /// Remove a paused request when the host page is reset or the page-side
+    /// fetch is aborted before a CDP client responds.
+    #[wasm_bindgen(js_name = cancelFetchRequest)]
+    pub fn cancel_fetch_request_json(&mut self, target_id: &str, request_id: &str) -> Result<(), JsValue> {
+        bounded(target_id, MAX_METHOD_BYTES, "CDP target ID")?;
+        bounded(request_id, MAX_METHOD_BYTES, "Fetch request ID")?;
+        if let Some(target) = self.targets.get_mut(target_id) {
+            target.paused_fetches.remove(request_id);
+        }
+        Ok(())
+    }
+
     /// Return and remove up to `max_items` queued events for a connection.
     #[wasm_bindgen(js_name = pollCdpEvents)]
     pub fn poll_cdp_events(&mut self, connection_id: u32, max_items: u32) -> Result<String, JsValue> {
@@ -484,6 +585,9 @@ impl PortableCdp {
             "streams": self.streams.len(),
             "responseBodyBytes": MAX_RESPONSE_BODY_BYTES,
             "responseBodies": self.targets.values().map(|target| target.response_bodies.len()).sum::<usize>(),
+            "fetchPatternLimit": MAX_FETCH_PATTERNS,
+            "fetchPausedRequestLimit": MAX_FETCH_REQUESTS,
+            "fetchResolutionQueue": self.fetch_resolutions.len(),
         })
         .to_string()
     }
@@ -585,6 +689,200 @@ impl PortableCdp {
             }
         }
         Ok(())
+    }
+
+    fn intercept_fetch_request(&mut self, target_id: &str, metadata: &Value) -> Result<Value, JsValue> {
+        let Some(metadata) = metadata.as_object() else {
+            return Err(js_error("Fetch request metadata must be an object"));
+        };
+        let request_id = metadata.get("requestId").and_then(Value::as_str).unwrap_or("");
+        let url = metadata.get("url").and_then(Value::as_str).unwrap_or("");
+        let method = metadata.get("method").and_then(Value::as_str).unwrap_or("GET");
+        if request_id.is_empty() || request_id.len() > MAX_METHOD_BYTES {
+            return Err(js_error("Fetch requestId is invalid"));
+        }
+        bounded(url, MAX_NAVIGATION_URL_BYTES, "Fetch request URL")?;
+        bounded(method, 32, "Fetch request method")?;
+        let Some(target) = self.targets.get_mut(target_id) else {
+            return Err(js_error("portable Fetch target is not known"));
+        };
+        if target.paused_fetches.len() >= MAX_FETCH_REQUESTS && !target.paused_fetches.contains_key(request_id) {
+            return Err(js_range_error("portable Fetch paused-request limit exceeded"));
+        }
+        let request_headers = metadata.get("headers").cloned().unwrap_or_else(|| Value::Object(Map::new()));
+        let Some(request_headers) = request_headers.as_object() else {
+            return Err(js_error("Fetch request headers must be an object"));
+        };
+        let mut headers = BTreeMap::new();
+        for (name, value) in request_headers {
+            let Some(value) = value.as_str() else {
+                return Err(js_error("Fetch request header values must be strings"));
+            };
+            bounded(name, 1024, "Fetch request header name")?;
+            bounded(value, MAX_NAVIGATION_HEADERS_BYTES, "Fetch request header value")?;
+            headers.insert(name.clone(), value.to_string());
+        }
+        let resource_type = metadata
+            .get("resourceType")
+            .and_then(Value::as_str)
+            .unwrap_or("Fetch");
+        bounded(resource_type, 64, "Fetch resource type")?;
+        let post_data = metadata.get("postData").and_then(Value::as_str).map(str::to_string);
+        if let Some(post_data) = post_data.as_deref() {
+            bounded(post_data, MAX_ACTION_RESULT_BYTES, "Fetch postData")?;
+        }
+        let frame_id = metadata
+            .get("frameId")
+            .and_then(Value::as_str)
+            .unwrap_or(&target.frame_id)
+            .to_string();
+        let matching_sessions: Vec<(u32, String)> = self
+            .connections
+            .iter()
+            .flat_map(|(connection_id, connection)| {
+                connection.sessions.iter().filter_map(|(session_id, mapped_target)| {
+                    if mapped_target != target_id {
+                        return None;
+                    }
+                    let patterns = target.fetch_patterns.get(session_id)?;
+                    patterns.iter().any(|pattern| fetch_url_matches(pattern, url))
+                        .then_some((*connection_id, session_id.clone()))
+                })
+            })
+            .collect();
+        if matching_sessions.is_empty() {
+            return Ok(json!({"paused": false, "requestId": request_id}));
+        }
+        let paused = PausedFetch {
+            request_id: request_id.to_string(),
+            url: url.to_string(),
+            method: method.to_string(),
+            headers,
+            post_data,
+            resource_type: resource_type.to_string(),
+            frame_id,
+        };
+        target.paused_fetches.insert(request_id.to_string(), paused);
+        let request = target.paused_fetches.get(request_id).expect("paused Fetch was inserted");
+        let request_payload = json!({
+            "url": request.url,
+            "method": request.method,
+            "headers": request.headers,
+            "postData": request.post_data,
+        });
+        for (connection_id, session_id) in &matching_sessions {
+            if let Some(connection) = self.connections.get_mut(connection_id) {
+                queue_event(connection, "Fetch.requestPaused", json!({
+                    "requestId": request.request_id,
+                    "request": request_payload,
+                    "resourceType": request.resource_type,
+                    "frameId": request.frame_id,
+                    "networkId": request.request_id,
+                }), Some(session_id));
+            }
+        }
+        Ok(json!({"paused": true, "requestId": request_id, "sessionCount": matching_sessions.len()}))
+    }
+
+    fn resolve_fetch_request(&mut self, target_id: &str, request_id: &str, resolution: Value) -> Result<(), String> {
+        let Some(target) = self.targets.get_mut(target_id) else {
+            return Err("target is not known".to_string());
+        };
+        if target.paused_fetches.remove(request_id).is_none() {
+            // CDP treats a stale resolution as an idempotent no-op for a
+            // request which already completed or was canceled by the host.
+            return Ok(());
+        }
+        if self.fetch_resolutions.len() >= MAX_FETCH_RESOLUTIONS {
+            return Err("Fetch resolution queue is full".to_string());
+        }
+        self.fetch_resolutions.push_back(resolution);
+        Ok(())
+    }
+
+    fn disable_fetch_for_session(&mut self, target_id: &str, session_id: &str) -> Result<(), String> {
+        let Some(target) = self.targets.get_mut(target_id) else {
+            return Err("target is not known".to_string());
+        };
+        target.fetch_patterns.remove(session_id);
+        if target.fetch_patterns.is_empty() {
+            let request_ids: Vec<String> = target.paused_fetches.keys().cloned().collect();
+            for request_id in request_ids {
+                let _ = self.resolve_fetch_request(target_id, &request_id, json!({
+                    "requestId": request_id,
+                    "action": "continue",
+                }));
+            }
+        }
+        Ok(())
+    }
+
+    fn queue_fetch_continue(&mut self, target_id: &str, request_id: &str, params: &Map<String, Value>) -> Result<(), String> {
+        let url = params.get("url").and_then(Value::as_str);
+        let method = params.get("method").and_then(Value::as_str);
+        let post_data = params.get("postData").and_then(Value::as_str);
+        if let Some(url) = url {
+            if url.len() > MAX_NAVIGATION_URL_BYTES {
+                return Err("Fetch continue URL exceeds the byte limit".to_string());
+            }
+        }
+        if let Some(method) = method {
+            if method.len() > 32 {
+                return Err("Fetch continue method exceeds the byte limit".to_string());
+            }
+        }
+        if let Some(post_data) = post_data {
+            if post_data.len() > MAX_ACTION_RESULT_BYTES {
+                return Err("Fetch continue postData exceeds the byte limit".to_string());
+            }
+        }
+        let headers = params.get("headers").cloned().unwrap_or(Value::Null);
+        if !headers.is_null() {
+            validate_fetch_header_array(&headers)?;
+        }
+        self.resolve_fetch_request(target_id, request_id, json!({
+            "requestId": request_id,
+            "action": "continue",
+            "url": url,
+            "method": method,
+            "headers": headers,
+            "postData": post_data,
+        }))
+    }
+
+    fn queue_fetch_fulfill(&mut self, target_id: &str, request_id: &str, params: &Map<String, Value>) -> Result<(), String> {
+        let status = params.get("responseCode").and_then(Value::as_u64).unwrap_or(200);
+        if status > u16::MAX as u64 {
+            return Err("responseCode is out of range".to_string());
+        }
+        let headers = params.get("responseHeaders").cloned().unwrap_or_else(|| Value::Array(Vec::new()));
+        validate_fetch_header_array(&headers)?;
+        let body = params.get("body").and_then(Value::as_str).unwrap_or("");
+        bounded_js_string(body, MAX_ACTION_RESULT_BYTES, "Fetch fulfill body")?;
+        if body.len() > MAX_RESPONSE_BODY_BYTES.saturating_mul(2) {
+            return Err("Fetch fulfill body exceeds the response limit".to_string());
+        }
+        let decoded = BASE64.decode(body).map_err(|_| "Fetch fulfill body is not valid base64".to_string())?;
+        if decoded.len() > MAX_RESPONSE_BODY_BYTES {
+            return Err("Fetch fulfill body exceeds the response limit".to_string());
+        }
+        self.resolve_fetch_request(target_id, request_id, json!({
+            "requestId": request_id,
+            "action": "fulfill",
+            "status": status,
+            "headers": headers,
+            "bodyBase64": body,
+        }))
+    }
+
+    fn queue_fetch_fail(&mut self, target_id: &str, request_id: &str, params: &Map<String, Value>) -> Result<(), String> {
+        let reason = params.get("errorReason").and_then(Value::as_str).unwrap_or("Failed");
+        bounded_js_string(reason, 256, "Fetch errorReason")?;
+        self.resolve_fetch_request(target_id, request_id, json!({
+            "requestId": request_id,
+            "action": "fail",
+            "reason": reason,
+        }))
     }
 
     fn target_for_session(
@@ -768,6 +1066,70 @@ impl PortableCdp {
             }
             "Page.enable" | "Page.disable" | "DOM.enable" | "DOM.disable" | "Runtime.disable" => {
                 cdp_result_response(&request.id, json!({}), session)
+            }
+            "Fetch.enable" => {
+                let Some(session_id) = session else {
+                    return cdp_error_response(&request.id, -32600, "Fetch.enable requires a target session", session);
+                };
+                let patterns = match parse_fetch_patterns(&request.params) {
+                    Ok(patterns) => patterns,
+                    Err(error) => return cdp_error_response(&request.id, -32602, error, session),
+                };
+                let Some(target) = self.targets.get_mut(&target_id) else {
+                    return cdp_error_response(&request.id, -32000, "target is not known", session);
+                };
+                target.fetch_patterns.insert(session_id.to_string(), patterns);
+                cdp_result_response(&request.id, json!({}), session)
+            }
+            "Fetch.disable" => {
+                if let Some(session_id) = session {
+                    if let Err(error) = self.disable_fetch_for_session(&target_id, session_id) {
+                        return cdp_error_response(&request.id, -32000, error, session);
+                    }
+                }
+                cdp_result_response(&request.id, json!({}), session)
+            }
+            "Fetch.continueRequest" => {
+                let Some(session_id) = session else {
+                    return cdp_error_response(&request.id, -32600, "Fetch.continueRequest requires a target session", session);
+                };
+                let Some(request_id) = request.params.get("requestId").and_then(Value::as_str) else {
+                    return cdp_error_response(&request.id, -32602, "requestId is required", session);
+                };
+                if let Err(error) = self.queue_fetch_continue(&target_id, request_id, &request.params) {
+                    return cdp_error_response(&request.id, -32000, error, Some(session_id));
+                }
+                cdp_result_response(&request.id, json!({}), session)
+            }
+            "Fetch.fulfillRequest" => {
+                let Some(request_id) = request.params.get("requestId").and_then(Value::as_str) else {
+                    return cdp_error_response(&request.id, -32602, "requestId is required", session);
+                };
+                if let Err(error) = self.queue_fetch_fulfill(&target_id, request_id, &request.params) {
+                    return cdp_error_response(&request.id, -32000, error, session);
+                }
+                cdp_result_response(&request.id, json!({}), session)
+            }
+            "Fetch.failRequest" => {
+                let Some(request_id) = request.params.get("requestId").and_then(Value::as_str) else {
+                    return cdp_error_response(&request.id, -32602, "requestId is required", session);
+                };
+                if let Err(error) = self.queue_fetch_fail(&target_id, request_id, &request.params) {
+                    return cdp_error_response(&request.id, -32000, error, session);
+                }
+                cdp_result_response(&request.id, json!({}), session)
+            }
+            "Fetch.getResponseBody" => {
+                let Some(request_id) = request.params.get("requestId").and_then(Value::as_str) else {
+                    return cdp_error_response(&request.id, -32602, "requestId is required", session);
+                };
+                let Some(target) = self.targets.get(&target_id) else {
+                    return cdp_error_response(&request.id, -32000, "target is not known", session);
+                };
+                let Some(body) = target.response_bodies.get(request_id) else {
+                    return cdp_error_response(&request.id, -32000, "No response body found for requestId", session);
+                };
+                cdp_result_response(&request.id, json!({"body": body.body, "base64Encoded": body.base64_encoded}), session)
             }
             "Network.enable" => {
                 let Some(session_id) = session else {
@@ -1251,6 +1613,8 @@ impl PortableCdp {
             focus_emulation: false,
             extra_headers: BTreeMap::new(),
             network_enabled_sessions: BTreeSet::new(),
+            fetch_patterns: BTreeMap::new(),
+            paused_fetches: BTreeMap::new(),
             response_bodies: BTreeMap::new(),
             core,
             sessions: BTreeSet::new(),
@@ -1350,7 +1714,9 @@ impl PortableCdp {
         if let Some(target) = self.targets.get_mut(&target_id) {
             target.sessions.remove(session_id);
             target.network_enabled_sessions.remove(session_id);
+            target.fetch_patterns.remove(session_id);
         }
+        let _ = self.disable_fetch_for_session(&target_id, session_id);
         self.actions.retain(|_, action| {
             action.connection_id != connection_id || action.session_id.as_deref() != Some(session_id)
         });
@@ -1368,6 +1734,16 @@ impl PortableCdp {
 
     fn destroy_target(&mut self, target_id: &str) {
         let Some(target) = self.targets.remove(target_id) else { return; };
+        for request_id in target.paused_fetches.keys() {
+            if self.fetch_resolutions.len() >= MAX_FETCH_RESOLUTIONS {
+                break;
+            }
+            self.fetch_resolutions.push_back(json!({
+                "requestId": request_id,
+                "action": "fail",
+                "reason": "TargetClosed",
+            }));
+        }
         // A target close can arrive while its host operation is in flight.
         // Completing one of those actions must be rejected, not applied to a
         // subsequent page with a coincidentally similar identifier.
@@ -1430,6 +1806,60 @@ fn layout_metrics(target: &Target) -> Value {
         },
         "contentSize": {"x": 0, "y": 0, "width": width, "height": height},
     })
+}
+
+fn bounded_js_string(value: &str, maximum: usize, label: &str) -> Result<(), String> {
+    if value.len() > maximum {
+        return Err(format!("{label} exceeds the {maximum}-byte limit"));
+    }
+    Ok(())
+}
+
+fn parse_fetch_patterns(params: &Map<String, Value>) -> Result<Vec<String>, String> {
+    let Some(raw) = params.get("patterns") else {
+        return Ok(vec!["*".to_string()]);
+    };
+    let Some(patterns) = raw.as_array() else {
+        return Err("Fetch patterns must be an array".to_string());
+    };
+    if patterns.len() > MAX_FETCH_PATTERNS {
+        return Err(format!("Fetch patterns exceed the {MAX_FETCH_PATTERNS}-item limit"));
+    }
+    let mut parsed = Vec::with_capacity(patterns.len());
+    for pattern in patterns {
+        let Some(pattern) = pattern.as_object() else {
+            return Err("Fetch pattern must be an object".to_string());
+        };
+        let value = pattern.get("urlPattern").and_then(Value::as_str).unwrap_or("*");
+        bounded_js_string(value, MAX_FETCH_PATTERN_BYTES, "Fetch urlPattern")?;
+        parsed.push(value.to_string());
+    }
+    if parsed.is_empty() {
+        parsed.push("*".to_string());
+    }
+    Ok(parsed)
+}
+
+fn validate_fetch_header_array(value: &Value) -> Result<(), String> {
+    let Some(headers) = value.as_array() else {
+        return Err("Fetch headers must be an array".to_string());
+    };
+    if headers.len() > 256 {
+        return Err("Fetch headers exceed the 256-item limit".to_string());
+    }
+    for header in headers {
+        let Some(header) = header.as_object() else {
+            return Err("Fetch header must be an object".to_string());
+        };
+        let name = header.get("name").and_then(Value::as_str).unwrap_or("");
+        let value = header.get("value").and_then(Value::as_str).unwrap_or("");
+        if name.is_empty() {
+            return Err("Fetch header name is required".to_string());
+        }
+        bounded_js_string(name, 1024, "Fetch header name")?;
+        bounded_js_string(value, MAX_NAVIGATION_HEADERS_BYTES, "Fetch header value")?;
+    }
+    Ok(())
 }
 
 const MAX_CDP_COOKIE_COUNT: usize = 4096;
@@ -1920,6 +2350,60 @@ mod tests {
         let get_body = format!(r#"{{"id":3,"sessionId":"{session}","method":"Network.getResponseBody","params":{{"requestId":"fetch-1"}}}}"#);
         let response = json(&cdp.cdp_request(connection, &get_body).unwrap());
         assert_eq!(BASE64.decode(response["result"]["body"].as_str().unwrap()).unwrap(), b"fetch-body");
+    }
+
+    #[test]
+    fn portable_fetch_interception_pauses_and_drains_host_resolution() {
+        let mut cdp = PortableCdp::new("").unwrap();
+        let connection = cdp.open_connection().unwrap();
+        let attached = json(&cdp.cdp_request(
+            connection,
+            r#"{"id":1,"method":"Target.attachToTarget","params":{"targetId":"page-1","flatten":true}}"#,
+        ).unwrap());
+        let session = attached["result"]["sessionId"].as_str().unwrap().to_string();
+        cdp.poll_cdp_events(connection, 8).unwrap();
+        let enabled = json(&cdp.cdp_request(
+            connection,
+            &format!(r#"{{"id":2,"sessionId":"{session}","method":"Fetch.enable","params":{{"patterns":[{{"urlPattern":"https://example.test/api/*"}}]}}}}"#),
+        ).unwrap());
+        assert_eq!(enabled["result"], json!({}));
+
+        let paused = json(&cdp.intercept_fetch_request_json(
+            "page-1",
+            r#"{"requestId":"fetch-1","url":"https://example.test/api/data","method":"GET","headers":{"x-test":"yes"},"resourceType":"Fetch","frameId":"page-1"}"#,
+        ).unwrap());
+        assert_eq!(paused["paused"], true);
+        let events = json(&cdp.poll_cdp_events(connection, 8).unwrap());
+        assert_eq!(events[0]["method"], "Fetch.requestPaused");
+        assert_eq!(events[0]["params"]["requestId"], "fetch-1");
+        assert_eq!(events[0]["params"]["request"]["headers"]["x-test"], "yes");
+
+        let continued = json(&cdp.cdp_request(
+            connection,
+            &format!(r#"{{"id":3,"sessionId":"{session}","method":"Fetch.continueRequest","params":{{"requestId":"fetch-1","url":"https://example.test/api/rewritten","method":"POST","postData":"body","headers":[{{"name":"x-rewritten","value":"ok"}}]}}}}"#),
+        ).unwrap());
+        assert_eq!(continued["result"], json!({}));
+        let resolutions = json(&cdp.drain_fetch_resolutions_json().unwrap());
+        assert_eq!(resolutions[0]["action"], "continue");
+        assert_eq!(resolutions[0]["url"], "https://example.test/api/rewritten");
+        assert_eq!(resolutions[0]["method"], "POST");
+        assert_eq!(resolutions[0]["headers"][0]["name"], "x-rewritten");
+        assert_eq!(resolutions[0]["postData"], "body");
+
+        let paused_again = json(&cdp.intercept_fetch_request_json(
+            "page-1",
+            r#"{"requestId":"fetch-2","url":"https://example.test/api/again","method":"GET","headers":{},"resourceType":"Fetch","frameId":"page-1"}"#,
+        ).unwrap());
+        assert_eq!(paused_again["paused"], true);
+        let fulfilled = json(&cdp.cdp_request(
+            connection,
+            &format!(r#"{{"id":4,"sessionId":"{session}","method":"Fetch.fulfillRequest","params":{{"requestId":"fetch-2","responseCode":201,"responseHeaders":[{{"name":"content-type","value":"text/plain"}}],"body":"{}"}}}}"#, BASE64.encode(b"fulfilled")),
+        ).unwrap());
+        assert_eq!(fulfilled["result"], json!({}));
+        let resolutions = json(&cdp.drain_fetch_resolutions_json().unwrap());
+        assert_eq!(resolutions[0]["action"], "fulfill");
+        assert_eq!(resolutions[0]["status"], 201);
+        assert_eq!(BASE64.decode(resolutions[0]["bodyBase64"].as_str().unwrap()).unwrap(), b"fulfilled");
     }
 
     #[test]
