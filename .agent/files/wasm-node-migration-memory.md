@@ -1,7 +1,7 @@
 # Obscura Node and WebAssembly migration memory
 
 Latest verified implementation commit:
-`ea0f2ea` (`feat: intercept portable navigation resources`).
+`b674f79` (`feat: extend Fetch response interception to resources`).
 The prior checkpoint was `c78d6a5` (`feat: route portable navigation network state through WASM`).
 Earlier harness, portable rendering, resource discovery, PDF, and
 boundary-hardening milestones remain recorded below.
@@ -925,3 +925,30 @@ redirect interception policy, response-stage parser/resource interception,
 all Network/Fetch domains, full DOM mutation/event synchronization, complete
 Playwright compatibility, Deno package integration, and the unavailable
 companion obstacle course remain open.
+
+## Portable resource response-stage checkpoint (2026-08-17)
+
+Source commit: `b674f79` (`feat: extend Fetch response interception to resources`).
+
+Parser scripts, linked stylesheets, navigation documents, and render-resource
+loads now pass bounded response metadata and bytes through the same portable
+Fetch response-stage ABI used by page `fetch()`. A response-stage pause can be
+continued, fulfilled, or failed; `Fetch.getResponseBody` is available while a
+resource is paused. The host buffers only within the existing navigation,
+stylesheet, or render-resource caps and keeps response processing inside the
+Worker deadline/cancellation lifecycle.
+
+Verification:
+
+- Fresh real render-WASM package suite: **10 passed, 1 optional Playwright
+  skip, 0 failed**, including a stylesheet response-stage pause/body read and
+  a render screenshot after continuation.
+- Real Node WASM harness: **68 passed, 2 expected native-addon skips, 0
+  failed** on the same Worker implementation.
+- Node syntax and diff checks passed.
+
+This still is not complete browser parity. Cache validation/revalidation,
+redirect policy under interception, response-stage edge semantics for every
+resource type, broader CDP domains, mutation/event synchronization, full
+Playwright compatibility, Deno packaging, and the unavailable obstacle course
+remain open.
