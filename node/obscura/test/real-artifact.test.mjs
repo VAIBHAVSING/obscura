@@ -26,10 +26,17 @@ test("real WASM artifact is reachable through package CDP", { skip: !modulePath 
       response.end(PIXEL_PNG);
       return;
     }
+    if (request.url === "/style.css") {
+      response.setHeader("content-type", "text/css; charset=utf-8");
+      response.end(".render-target { background-image: url('/pixel.png'); }");
+      return;
+    }
     response.setHeader("content-type", "text/html; charset=utf-8");
     const script = request.url === "/headers" ? '<script src="/script.js"></script>' : "";
-    const image = request.url === "/render" ? '<img src="/pixel.png" width="1" height="1">' : "";
-    response.end(`<html><body><h1>${request.headers["x-portable"] ?? "missing"}</h1>${script}${image}</body></html>`);
+    const render = request.url === "/render"
+      ? '<link rel="stylesheet" href="/style.css"><div class="render-target"><img src="/pixel.png" width="1" height="1"></div>'
+      : "";
+    response.end(`<html><body><h1>${request.headers["x-portable"] ?? "missing"}</h1>${script}${render}</body></html>`);
   });
   await new Promise((resolve, reject) => {
     fixture.once("error", reject);
@@ -137,6 +144,26 @@ test("real WASM artifact is reachable through package CDP", { skip: !modulePath 
     const renderScreenshot = await client.command("Page.captureScreenshot", {}, sessionId);
     assert.deepEqual(Buffer.from(renderScreenshot.data, "base64").subarray(0, 8), Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]));
     const imageUrl = new URL("/pixel.png", renderUrl).href;
+    const stylesheetUrl = new URL("/style.css", renderUrl).href;
+    const stylesheetRequestEvent = networkEvents.find(
+      (event) => event.method === "Network.requestWillBeSent" && event.params.request.url === stylesheetUrl,
+    );
+    const renderDocumentIndex = networkEvents.findIndex(
+      (event) => event.method === "Network.requestWillBeSent" && event.params.request.url === renderUrl,
+    );
+    const stylesheetIndex = networkEvents.findIndex((event) => event === stylesheetRequestEvent);
+    assert.ok(renderDocumentIndex >= 0 && stylesheetIndex > renderDocumentIndex);
+    assert.ok(stylesheetRequestEvent?.params?.requestId);
+    assert.equal(stylesheetRequestEvent.params.type, "Stylesheet");
+    const stylesheetResponseBody = await client.command(
+      "Network.getResponseBody",
+      { requestId: stylesheetRequestEvent.params.requestId },
+      sessionId,
+    );
+    const stylesheetText = stylesheetResponseBody.base64Encoded
+      ? Buffer.from(stylesheetResponseBody.body, "base64").toString("utf8")
+      : stylesheetResponseBody.body;
+    assert.match(stylesheetText, /render-target/);
     const imageRequestEvent = networkEvents.find(
       (event) => event.method === "Network.requestWillBeSent" && event.params.request.url === imageUrl,
     );

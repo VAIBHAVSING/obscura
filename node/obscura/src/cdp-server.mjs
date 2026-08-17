@@ -267,6 +267,7 @@ class PageTarget {
     this.portableCdpConnections = new Map();
     this.networkFlushPromise = null;
     this.networkFlushTimer = null;
+    this.networkFlushPaused = false;
     this.nextRemoteId = 1;
     this.viewport = { width: 800, height: 600, deviceScaleFactor: 1 };
     this.closed = false;
@@ -311,7 +312,7 @@ class PageTarget {
   }
 
   async flushPortableNetworkEvents() {
-    if (this.closed || !this.worker || this.portableCdpConnections.size === 0) return;
+    if (this.closed || this.networkFlushPaused || !this.worker || this.portableCdpConnections.size === 0) return;
     if (this.networkFlushPromise) return this.networkFlushPromise;
     this.networkFlushPromise = (async () => {
       let recorded;
@@ -373,13 +374,19 @@ class PageTarget {
 
   async navigate(url, params = {}) {
     await this.start();
-    const result = await this.worker.navigate(url, {
-      executeScripts: params.executeScripts !== false,
-      maxRedirects: params.maxRedirects,
-      extraHTTPHeaders: params.extraHTTPHeaders,
-      requestTimeoutMs: params.requestTimeoutMs ?? this.server.requestTimeoutMs,
-      allowPrivateNetwork: params.allowPrivateNetwork === true,
-    });
+    this.networkFlushPaused = true;
+    let result;
+    try {
+      result = await this.worker.navigate(url, {
+        executeScripts: params.executeScripts !== false,
+        maxRedirects: params.maxRedirects,
+        extraHTTPHeaders: params.extraHTTPHeaders,
+        requestTimeoutMs: params.requestTimeoutMs ?? this.server.requestTimeoutMs,
+        allowPrivateNetwork: params.allowPrivateNetwork === true,
+      });
+    } finally {
+      this.networkFlushPaused = false;
+    }
     this.url = result.url || safeUrl(url);
     this.loaderId = result.loaderId ? String(result.loaderId) : `${this.id}-loader-${Date.now()}`;
     // A navigation replaces the realm. Install the page facade after the
@@ -967,7 +974,11 @@ export class ObscuraCdpServer {
     // A previous page fetch/XHR may have completed after its Runtime action
     // returned. Move those host records into the WASM CDP queue before this
     // command observes the event stream.
-    await target.flushPortableNetworkEvents();
+    // Navigation completion carries the document Network events into WASM.
+    // Hold background stylesheet/script records until after that completion so
+    // CDP observes Document before its parser subresources.
+    const deferNetworkFlush = method === "Page.navigate" || method === "Page.reload" || method === "Page.setDocumentContent";
+    if (!deferNetworkFlush) await target.flushPortableNetworkEvents();
     const response = routed.response;
     if (Array.isArray(response?.result?.cookies)) {
       response.result.cookies = response.result.cookies.map(cdpCookie);
@@ -1004,7 +1015,7 @@ export class ObscuraCdpServer {
     } catch (error) {
       hostResult = { error: { code: Number.isInteger(error?.code) ? error.code : -32603, message: error?.message ?? "Portable host action failed" } };
     }
-    await target.flushPortableNetworkEvents();
+    if (!deferNetworkFlush) await target.flushPortableNetworkEvents();
     let completion = hostResult;
     // Navigation metadata is private to the WASM CDP state. The host action
     // wraps Page.navigate's result, so lift it for completion and remove it
@@ -1035,6 +1046,7 @@ export class ObscuraCdpServer {
     if (completed?.error) {
       throw cdpError(completed.error.code ?? -32603, completed.error.message ?? "Portable CDP action failed", completed.error.data);
     }
+    await target.flushPortableNetworkEvents();
     // Completion may enqueue WASM-owned Network events (and response-body
     // state). Drain them before returning the command so ordering is
     // deterministic for CDP clients which await Page.navigate.

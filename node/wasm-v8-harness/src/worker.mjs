@@ -117,6 +117,9 @@ const MAX_NAVIGATION_REQUEST_TIMEOUT_MS = 120_000;
 const MAX_RENDER_RESOURCE_PREPARE_MS = 30_000;
 const MAX_RENDER_RESOURCE_REQUEST_TIMEOUT_MS = 120_000;
 const MAX_SCRIPT_SOURCE_BYTES = 16 * 1024 * 1024;
+const MAX_STYLESHEET_SOURCE_BYTES = 4 * 1024 * 1024;
+const MAX_STYLESHEET_RESOURCES = 128;
+const MAX_STYLESHEET_IMPORT_DEPTH = 4;
 const MAX_DOCUMENT_SCRIPTS = 512;
 const PLATFORM_OP_COMMAND_SET = new Set(BOOTSTRAP_PLATFORM_OP_COMMANDS);
 const PLATFORM_BYTE_FIELDS = Object.freeze({
@@ -2219,6 +2222,188 @@ async function fetchClassicScript(url, requestTimeoutMs, allowPrivateNetwork, { 
   }
 }
 
+function stylesheetElementRecords() {
+  const handles = JSON.parse(domOperation("query_selector_all", 'link[rel~="stylesheet"]', ""));
+  if (!Array.isArray(handles)) throw new TypeError("query_selector_all(stylesheets) returned a non-array");
+  if (handles.length > MAX_STYLESHEET_RESOURCES) {
+    throw new RangeError(`document contains more than ${MAX_STYLESHEET_RESOURCES} stylesheet links`);
+  }
+  const records = [];
+  for (let index = 0; index < handles.length; index += 1) {
+    const nid = requireUnsignedU32(handles[index], "stylesheet node handle");
+    const href = decodeWireString(domOperation("get_attribute", String(nid), "href"), "stylesheet href");
+    if (!href) continue;
+    records.push({
+      index,
+      nid,
+      href,
+      disabled: domOperation("get_attribute", String(nid), "disabled") !== "null",
+      media: decodeWireString(domOperation("get_attribute", String(nid), "media"), "stylesheet media") ?? "",
+    });
+  }
+  return records;
+}
+
+function rebaseStylesheetUrls(css, baseUrl) {
+  return css.replace(/url\(\s*(?:(['"])(.*?)\1|([^)'"\s]+))\s*\)/giu, (whole, quote, quoted, bare) => {
+    const value = quoted ?? bare ?? "";
+    if (!value || /^(?:[a-z][a-z0-9+.-]*:|\/\/|#)/iu.test(value)) return whole;
+    let resolved = value;
+    try { resolved = new URL(value, baseUrl).href; } catch {}
+    return `url(${quote ?? '"'}${resolved.replaceAll('\\', '\\\\').replaceAll('"', '\\"')}${quote ?? '"'})`;
+  });
+}
+
+function stripStylesheetImports(css, baseUrl) {
+  const imports = [];
+  const remainder = css.replace(
+    /@import\s+(?:url\(\s*)?(?:(['"])(.*?)\1|([^)'"\s;]+))\s*\)?\s*([^;]*);/giu,
+    (whole, quote, quoted, bare, media) => {
+      const target = quoted ?? bare ?? "";
+      if (!target) return whole;
+      try {
+        imports.push({ url: new URL(target, baseUrl).href, media: String(media ?? "").trim() });
+      } catch {}
+      return "";
+    },
+  );
+  return { imports, remainder };
+}
+
+async function fetchStylesheetCss(url, requestTimeoutMs, allowPrivateNetwork, seen = new Set(), depth = 0) {
+  if (depth > MAX_STYLESHEET_IMPORT_DEPTH || seen.has(url)) return "";
+  seen.add(url);
+  const targetUrl = validateNavigationUrl(url, allowPrivateNetwork);
+  const requestId = `stylesheet-${nextBootstrapNetworkRequestId++}`;
+  if (nextBootstrapNetworkRequestId > 0xffff_ffff) nextBootstrapNetworkRequestId = 1;
+  const loaderId = currentNavigationLoaderId();
+  const requestHeaders = {};
+  const cookie = cookieHeaderForUrl(targetUrl, "include");
+  if (cookie) requestHeaders.Cookie = cookie;
+  let response;
+  let responseHeaders = {};
+  let responseUrl = targetUrl.toString();
+  let recorded = false;
+  let timer;
+  const record = (status, body, bodySize = body?.byteLength ?? 0) => {
+    if (recorded) return;
+    queueBootstrapNetworkEvent({
+      generation: bridgeGeneration,
+      runtime: bootstrapRuntime,
+      ...networkRecord({
+        requestId,
+        loaderId,
+        url: responseUrl,
+        method: "GET",
+        requestHeaders,
+        status,
+        responseHeaders,
+        mimeType: responseHeaders["content-type"] ?? "text/css",
+        body,
+        bodySize,
+        resourceType: "Stylesheet",
+        initiatorType: "parser",
+      }),
+    });
+    recorded = true;
+  };
+  try {
+    let bytes;
+    if (targetUrl.protocol === "data:" || targetUrl.protocol === "about:") {
+      bytes = decodeInlineNavigation(url).bytes;
+      responseHeaders = { "content-type": "text/css; charset=UTF-8" };
+      responseUrl = url;
+      record(200, bytes, bytes.byteLength);
+    } else {
+      const controller = new AbortController();
+      timer = setTimeout(() => controller.abort(new Error("stylesheet fetch timed out")), requestTimeoutMs);
+      timer.unref?.();
+      const referrer = documentUrlForCookies();
+      const options = { headers: requestHeaders, redirect: "follow", signal: controller.signal };
+      if (/^https?:/iu.test(referrer)) options.referrer = referrer;
+      response = await fetch(targetUrl, options);
+      responseUrl = response.url || targetUrl.toString();
+      storeResponseCookies(responseUrl, response);
+      ({ headers: responseHeaders } = responseHeadersObject(response));
+      if (!response.ok) {
+        record(response.status, undefined, 0);
+        try { await response.body?.cancel(); } catch {}
+        throw new Error(`stylesheet fetch returned HTTP ${response.status}`);
+      }
+      bytes = await readBoundedResponseBytes(response, MAX_STYLESHEET_SOURCE_BYTES);
+      record(response.status, bytes, bytes.byteLength);
+    }
+    const css = new TextDecoder("utf-8", { fatal: false }).decode(bytes);
+    requireBoundedString(css, MAX_STYLESHEET_SOURCE_BYTES, "stylesheet source");
+    const { imports, remainder } = stripStylesheetImports(css, responseUrl);
+    const imported = [];
+    for (const entry of imports) {
+      const source = await fetchStylesheetCss(
+        entry.url,
+        requestTimeoutMs,
+        allowPrivateNetwork,
+        new Set(seen),
+        depth + 1,
+      );
+      if (!source) continue;
+      imported.push(entry.media ? `@media ${entry.media}{${source}}` : source);
+    }
+    return [...imported, rebaseStylesheetUrls(remainder, responseUrl)].filter(Boolean).join("\n");
+  } catch (error) {
+    if (!recorded) record(response?.status ?? 0, undefined, 0);
+    throw error;
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+async function materializeLinkedStylesheet(index, href, css, media) {
+  const source = `(function(index, href, css, media) {
+    var links = document.querySelectorAll('link[rel~="stylesheet"]');
+    var link = links[index];
+    if (!link || !link.parentNode) return false;
+    var style = document.createElement('style');
+    style.setAttribute('data-obscura-external-stylesheets', '');
+    style.setAttribute('data-obscura-linked', href);
+    if (media) style.setAttribute('media', media);
+    style.textContent = css;
+    if (typeof globalThis.__obscura_registerLinkedStylesheet === 'function') {
+      globalThis.__obscura_registerLinkedStylesheet(link, style, href);
+    }
+    link.parentNode.insertBefore(style, link.nextSibling);
+    try { link.dispatchEvent(new Event('load')); } catch (_) {}
+    return true;
+  })(${index}, ${JSON.stringify(href)}, ${JSON.stringify(css)}, ${JSON.stringify(media || "")})`;
+  return hostEvaluate(source, 1_000);
+}
+
+async function loadDocumentStylesheets({ requestTimeoutMs, allowPrivateNetwork }) {
+  const base = decodeWireString(domOperation("document_url", "", ""), "document URL") ?? "about:blank";
+  const records = stylesheetElementRecords();
+  if (records.length === 0) return { loaded: [], failed: [] };
+  await installBootstrapRealm();
+  const loaded = [];
+  const failed = [];
+  const deadline = performance.now() + Math.min(requestTimeoutMs, MAX_RENDER_RESOURCE_PREPARE_MS);
+  for (const record of records) {
+    if (record.disabled || performance.now() >= deadline) continue;
+    try {
+      const fullUrl = new URL(record.href, base).href;
+      const css = await fetchStylesheetCss(
+        fullUrl,
+        Math.max(1, Math.ceil(deadline - performance.now())),
+        allowPrivateNetwork,
+      );
+      requireBoundedString(css, MAX_STYLESHEET_SOURCE_BYTES, "materialized stylesheet source");
+      await materializeLinkedStylesheet(record.index, fullUrl, css, record.media);
+      loaded.push({ nid: record.nid, url: fullUrl });
+    } catch (error) {
+      failed.push({ nid: record.nid, url: record.href, error: serializeError(error) });
+    }
+  }
+  return { loaded, failed };
+}
+
 function importMapTable(value, baseUrl, label) {
   if (value === null || typeof value !== "object" || Array.isArray(value)) {
     throw new TypeError(`${label} must be an object`);
@@ -2588,10 +2773,11 @@ async function navigatePortable({ url, options = {}, allowPrivateNetwork = false
           bodySize: inline.bytes.byteLength,
         }));
         resetBridgeRealmAfterNavigation();
+        const stylesheets = await loadDocumentStylesheets({ requestTimeoutMs, allowPrivateNetwork });
         const scripts = options.executeScripts === false
           ? null
           : await executeDocumentScripts({ requestTimeoutMs, allowPrivateNetwork });
-        return { ...commit, navigation: JSON.parse(syncCall(api.navigationStatus)), scripts, __obscuraNetwork: networkEvents };
+        return { ...commit, navigation: JSON.parse(syncCall(api.navigationStatus)), stylesheets, scripts, __obscuraNetwork: networkEvents };
       }
       const targetUrl = validateNavigationUrl(action.url, allowPrivateNetwork);
       const navigationHeaders = { ...extraHTTPHeaders };
@@ -2634,10 +2820,11 @@ async function navigatePortable({ url, options = {}, allowPrivateNetwork = false
       const commit = JSON.parse(syncCall(api.navigationResponseEnd, navigationId, targetUrl.toString(), responseEncoding(headers)));
       networkEvents.push({ ...responseRecord, bodySize: captured.total, ...(captured.bytes.byteLength <= MAX_NETWORK_RESPONSE_BODY_BYTES ? { bodyBase64: Buffer.from(captured.bytes).toString("base64") } : {}) });
       resetBridgeRealmAfterNavigation();
+      const stylesheets = await loadDocumentStylesheets({ requestTimeoutMs, allowPrivateNetwork });
       const scripts = options.executeScripts === false
         ? null
         : await executeDocumentScripts({ requestTimeoutMs, allowPrivateNetwork });
-      return { ...commit, navigation: JSON.parse(syncCall(api.navigationStatus)), scripts, __obscuraNetwork: networkEvents };
+      return { ...commit, navigation: JSON.parse(syncCall(api.navigationStatus)), stylesheets, scripts, __obscuraNetwork: networkEvents };
     }
   } catch (error) {
     try { if (api.cancelNavigation) syncCall(api.cancelNavigation, Number(action.navigationId)); } catch {}
