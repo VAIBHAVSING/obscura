@@ -164,6 +164,14 @@ test("real WASM artifact is reachable through package CDP", { skip: !modulePath 
       ? Buffer.from(stylesheetResponseBody.body, "base64").toString("utf8")
       : stylesheetResponseBody.body;
     assert.match(stylesheetText, /render-target/);
+    const stylesheetState = await client.command("Runtime.evaluate", {
+      expression: "(() => { const link = document.querySelector('link[rel~=stylesheet]'); const sheet = link?.sheet; return { sheets: document.styleSheets.length, linkSheet: !!sheet, rules: sheet?.cssRules?.length ?? 0, cssText: sheet?.cssRules?.[0]?.cssText ?? '' }; })()",
+      returnByValue: true,
+    }, sessionId);
+    assert.equal(stylesheetState.result.value.linkSheet, true);
+    assert.equal(stylesheetState.result.value.sheets, 1);
+    assert.ok(stylesheetState.result.value.rules >= 1);
+    assert.match(stylesheetState.result.value.cssText, /render-target/);
     const imageRequestEvent = networkEvents.find(
       (event) => event.method === "Network.requestWillBeSent" && event.params.request.url === imageUrl,
     );

@@ -2363,12 +2363,26 @@ async function materializeLinkedStylesheet(index, href, css, media) {
     var link = links[index];
     if (!link || !link.parentNode) return false;
     var style = document.createElement('style');
-    style.setAttribute('data-obscura-external-stylesheets', '');
-    style.setAttribute('data-obscura-linked', href);
     if (media) style.setAttribute('media', media);
     style.textContent = css;
-    if (typeof globalThis.__obscura_registerLinkedStylesheet === 'function') {
-      globalThis.__obscura_registerLinkedStylesheet(link, style, href);
+    // The bootstrap's private link registry is intentionally not exposed to
+    // page code. Build an origin-clean sheet in the page realm and shadow the
+    // readonly link.sheet accessor for this fetched link. The style element
+    // remains the renderer input and is deliberately not marked as an
+    // internal CSSOM bridge, so document.styleSheets exposes one live sheet.
+    try {
+      if (typeof CSSStyleSheet === 'function') {
+        var sheet = new CSSStyleSheet();
+        if (typeof sheet.replaceSync === 'function') sheet.replaceSync(css);
+        Object.defineProperty(link, 'sheet', {
+          configurable: true,
+          enumerable: false,
+          value: sheet,
+        });
+      }
+    } catch (_) {}
+    if (media) {
+      try { style.media = media; } catch (_) {}
     }
     link.parentNode.insertBefore(style, link.nextSibling);
     try { link.dispatchEvent(new Event('load')); } catch (_) {}
