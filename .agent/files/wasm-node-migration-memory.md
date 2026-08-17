@@ -739,3 +739,30 @@ interception/cache/redirect credential policy, broad CDP domain parity, and
 complete DOM mutation/event synchronization remain. The companion
 `obscura-benchmark` repository is absent, so the required 33/33 obstacle course
 is unavailable and is not counted as passed.
+
+## Portable page-fetch network checkpoint (2026-08-17)
+
+Source commit: `1304eb6` (`feat: route page fetch events through portable wasm cdp`).
+
+The page-realm `fetch()` host adapter now assigns bounded request and loader IDs,
+records Fetch events and response bodies in the Rust/WASM CDP queue, and emits
+them through the package's external CDP session. `Network.getResponseBody` is
+available for completed page fetches, including asynchronous work that finishes
+after the original `Runtime.evaluate` action returns. Queue size and retained
+metadata are bounded, and navigation/release generation changes discard stale
+records.
+
+Verification after this checkpoint:
+
+- `obscura-wasm` release nextest: **64/64 passed**.
+- Full release render nextest: **1,492/1,492 passed, 4 configured skips**.
+- Exact release CLI build with render: passed.
+- Node WASM harness: **62 passed, 8 expected skips, 0 failed**.
+- Real `@obscura/browser` package suite: **6 passed, 1 optional Playwright skip,
+  0 failed**, including asynchronous page-fetch Network events and response-body
+  retrieval.
+
+The remaining browser-parity work is still broader than this slice: page script
+and subresource events, complete interception/cache/redirect policy, broader CDP
+domains, DOM mutation/event synchronization, and the unavailable companion
+obstacle course remain open.
