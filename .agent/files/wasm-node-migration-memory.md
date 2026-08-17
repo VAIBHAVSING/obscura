@@ -1,7 +1,7 @@
 # Obscura Node and WebAssembly migration memory
 
 Latest verified implementation commit:
-`4c6d842` (`feat: move fetch interception into portable wasm cdp`).
+`40552d8` (`feat: support response-stage portable fetch interception`).
 The prior checkpoint was `c78d6a5` (`feat: route portable navigation network state through WASM`).
 Earlier harness, portable rendering, resource discovery, PDF, and
 boundary-hardening milestones remain recorded below.
@@ -855,3 +855,39 @@ This is a Fetch interception milestone, not full browser parity. Static
 navigation/resource interception, cache policy, redirects, response-stage
 interception, and the companion obstacle course remain open. The full
 workspace nextest gate must be rerun in an environment with cargo-nextest.
+
+## Portable Fetch response-stage checkpoint (2026-08-17)
+
+Source commit: `40552d8` (`feat: support response-stage portable fetch interception`).
+
+Fetch patterns now carry an explicit `requestStage` (`Request` or `Response`).
+The portable Rust CDP core matches the stage, includes response status and
+headers in response-stage pause events, and stores a bounded response body for
+`Fetch.getResponseBody`. The Node host buffers only within the existing
+navigation response cap, then applies continue, fulfill, or fail resolutions
+inside the same page-fetch lifecycle. The page realm receives only the
+data-only response envelope.
+
+Verification after this checkpoint:
+
+- Rust focused release fallback: **2/2 portable Fetch CDP tests passed**.
+  `cargo-nextest` is unavailable in this environment, so the equivalent
+  `cargo test --release --features render -p obscura-wasm cdp::tests::portable_fetch`
+  command was used and must not be reported as nextest.
+- Fresh render-enabled wasm32 release build passed.
+- Real `@obscura/browser` package suite: **10 passed, 1 optional Playwright
+  skip, 0 failed**. It covers response-stage pause, status/headers,
+  `Fetch.getResponseBody`, synthetic fulfillment, and page reuse.
+- Real Node WASM harness: **68 passed, 2 expected native-addon skips, 0
+  failed**.
+- Exact release CLI render build passed as a repository regression gate; the
+  native binary is not included in or required by the npm package.
+
+Remaining limitations are unchanged for static parser/resource interception:
+`Page.navigate` still executes its host fetch/resource pipeline as one bounded
+operation, so a Fetch pause cannot yet safely suspend parser scripts,
+stylesheets, navigation, or render-resource loads for an external CDP command.
+Those paths need an action/re-entry protocol before they can share the same
+interceptor without deadlocking the Worker request queue. Cache and redirect
+policy, broader CDP domains, full Playwright parity, Deno package integration,
+and the unavailable companion obstacle course remain open.
