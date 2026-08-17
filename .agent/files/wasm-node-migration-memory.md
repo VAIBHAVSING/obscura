@@ -788,3 +788,34 @@ Verification:
 - Real `@obscura/browser` package suite: **6 passed, 1 optional Playwright skip,
   0 failed**, including a real external script event and
   `Network.getResponseBody` assertion.
+
+## Portable render-resource checkpoint (2026-08-17)
+
+Source commit: `461ce77` (`feat: fetch render resources through portable wasm`).
+
+The package now drives the existing WASM `renderResourceRequests` ABI before
+`Page.captureScreenshot` and `Page.printToPDF`. The Worker validates every
+image/font URL through the portable SSRF policy, sends the WASM cookie header,
+follows bounded HTTP redirects, caps resource bytes at 16 MiB, records bounded
+`Network` metadata/body events, seeds successful bytes into the WASM render
+cache, and negative-seeds failed resources so a broken asset cannot abort a
+capture. Preparation has a 5-second default deadline, is skipped for older
+partial render cores, and runs entirely inside the Node/WASM package. The
+package test covers a real HTTP PNG request, `type: "Image"`, response-body
+retrieval, and a valid screenshot.
+
+Verification after this checkpoint:
+
+- Full release render nextest: **1,492/1,492 passed, 4 configured skips**,
+  run `759a4938-7a4d-4a83-b0eb-df69b6cb5064`.
+- Exact release CLI build with render: passed. The CLI remains a regression
+  gate only and is not a runtime dependency of the npm package.
+- Node WASM harness: **62 passed, 8 expected skips, 0 failed**.
+- Real `@obscura/browser` package suite against the render-capable artifact:
+  **6 passed, 1 optional Playwright skip, 0 failed**.
+
+Remaining browser-parity work includes external stylesheet materialization and
+stylesheet/import network events, complete interception/cache/redirect policy,
+broader CDP domains, full DOM mutation/event synchronization, npm release
+packaging, and the unavailable companion obstacle course. This checkpoint does
+not claim a complete browser migration.
