@@ -697,6 +697,10 @@ export class WasmV8Worker {
     return this.request("portableCdp", { operation: "openStream", connectionId, data }, options.requestTimeoutMs);
   }
 
+  portableCdpRecordNetwork(options = {}) {
+    return this.request("portableCdp", { operation: "recordNetwork" }, options.requestTimeoutMs);
+  }
+
   allCookies(options = {}) {
     return this.request("allCookies", undefined, options.requestTimeoutMs);
   }

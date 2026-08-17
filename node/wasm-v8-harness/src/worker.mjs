@@ -426,6 +426,11 @@ let portableCdpCore = null;
 let bootstrapRuntime;
 let nextBootstrapFetchId = 1;
 const bootstrapFetches = new Map();
+const MAX_BOOTSTRAP_NETWORK_EVENTS = 512;
+const MAX_BOOTSTRAP_NETWORK_BYTES = 12 * 1024 * 1024;
+let nextBootstrapNetworkRequestId = 1;
+const bootstrapNetworkEvents = [];
+let bootstrapNetworkEventBytes = 0;
 let activeAllowPrivateNetwork = false;
 const MAX_MODULES_PER_DOCUMENT = 256;
 const MAX_IMPORT_MAP_ENTRIES = 1_024;
@@ -1267,6 +1272,17 @@ function portableCdpOperation(payload = {}) {
     requireBoundedString(payload.data, MAX_PLATFORM_RESPONSE_BYTES, "CDP stream data");
     return core.openStream(connectionId, payload.data);
   }
+  if (operation === "recordNetwork") {
+    const recorder = member(core, ["recordNetworkMetadata", "record_network_metadata"]);
+    if (!recorder) return { recorded: false, available: false, count: 0 };
+    if (bootstrapNetworkEvents.length === 0) return { recorded: true, available: true, count: 0 };
+    const metadata = JSON.stringify(bootstrapNetworkEvents);
+    recorder.fn("page-1", metadata);
+    const count = bootstrapNetworkEvents.length;
+    bootstrapNetworkEvents.length = 0;
+    bootstrapNetworkEventBytes = 0;
+    return { recorded: true, available: true, count };
+  }
   if (operation === "request") {
     const connectionId = requireUnsignedU32(payload.connectionId, "CDP connection ID");
     requireBoundedString(payload.message, MAX_PLATFORM_REQUEST_BYTES, "CDP message");
@@ -1602,6 +1618,8 @@ async function disposeBridgeCore() {
   bridgeCore = null;
   portableCdpCore = null;
   cancelBootstrapFetches();
+  bootstrapNetworkEvents.length = 0;
+  bootstrapNetworkEventBytes = 0;
   bootstrapRuntime = null;
   moduleRecords = new Map();
   moduleImportMap = { imports: Object.create(null), scopes: Object.create(null) };
@@ -1717,6 +1735,8 @@ async function replaceBridgeCore(html, documentMetadata) {
 
 function resetBridgeRealmAfterNavigation() {
   cancelBootstrapFetches();
+  bootstrapNetworkEvents.length = 0;
+  bootstrapNetworkEventBytes = 0;
   bootstrapRuntime = null;
   moduleRecords = new Map();
   moduleImportMap = { imports: Object.create(null), scopes: Object.create(null) };
@@ -1840,7 +1860,7 @@ async function readNavigationBody(response, api, navigationId, signal) {
   return { bytes, total };
 }
 
-function networkRecord({ requestId, loaderId, url, method, requestHeaders, status, responseHeaders, mimeType, body, bodySize, redirect = false }) {
+function networkRecord({ requestId, loaderId, url, method, requestHeaders, status, responseHeaders, mimeType, body, bodySize, redirect = false, resourceType = "Document", initiatorType = "other" }) {
   const record = {
     requestId: String(requestId),
     loaderId: String(loaderId),
@@ -1853,13 +1873,40 @@ function networkRecord({ requestId, loaderId, url, method, requestHeaders, statu
     bodySize: Number.isSafeInteger(bodySize) && bodySize >= 0 ? bodySize : 0,
     timestamp: Date.now() / 1000,
     wallTime: Date.now() / 1000,
-    resourceType: "Document",
-    initiatorType: "other",
+    resourceType: typeof resourceType === "string" && resourceType.length > 0 ? resourceType : "Document",
+    initiatorType: typeof initiatorType === "string" && initiatorType.length > 0 ? initiatorType : "other",
   };
   if (!redirect && body && body.byteLength <= MAX_NETWORK_RESPONSE_BODY_BYTES) {
     record.bodyBase64 = Buffer.from(body).toString("base64");
   }
   return record;
+}
+
+function currentNavigationLoaderId() {
+  try {
+    const api = bridgeApi();
+    if (api.navigationStatus) {
+      const state = JSON.parse(syncCall(api.navigationStatus));
+      if (typeof state?.loaderId === "string" && state.loaderId.length > 0) return state.loaderId;
+    }
+  } catch {}
+  return `loader-${bridgeDocumentHandle ?? "unknown"}`;
+}
+
+function queueBootstrapNetworkEvent(event) {
+  if (event === null || typeof event !== "object" || event.generation !== bridgeGeneration ||
+      event.runtime !== bootstrapRuntime) return;
+  const { generation, runtime, ...record } = event;
+  const recordBytes = Buffer.byteLength(JSON.stringify(record), "utf8");
+  if (recordBytes > MAX_BOOTSTRAP_NETWORK_BYTES) return;
+  while (bootstrapNetworkEvents.length >= MAX_BOOTSTRAP_NETWORK_EVENTS ||
+         bootstrapNetworkEventBytes + recordBytes > MAX_BOOTSTRAP_NETWORK_BYTES) {
+    const removed = bootstrapNetworkEvents.shift();
+    if (!removed) break;
+    bootstrapNetworkEventBytes -= Buffer.byteLength(JSON.stringify(removed), "utf8");
+  }
+  bootstrapNetworkEvents.push(record);
+  bootstrapNetworkEventBytes += recordBytes;
 }
 
 function decodeWireString(value, label) {
@@ -1943,6 +1990,9 @@ function startBootstrapFetch(url, method, headersJson, body, pageOrigin, mode, c
   const record = { controller, runtime: bootstrapRuntime, generation: bridgeGeneration };
   bootstrapFetches.set(id, record);
   void (async () => {
+    const requestId = `fetch-${nextBootstrapNetworkRequestId++}`;
+    if (nextBootstrapNetworkRequestId > 0xffff_ffff) nextBootstrapNetworkRequestId = 1;
+    const loaderId = currentNavigationLoaderId();
     try {
       const requestHeaders = { ...headers };
       const requestOrigin = (() => {
@@ -1974,17 +2024,69 @@ function startBootstrapFetch(url, method, headersJson, body, pageOrigin, mode, c
         const allowedCredentials = responseHeaders["access-control-allow-credentials"]?.toLowerCase() === "true";
         if ((allowedOrigin !== "*" && allowedOrigin !== pageOrigin) ||
             (credentials === "include" && !allowedCredentials)) {
+          queueBootstrapNetworkEvent({
+            generation: record.generation,
+            runtime: record.runtime,
+            ...networkRecord({
+              requestId,
+              loaderId,
+              url: response.url || targetUrl.toString(),
+              method,
+              requestHeaders,
+              status: response.status,
+              responseHeaders,
+              mimeType: responseHeaders["content-type"] ?? "",
+              bodySize: 0,
+              resourceType: "Fetch",
+              initiatorType: "script",
+            }),
+          });
           try { await response.body?.cancel(); } catch {}
           bootstrapFetchResolution(id, { ok: true, value: JSON.stringify({ corsBlocked: true, corsError: "CORS policy blocked the response" }) });
           return;
         }
       }
       if (mode === "no-cors" && !sameOrigin) {
+        queueBootstrapNetworkEvent({
+          generation: record.generation,
+          runtime: record.runtime,
+          ...networkRecord({
+            requestId,
+            loaderId,
+            url: response.url || targetUrl.toString(),
+            method,
+            requestHeaders,
+            status: response.status,
+            responseHeaders: {},
+            mimeType: "",
+            bodySize: 0,
+            resourceType: "Fetch",
+            initiatorType: "script",
+          }),
+        });
         try { await response.body?.cancel(); } catch {}
         bootstrapFetchResolution(id, { ok: true, value: JSON.stringify({ blocked: false, corsBlocked: false, status: 0, headers: {}, body: "", url: "", redirected: false }) });
         return;
       }
       const bytes = await readBoundedResponseBytes(response, MAX_NAVIGATION_RESPONSE_BYTES);
+      queueBootstrapNetworkEvent({
+        generation: record.generation,
+        runtime: record.runtime,
+        ...networkRecord({
+          requestId,
+          loaderId,
+          url: response.url || targetUrl.toString(),
+          method,
+          requestHeaders,
+          status: response.status,
+          responseHeaders,
+          mimeType: responseHeaders["content-type"] ?? "",
+          body: bytes,
+          bodySize: bytes.byteLength,
+          resourceType: "Fetch",
+          initiatorType: "script",
+        }),
+      });
       bootstrapFetchResolution(id, {
         ok: true,
         value: JSON.stringify({
@@ -1999,6 +2101,23 @@ function startBootstrapFetch(url, method, headersJson, body, pageOrigin, mode, c
         }),
       });
     } catch (error) {
+      queueBootstrapNetworkEvent({
+        generation: record.generation,
+        runtime: record.runtime,
+        ...networkRecord({
+          requestId,
+          loaderId,
+          url: targetUrl.toString(),
+          method,
+          requestHeaders: headers,
+          status: 0,
+          responseHeaders: {},
+          mimeType: "",
+          bodySize: 0,
+          resourceType: "Fetch",
+          initiatorType: "script",
+        }),
+      });
       bootstrapFetchResolution(id, {
         ok: false,
         error: { name: "TypeError", message: error?.name === "AbortError" ? "The fetch was aborted" : "Failed to fetch" },

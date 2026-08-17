@@ -265,6 +265,8 @@ class PageTarget {
     this.sessions = new Set();
     this.remoteObjects = new Map();
     this.portableCdpConnections = new Map();
+    this.networkFlushPromise = null;
+    this.networkFlushTimer = null;
     this.nextRemoteId = 1;
     this.viewport = { width: 800, height: 600, deviceScaleFactor: 1 };
     this.closed = false;
@@ -284,11 +286,19 @@ class PageTarget {
         timeoutMs: 1_000,
       });
     }
+    this.networkFlushTimer = setInterval(() => {
+      void this.flushPortableNetworkEvents();
+    }, 25);
+    this.networkFlushTimer.unref?.();
   }
 
   async close() {
     if (this.closed) return;
     this.closed = true;
+    if (this.networkFlushTimer) {
+      clearInterval(this.networkFlushTimer);
+      this.networkFlushTimer = null;
+    }
     for (const session of this.sessions) session.target = null;
     this.sessions.clear();
     this.remoteObjects.clear();
@@ -298,6 +308,41 @@ class PageTarget {
     this.portableCdpConnections.clear();
     if (this.worker) await this.worker.close();
     this.worker = null;
+  }
+
+  async flushPortableNetworkEvents() {
+    if (this.closed || !this.worker || this.portableCdpConnections.size === 0) return;
+    if (this.networkFlushPromise) return this.networkFlushPromise;
+    this.networkFlushPromise = (async () => {
+      let recorded;
+      try {
+        recorded = await this.worker.portableCdpRecordNetwork({ requestTimeoutMs: this.server.requestTimeoutMs });
+      } catch {
+        return;
+      }
+      if (!recorded?.recorded || !recorded.count) return;
+      for (const connection of this.sessions) {
+        const core = this.portableCdpConnections.get(connection.id);
+        if (!core || connection.closed) continue;
+        let events;
+        try {
+          events = await this.worker.portableCdpPoll(core.connectionId, 512, { requestTimeoutMs: this.server.requestTimeoutMs });
+        } catch {
+          continue;
+        }
+        if (!Array.isArray(events)) continue;
+        for (const event of events) {
+          if (typeof event?.method !== "string") continue;
+          const sessionId = core.externalSessionId ?? core.sessionId;
+          if (typeof event.sessionId === "string") event.sessionId = sessionId;
+          rewritePortableTargetIds(event, "page-1", this.frameId);
+          connection.event(event.method, event.params ?? {}, sessionId);
+        }
+      }
+    })().finally(() => {
+      this.networkFlushPromise = null;
+    });
+    return this.networkFlushPromise;
   }
 
   storeRemote(value) {
@@ -433,7 +478,11 @@ class PageTarget {
           await this.worker.portableCdpClose(coreConnectionId, { requestTimeoutMs: this.server.requestTimeoutMs });
           return null;
         }
-        record = { connectionId: coreConnectionId, sessionId: attached.result.sessionId };
+        record = {
+          connectionId: coreConnectionId,
+          sessionId: attached.result.sessionId,
+          externalSessionId: command.sessionId,
+        };
         this.portableCdpConnections.set(connectionId, record);
         try { await this.worker.portableCdpPoll(coreConnectionId, 512, { requestTimeoutMs: this.server.requestTimeoutMs }); } catch {}
       } catch {
@@ -893,6 +942,10 @@ export class ObscuraCdpServer {
     }
     const routed = await target.portableCdpCommand(connection.id, command);
     if (!routed) return undefined;
+    // A previous page fetch/XHR may have completed after its Runtime action
+    // returned. Move those host records into the WASM CDP queue before this
+    // command observes the event stream.
+    await target.flushPortableNetworkEvents();
     const response = routed.response;
     if (Array.isArray(response?.result?.cookies)) {
       response.result.cookies = response.result.cookies.map(cdpCookie);
@@ -929,6 +982,7 @@ export class ObscuraCdpServer {
     } catch (error) {
       hostResult = { error: { code: Number.isInteger(error?.code) ? error.code : -32603, message: error?.message ?? "Portable host action failed" } };
     }
+    await target.flushPortableNetworkEvents();
     let completion = hostResult;
     // Navigation metadata is private to the WASM CDP state. The host action
     // wraps Page.navigate's result, so lift it for completion and remove it

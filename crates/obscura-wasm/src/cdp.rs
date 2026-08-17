@@ -430,6 +430,24 @@ impl PortableCdp {
             .map_err(|error| js_error(&format!("CDP response serialization failed: {error}")))?)
     }
 
+    /// Record host-owned network activity which completed after the original
+    /// CDP action returned. Page `fetch()`/XHR work is asynchronous, so it
+    /// cannot always be attached to a pending action. Keeping this ingress in
+    /// the portable core preserves the same event routing and response-body
+    /// ownership as navigation actions.
+    #[wasm_bindgen(js_name = recordNetworkMetadata)]
+    pub fn record_network_metadata_json(
+        &mut self,
+        target_id: &str,
+        metadata_json: &str,
+    ) -> Result<(), JsValue> {
+        bounded(target_id, MAX_METHOD_BYTES, "CDP target ID")?;
+        bounded(metadata_json, MAX_ACTION_RESULT_BYTES, "CDP network metadata")?;
+        let metadata: Value = serde_json::from_str(metadata_json)
+            .map_err(|error| js_error(&format!("invalid CDP network metadata: {error}")))?;
+        self.record_network_metadata(target_id, &metadata)
+    }
+
     /// Return and remove up to `max_items` queued events for a connection.
     #[wasm_bindgen(js_name = pollCdpEvents)]
     pub fn poll_cdp_events(&mut self, connection_id: u32, max_items: u32) -> Result<String, JsValue> {
@@ -1878,6 +1896,30 @@ mod tests {
         let disable = format!(r#"{{"id":5,"sessionId":"{session}","method":"Network.disable"}}"#);
         assert_eq!(json(&cdp.cdp_request(connection, &disable).unwrap())["result"], json!({}));
         assert_eq!(json(&cdp.cdp_request(connection, &get_body).unwrap())["error"]["code"], -32000);
+    }
+
+    #[test]
+    fn asynchronous_network_metadata_enters_the_same_wasm_event_queue() {
+        let mut cdp = PortableCdp::new("").unwrap();
+        let connection = cdp.open_connection().unwrap();
+        let attached = json(&cdp.cdp_request(
+            connection,
+            r#"{"id":1,"method":"Target.attachToTarget","params":{"targetId":"page-1","flatten":true}}"#,
+        ).unwrap());
+        let session = attached["result"]["sessionId"].as_str().unwrap().to_string();
+        cdp.poll_cdp_events(connection, 8).unwrap();
+        let enable = format!(r#"{{"id":2,"sessionId":"{session}","method":"Network.enable"}}"#);
+        assert_eq!(json(&cdp.cdp_request(connection, &enable).unwrap())["result"], json!({}));
+        let body = BASE64.encode(b"fetch-body");
+        cdp.record_network_metadata_json(
+            "page-1",
+            &format!(r#"[{{"requestId":"fetch-1","loaderId":"loader-1","url":"https://example.test/api","method":"GET","requestHeaders":{{}},"status":200,"responseHeaders":{{"content-type":"text/plain"}},"mimeType":"text/plain","bodyBase64":"{body}","bodySize":10,"timestamp":2.0,"wallTime":2.0,"resourceType":"Fetch","initiatorType":"script"}}]"#),
+        ).unwrap();
+        let events = json(&cdp.poll_cdp_events(connection, 8).unwrap());
+        assert_eq!(events.as_array().unwrap().iter().filter(|event| event["method"] == "Network.requestWillBeSent").count(), 1);
+        let get_body = format!(r#"{{"id":3,"sessionId":"{session}","method":"Network.getResponseBody","params":{{"requestId":"fetch-1"}}}}"#);
+        let response = json(&cdp.cdp_request(connection, &get_body).unwrap());
+        assert_eq!(BASE64.decode(response["result"]["body"].as_str().unwrap()).unwrap(), b"fetch-body");
     }
 
     #[test]

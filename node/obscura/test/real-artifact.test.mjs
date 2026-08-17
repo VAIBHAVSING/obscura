@@ -7,6 +7,11 @@ const modulePath = process.env.OBSCURA_REAL_WASM_MODULE;
 
 test("real WASM artifact is reachable through package CDP", { skip: !modulePath }, async () => {
   const fixture = createHttpServer((request, response) => {
+    if (request.url === "/api") {
+      response.setHeader("content-type", "text/plain; charset=utf-8");
+      response.end("fetch-body");
+      return;
+    }
     response.setHeader("content-type", "text/html; charset=utf-8");
     response.end(`<html><body><h1>${request.headers["x-portable"] ?? "missing"}</h1></body></html>`);
   });
@@ -75,6 +80,28 @@ test("real WASM artifact is reachable through package CDP", { skip: !modulePath 
     const responseBody = await client.command("Network.getResponseBody", { requestId: requestEvent.params.requestId }, sessionId);
     const responseText = responseBody.base64Encoded ? Buffer.from(responseBody.body, "base64").toString("utf8") : responseBody.body;
     assert.match(responseText, /<h1>wasm<\/h1>/);
+    const apiUrl = new URL("/api", fixtureUrl).href;
+    await client.command("Runtime.evaluate", {
+      expression: "globalThis.__fetchValue = null; fetch('/api').then((response) => response.text()).then((value) => { globalThis.__fetchValue = value; }); undefined",
+    }, sessionId);
+    let fetchValue;
+    for (let attempt = 0; attempt < 100; attempt += 1) {
+      const evaluatedFetch = await client.command("Runtime.evaluate", {
+        expression: "globalThis.__fetchValue",
+        returnByValue: true,
+      }, sessionId);
+      fetchValue = evaluatedFetch.result.value;
+      if (fetchValue === "fetch-body") break;
+      await new Promise((resolve) => setTimeout(resolve, 10));
+    }
+    assert.equal(fetchValue, "fetch-body");
+    const fetchRequestEvent = networkEvents.find((event) => event.method === "Network.requestWillBeSent" && event.params.request.url === apiUrl);
+    assert.ok(fetchRequestEvent?.params?.requestId);
+    const fetchResponseBody = await client.command("Network.getResponseBody", { requestId: fetchRequestEvent.params.requestId }, sessionId);
+    const fetchText = fetchResponseBody.base64Encoded
+      ? Buffer.from(fetchResponseBody.body, "base64").toString("utf8")
+      : fetchResponseBody.body;
+    assert.equal(fetchText, "fetch-body");
     stopNetworkEvents();
     const headerValue = await client.command("Runtime.evaluate", {
       expression: "document.querySelector('h1').textContent",
