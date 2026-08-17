@@ -213,6 +213,7 @@ struct Target {
     viewport: Viewport,
     emulated_media: String,
     focus_emulation: bool,
+    cache_disabled: bool,
     extra_headers: BTreeMap<String, String>,
     network_enabled_sessions: BTreeSet<String>,
     fetch_patterns: BTreeMap<String, Vec<FetchPattern>>,
@@ -273,6 +274,7 @@ impl PortableCdp {
                 viewport: Viewport::default(),
                 emulated_media: String::new(),
                 focus_emulation: false,
+                cache_disabled: false,
                 extra_headers: BTreeMap::new(),
                 network_enabled_sessions: BTreeSet::new(),
                 fetch_patterns: BTreeMap::new(),
@@ -542,6 +544,31 @@ impl PortableCdp {
             .map_err(|error| js_error(&format!("Fetch resolution serialization failed: {error}")))?;
         bounded(&text, MAX_EVENT_BYTES, "Fetch resolution batch")?;
         Ok(text)
+    }
+
+    /// Return the target-neutral cache policy selected by Network commands.
+    /// The host owns byte storage, while the portable core owns this policy
+    /// bit and therefore remains the source of truth for CDP state.
+    #[wasm_bindgen(js_name = cacheDisabled)]
+    pub fn cache_disabled_json(&self, target_id: &str) -> Result<bool, JsValue> {
+        bounded(target_id, MAX_METHOD_BYTES, "CDP target ID")?;
+        self.targets
+            .get(target_id)
+            .map(|target| target.cache_disabled)
+            .ok_or_else(|| js_error("portable cache target is not known"))
+    }
+
+    /// Clear response-body ownership associated with a target. The host
+    /// adapter clears its bounded HTTP cache when it receives the same CDP
+    /// command; this method keeps the portable response state coherent.
+    #[wasm_bindgen(js_name = clearResponseCache)]
+    pub fn clear_response_cache(&mut self, target_id: &str) -> Result<(), JsValue> {
+        bounded(target_id, MAX_METHOD_BYTES, "CDP target ID")?;
+        let Some(target) = self.targets.get_mut(target_id) else {
+            return Err(js_error("portable cache target is not known"));
+        };
+        target.response_bodies.clear();
+        Ok(())
     }
 
     /// Remove a paused request when the host page is reset or the page-side
@@ -1331,7 +1358,19 @@ impl PortableCdp {
                 target.core.cdp_clear_cookies();
                 cdp_result_response(&request.id, json!({}), session)
             }
-            "Network.clearBrowserCache" => cdp_result_response(&request.id, json!({}), session),
+            "Network.setCacheDisabled" => {
+                let Some(target) = self.targets.get_mut(&target_id) else {
+                    return cdp_error_response(&request.id, -32000, "target is not known", session);
+                };
+                target.cache_disabled = request.params.get("cacheDisabled").and_then(Value::as_bool).unwrap_or(false);
+                cdp_result_response(&request.id, json!({}), session)
+            }
+            "Network.clearBrowserCache" => {
+                if let Some(target) = self.targets.get_mut(&target_id) {
+                    target.response_bodies.clear();
+                }
+                cdp_result_response(&request.id, json!({}), session)
+            }
             "Network.getResponseBody" => {
                 let Some(request_id) = request.params.get("requestId").and_then(Value::as_str) else {
                     return cdp_error_response(&request.id, -32602, "requestId is required", session);
@@ -1671,6 +1710,7 @@ impl PortableCdp {
             viewport: Viewport::default(),
             emulated_media: String::new(),
             focus_emulation: false,
+            cache_disabled: false,
             extra_headers: BTreeMap::new(),
             network_enabled_sessions: BTreeSet::new(),
             fetch_patterns: BTreeMap::new(),
@@ -2508,6 +2548,36 @@ mod tests {
         ).unwrap());
         assert_eq!(continued["result"], json!({}));
         assert_eq!(json(&cdp.drain_fetch_resolutions_json().unwrap())[0]["action"], "continue");
+    }
+
+    #[test]
+    fn portable_cache_policy_is_owned_by_target_state() {
+        let mut cdp = PortableCdp::new("").unwrap();
+        let connection = cdp.open_connection().unwrap();
+        let attached = json(&cdp.cdp_request(
+            connection,
+            r#"{"id":1,"method":"Target.attachToTarget","params":{"targetId":"page-1","flatten":true}}"#,
+        ).unwrap());
+        let session = attached["result"]["sessionId"].as_str().unwrap();
+        cdp.poll_cdp_events(connection, 8).unwrap();
+        assert_eq!(cdp.cache_disabled_json("page-1").unwrap(), false);
+        let enabled = json(&cdp.cdp_request(
+            connection,
+            &format!(r#"{{"id":2,"sessionId":"{session}","method":"Network.setCacheDisabled","params":{{"cacheDisabled":true}}}}"#),
+        ).unwrap());
+        assert_eq!(enabled["result"], json!({}));
+        assert_eq!(cdp.cache_disabled_json("page-1").unwrap(), true);
+        let cleared = json(&cdp.cdp_request(
+            connection,
+            &format!(r#"{{"id":3,"sessionId":"{session}","method":"Network.clearBrowserCache"}}"#),
+        ).unwrap());
+        assert_eq!(cleared["result"], json!({}));
+        let disabled = json(&cdp.cdp_request(
+            connection,
+            &format!(r#"{{"id":4,"sessionId":"{session}","method":"Network.setCacheDisabled","params":{{"cacheDisabled":false}}}}"#),
+        ).unwrap());
+        assert_eq!(disabled["result"], json!({}));
+        assert_eq!(cdp.cache_disabled_json("page-1").unwrap(), false);
     }
 
     #[test]

@@ -993,6 +993,7 @@ export class ObscuraCdpServer {
       "Network.deleteCookies",
       "Network.clearBrowserCookies",
       "Network.clearBrowserCache",
+      "Network.setCacheDisabled",
       "Network.setExtraHTTPHeaders",
       "Storage.getCookies",
       "Storage.setCookies",

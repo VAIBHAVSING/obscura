@@ -10,6 +10,7 @@ const PIXEL_PNG = Buffer.from(
 );
 
 test("real WASM artifact is reachable through package CDP", { skip: !modulePath }, async () => {
+  let scriptRequests = 0;
   const fixture = createHttpServer((request, response) => {
     if (request.url === "/api") {
       response.setHeader("content-type", "text/plain; charset=utf-8");
@@ -22,6 +23,7 @@ test("real WASM artifact is reachable through package CDP", { skip: !modulePath 
       return;
     }
     if (request.url === "/script.js") {
+      scriptRequests += 1;
       response.setHeader("content-type", "application/javascript; charset=utf-8");
       response.end("globalThis.__portableScriptLoaded = true;");
       return;
@@ -275,6 +277,16 @@ test("real WASM artifact is reachable through package CDP", { skip: !modulePath 
       returnByValue: true,
     }, sessionId);
     assert.equal(staticScriptLoaded.result.value, true);
+    const scriptRequestsAfterInterception = scriptRequests;
+    await client.command("Page.navigate", { url: fixtureUrl }, sessionId);
+    assert.equal(scriptRequests, scriptRequestsAfterInterception);
+    await client.command("Network.setCacheDisabled", { cacheDisabled: true }, sessionId);
+    await client.command("Page.navigate", { url: fixtureUrl }, sessionId);
+    assert.equal(scriptRequests, scriptRequestsAfterInterception + 1);
+    await client.command("Network.setCacheDisabled", { cacheDisabled: false }, sessionId);
+    await client.command("Network.clearBrowserCache", {}, sessionId);
+    await client.command("Page.navigate", { url: fixtureUrl }, sessionId);
+    assert.equal(scriptRequests, scriptRequestsAfterInterception + 2);
     const renderUrl = new URL("/render", fixtureUrl).href;
     const imageUrl = new URL("/pixel.png", renderUrl).href;
     const stylesheetUrl = new URL("/style.css", renderUrl).href;

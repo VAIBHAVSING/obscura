@@ -435,6 +435,10 @@ const bootstrapFetches = new Map();
 // interception point while the main navigation operation is awaiting I/O.
 // Their continuations are serviced by re-entrant portableCdp messages.
 const portableFetchWaiters = new Map();
+const MAX_HTTP_CACHE_ENTRIES = 128;
+const MAX_HTTP_CACHE_BYTES = 16 * 1024 * 1024;
+const portableHttpCache = new Map();
+let portableHttpCacheBytes = 0;
 const MAX_BOOTSTRAP_NETWORK_EVENTS = 512;
 const MAX_BOOTSTRAP_NETWORK_BYTES = 12 * 1024 * 1024;
 let nextBootstrapNetworkRequestId = 1;
@@ -1299,6 +1303,74 @@ function portableCdpInterceptFetch(metadata) {
   }
 }
 
+function portableCdpCacheDisabled() {
+  const getter = member(portableCdpCore, ["cacheDisabled", "cache_disabled"]);
+  if (!getter) return null;
+  try { return Boolean(getter.fn("page-1")); } catch { return null; }
+}
+
+function portableCdpClearHttpCache() {
+  portableHttpCache.clear();
+  portableHttpCacheBytes = 0;
+  const clearer = member(portableCdpCore, ["clearResponseCache", "clear_response_cache"]);
+  if (clearer) {
+    try { clearer.fn("page-1"); } catch {}
+  }
+}
+
+function portableHttpCacheKey({ url, method = "GET", headers = {}, resourceType = "Other" } = {}) {
+  if (method !== "GET" && method !== "HEAD") return null;
+  const normalizedHeaders = Object.entries(headers)
+    .map(([name, value]) => [String(name).toLowerCase(), String(value)])
+    .sort(([left], [right]) => left.localeCompare(right));
+  return JSON.stringify([String(url), method, resourceType, normalizedHeaders]);
+}
+
+function portableHttpCacheLookup(request) {
+  if (portableCdpCacheDisabled() !== false) return null;
+  const key = portableHttpCacheKey(request);
+  if (!key) return null;
+  const entry = portableHttpCache.get(key);
+  if (!entry) return null;
+  portableHttpCache.delete(key);
+  portableHttpCache.set(key, entry);
+  return {
+    url: entry.url,
+    status: entry.status,
+    headers: { ...entry.headers },
+    bytes: entry.bytes.slice(),
+    cached: true,
+  };
+}
+
+function portableHttpCacheStore(request, response) {
+  if (portableCdpCacheDisabled() !== false || !response || response.status < 200 || response.status >= 300) return;
+  const key = portableHttpCacheKey(request);
+  const bytes = response.bytes instanceof Uint8Array ? response.bytes : new Uint8Array(response.bytes ?? []);
+  if (!key || bytes.byteLength > MAX_HTTP_CACHE_BYTES) return;
+  const cacheControl = String(response.headers?.["cache-control"] ?? response.headers?.["Cache-Control"] ?? "").toLowerCase();
+  if (/(?:^|[,\s])(?:no-store|no-cache)(?:[,\s]|$)/u.test(cacheControl)) return;
+  if (Object.keys(response.headers ?? {}).some((name) => name.toLowerCase() === "set-cookie")) return;
+  const previous = portableHttpCache.get(key);
+  if (previous) portableHttpCacheBytes -= previous.bytes.byteLength;
+  portableHttpCache.delete(key);
+  while (portableHttpCache.size >= MAX_HTTP_CACHE_ENTRIES || portableHttpCacheBytes + bytes.byteLength > MAX_HTTP_CACHE_BYTES) {
+    const oldestKey = portableHttpCache.keys().next().value;
+    if (oldestKey === undefined) break;
+    const oldest = portableHttpCache.get(oldestKey);
+    portableHttpCache.delete(oldestKey);
+    portableHttpCacheBytes -= oldest?.bytes?.byteLength ?? 0;
+  }
+  const entry = {
+    url: String(response.url ?? request.url),
+    status: response.status,
+    headers: { ...(response.headers ?? {}) },
+    bytes: bytes.slice(),
+  };
+  portableHttpCache.set(key, entry);
+  portableHttpCacheBytes += entry.bytes.byteLength;
+}
+
 function awaitPortableFetchInterception(metadata, record) {
   const interception = portableCdpInterceptFetch(metadata);
   if (interception.paused !== true) return null;
@@ -1350,6 +1422,13 @@ function portableCdpOperation(payload = {}) {
     const connectionId = requireUnsignedU32(payload.connectionId, "CDP connection ID");
     requireBoundedString(payload.message, MAX_PLATFORM_REQUEST_BYTES, "CDP message");
     const response = decodeJsonText(core.cdpRequest(connectionId, payload.message));
+    try {
+      const request = JSON.parse(payload.message);
+      if (request?.method === "Network.clearBrowserCache" ||
+          (request?.method === "Network.setCacheDisabled" && request?.params?.cacheDisabled === true)) {
+        portableCdpClearHttpCache();
+      }
+    } catch {}
     drainPortableFetchResolutions();
     return response;
   }
@@ -2090,7 +2169,11 @@ async function hostFetchInterception({
     resourceType,
     frameId,
   }, record);
-  if (!resolution) return { url, method, headers, postData, fulfilled: null };
+  if (!resolution) {
+    const cached = portableHttpCacheLookup({ url, method, headers, resourceType });
+    if (cached) return { url, method, headers, postData, fulfilled: cached, fromCache: true };
+    return { url, method, headers, postData, fulfilled: null, fromCache: false };
+  }
   if (!resolution || resolution.action === "fail") {
     throw new Error("Fetch request failed by interception");
   }
@@ -2101,6 +2184,7 @@ async function hostFetchInterception({
       headers,
       postData,
       fulfilled: decodeFetchFulfillment(resolution, String(url)),
+      fromCache: false,
     };
   }
   let effectiveUrl = url;
@@ -2114,6 +2198,7 @@ async function hostFetchInterception({
     headers: effectiveHeaders,
     postData: typeof resolution.postData === "string" ? resolution.postData : postData,
     fulfilled: null,
+    fromCache: false,
   };
 }
 
@@ -2144,12 +2229,12 @@ async function hostFetchResponseInterception({
     resourceType,
     frameId,
   }, record);
-  if (!resolution) return { url, status, headers: responseHeaders, bytes: body };
+  if (!resolution) return { url, status, headers: responseHeaders, bytes: body, intercepted: false };
   if (!resolution || resolution.action === "fail") {
     throw new Error("Fetch response failed by interception");
   }
-  if (resolution.action === "fulfill") return decodeFetchFulfillment(resolution, String(url));
-  return { url, status, headers: responseHeaders, bytes: body };
+  if (resolution.action === "fulfill") return { ...decodeFetchFulfillment(resolution, String(url)), intercepted: true };
+  return { url, status, headers: responseHeaders, bytes: body, intercepted: false };
 }
 
 function bootstrapFetchResolution(id, envelope) {
@@ -2467,6 +2552,21 @@ async function fetchClassicScript(url, requestTimeoutMs, allowPrivateNetwork, { 
     let bytes;
     if (decision.fulfilled) {
       ({ headers: responseHeaders, url: responseUrl, status, bytes } = decision.fulfilled);
+      if (decision.fromCache) {
+        const responseDecision = await hostFetchResponseInterception({
+          requestId,
+          url: responseUrl,
+          method: decision.method,
+          headers: decision.headers,
+          status,
+          responseHeaders,
+          bytes,
+          resourceType: "Script",
+          frameId: "page-1",
+          record: interceptionRecord,
+        });
+        ({ headers: responseHeaders, url: responseUrl, status, bytes } = responseDecision);
+      }
     } else {
       response = await fetch(decision.url, {
         method: decision.method,
@@ -2493,6 +2593,12 @@ async function fetchClassicScript(url, requestTimeoutMs, allowPrivateNetwork, { 
         record: interceptionRecord,
       });
       ({ headers: responseHeaders, url: responseUrl, status, bytes } = responseDecision);
+      if (!responseDecision.intercepted) {
+        portableHttpCacheStore(
+          { url: decision.url, method: decision.method, headers: decision.headers, resourceType: "Script" },
+          { url: responseUrl, status, headers: responseHeaders, bytes },
+        );
+      }
     }
     if (status < 200 || status >= 300) {
       queueBootstrapNetworkEvent({
@@ -2674,6 +2780,21 @@ async function fetchStylesheetCss(url, requestTimeoutMs, allowPrivateNetwork, se
       if (decision.fulfilled) {
         ({ headers: responseHeaders, url: responseUrl, status: responseStatus } = decision.fulfilled);
         bytes = responseStatus >= 200 && responseStatus < 300 ? decision.fulfilled.bytes : new Uint8Array();
+        if (decision.fromCache) {
+          const responseDecision = await hostFetchResponseInterception({
+            requestId,
+            url: responseUrl,
+            method: decision.method,
+            headers: decision.headers,
+            status: responseStatus,
+            responseHeaders,
+            bytes,
+            resourceType: "Stylesheet",
+            frameId: "page-1",
+            record: interceptionRecord,
+          });
+          ({ headers: responseHeaders, url: responseUrl, status: responseStatus, bytes } = responseDecision);
+        }
       } else {
         const options = { headers: decision.headers, redirect: "follow", signal: controller.signal };
         if (/^https?:/iu.test(referrer)) options.referrer = referrer;
@@ -2700,6 +2821,12 @@ async function fetchStylesheetCss(url, requestTimeoutMs, allowPrivateNetwork, se
           record: interceptionRecord,
         });
         ({ headers: responseHeaders, url: responseUrl, status: responseStatus, bytes } = responseDecision);
+        if (!responseDecision.intercepted) {
+          portableHttpCacheStore(
+            { url: decision.url, method: decision.method, headers: decision.headers, resourceType: "Stylesheet" },
+            { url: responseUrl, status: responseStatus, headers: responseHeaders, bytes },
+          );
+        }
       }
       if (responseStatus < 200 || responseStatus >= 300) {
         record(responseStatus, undefined, 0);
@@ -3196,6 +3323,25 @@ async function navigatePortable({ url, options = {}, allowPrivateNetwork = false
         headers = decision.fulfilled.headers;
         serialized = JSON.stringify(headers);
         fulfilledBytes = decision.fulfilled.bytes;
+        if (decision.fromCache) {
+          const responseDecision = await hostFetchResponseInterception({
+            requestId,
+            url: responseUrl,
+            method: decision.method,
+            headers: decision.headers,
+            status: responseStatus,
+            responseHeaders: headers,
+            bytes: fulfilledBytes,
+            resourceType: "Document",
+            frameId: "page-1",
+            record: interceptionRecord,
+          });
+          responseUrl = responseDecision.url;
+          responseStatus = responseDecision.status;
+          headers = responseDecision.headers;
+          serialized = JSON.stringify(headers);
+          fulfilledBytes = responseDecision.bytes;
+        }
       } else {
         response = await fetch(decision.url, {
           method: decision.method,
@@ -3230,6 +3376,12 @@ async function navigatePortable({ url, options = {}, allowPrivateNetwork = false
         serialized = JSON.stringify(headers);
         fulfilledBytes = responseDecision.bytes;
         response = null;
+        if (!responseDecision.intercepted) {
+          portableHttpCacheStore(
+            { url: decision.url, method: decision.method, headers: decision.headers, resourceType: "Document" },
+            { url: responseUrl, status: responseStatus, headers, bytes: fulfilledBytes },
+          );
+        }
       }
       const responseRecord = networkRecord({
         requestId,
@@ -3733,6 +3885,21 @@ async function fetchAndSeedRenderResource(
     let bytes;
     if (decision.fulfilled) {
       ({ headers: responseHeaders, url: responseUrl, status: responseStatus, bytes } = decision.fulfilled);
+      if (decision.fromCache) {
+        const responseDecision = await hostFetchResponseInterception({
+          requestId,
+          url: responseUrl,
+          method: decision.method,
+          headers: decision.headers,
+          status: responseStatus,
+          responseHeaders,
+          bytes,
+          resourceType,
+          frameId: "page-1",
+          record: interceptionRecord,
+        });
+        ({ headers: responseHeaders, url: responseUrl, status: responseStatus, bytes } = responseDecision);
+      }
     } else {
       response = await fetch(decision.url, {
         method: decision.method,
@@ -3761,6 +3928,12 @@ async function fetchAndSeedRenderResource(
         record: interceptionRecord,
       });
       ({ headers: responseHeaders, url: responseUrl, status: responseStatus, bytes } = responseDecision);
+      if (!responseDecision.intercepted) {
+        portableHttpCacheStore(
+          { url: decision.url, method: decision.method, headers: decision.headers, resourceType },
+          { url: responseUrl, status: responseStatus, headers: responseHeaders, bytes },
+        );
+      }
     }
     if (responseStatus < 200 || responseStatus >= 300) {
       record(responseStatus, undefined, 0);
