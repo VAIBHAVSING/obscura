@@ -1,7 +1,7 @@
 # Obscura Node and WebAssembly migration memory
 
 Latest verified implementation commit:
-`40552d8` (`feat: support response-stage portable fetch interception`).
+`ea0f2ea` (`feat: intercept portable navigation resources`).
 The prior checkpoint was `c78d6a5` (`feat: route portable navigation network state through WASM`).
 Earlier harness, portable rendering, resource discovery, PDF, and
 boundary-hardening milestones remain recorded below.
@@ -891,3 +891,37 @@ Those paths need an action/re-entry protocol before they can share the same
 interceptor without deadlocking the Worker request queue. Cache and redirect
 policy, broader CDP domains, full Playwright parity, Deno package integration,
 and the unavailable companion obstacle course remain open.
+
+## Portable parser/resource Fetch checkpoint (2026-08-17)
+
+Source commit: `ea0f2ea` (`feat: intercept portable navigation resources`).
+
+The Node host now applies the portable Rust Fetch request policy to document
+navigation, classic parser scripts, linked stylesheets and render-resource
+loads. The Worker keeps host fetch records bounded and cancellable. Portable
+CDP request/poll/record operations are allowed to re-enter while host I/O is
+awaiting a pause; DOM and page operations remain serialized. During a paused
+navigation, the package polls only Fetch control events and defers ordinary
+Network metadata until commit, preserving Document-before-subresource event
+ordering. Continue, URL/method/header rewrite, fulfill, fail, cancellation,
+and page reset paths all use data-only envelopes.
+
+Verification after this checkpoint:
+
+- Real `@obscura/browser` package suite against the fresh render WASM wrapper:
+  **10 passed, 1 optional Playwright skip, 0 failed**. The local fixture now
+  proves request interception for a parser script, a stylesheet during
+  navigation, and an image during screenshot preparation, including a
+  continuation that unblocks the pending host operation.
+- Real Node WASM harness against the same wrapper: **68 passed, 2 expected
+  native-addon skips, 0 failed**.
+- `node --check` passed for the changed Worker, package server, and real
+  artifact test; `git diff --check` passed.
+- The Rust response-stage Fetch tests and fresh wasm32 render build remain
+  green from the preceding `40552d8` checkpoint.
+
+The portable host still does not provide a complete browser: cache semantics,
+redirect interception policy, response-stage parser/resource interception,
+all Network/Fetch domains, full DOM mutation/event synchronization, complete
+Playwright compatibility, Deno package integration, and the unavailable
+companion obstacle course remain open.
