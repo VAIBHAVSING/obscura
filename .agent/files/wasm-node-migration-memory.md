@@ -1,7 +1,8 @@
 # Obscura Node and WebAssembly migration memory
 
 Latest verified implementation commit:
-`c78d6a5` (`feat: route portable navigation network state through WASM`).
+`4c6d842` (`feat: move fetch interception into portable wasm cdp`).
+The prior checkpoint was `c78d6a5` (`feat: route portable navigation network state through WASM`).
 Earlier harness, portable rendering, resource discovery, PDF, and
 boundary-hardening milestones remain recorded below.
 
@@ -819,3 +820,38 @@ stylesheet/import network events, complete interception/cache/redirect policy,
 broader CDP domains, full DOM mutation/event synchronization, npm release
 packaging, and the unavailable companion obstacle course. This checkpoint does
 not claim a complete browser migration.
+
+## Portable Fetch interception checkpoint (2026-08-17)
+
+Source commit: `4c6d842` (`feat: move fetch interception into portable wasm cdp`).
+
+`PortableCdp` now owns bounded `Fetch.enable`, `Fetch.disable`,
+`Fetch.continueRequest`, `Fetch.fulfillRequest`, `Fetch.failRequest`, and
+`Fetch.getResponseBody` state. It emits `Fetch.requestPaused` into the WASM CDP
+event queue and drains opaque continue/fulfill/fail resolutions to the host.
+Patterns, paused requests, response bodies, headers, and resolution queues are
+bounded. Session detach, target close, page reset, and Worker shutdown clear or
+resolve paused work. Node performs only the HTTP request and applies the
+WASM-produced resolution; it does not own interception policy.
+
+Verification after this checkpoint:
+
+- Release `obscura-wasm` portable CDP tests: **17/17 passed**. The environment
+  does not currently have `cargo-nextest`, so this focused fallback used
+  `cargo test --release --features render -p obscura-wasm cdp::tests`.
+- Real WASM `@obscura/browser` package suite: **10 passed, 1 optional
+  Playwright skip, 0 failed**. It covers request pause, URL rewrite/continue,
+  synthetic fulfill, failure, event delivery while idle, and response-body
+  retrieval.
+- Real WASM Node harness: **68 passed, 2 expected native-addon skips, 0
+  failed**.
+- Exact render CLI release build: passed.
+- Final disposable render artifact used by the real gates: wrapper SHA256
+  `b2685cb5e5569e2a0e9627c5be7d96c71c4463003597a34eb06b1a2c5b9a8025` and
+  background WASM SHA256
+  `89976616e4b01f967df88cabb1fcd212ebb1d6698eb6db834bc9ce3a157a6fc7`.
+
+This is a Fetch interception milestone, not full browser parity. Static
+navigation/resource interception, cache policy, redirects, response-stage
+interception, and the companion obstacle course remain open. The full
+workspace nextest gate must be rerun in an environment with cargo-nextest.
