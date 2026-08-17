@@ -12,8 +12,14 @@ test("real WASM artifact is reachable through package CDP", { skip: !modulePath 
       response.end("fetch-body");
       return;
     }
+    if (request.url === "/script.js") {
+      response.setHeader("content-type", "application/javascript; charset=utf-8");
+      response.end("globalThis.__portableScriptLoaded = true;");
+      return;
+    }
     response.setHeader("content-type", "text/html; charset=utf-8");
-    response.end(`<html><body><h1>${request.headers["x-portable"] ?? "missing"}</h1></body></html>`);
+    const script = request.url === "/headers" ? '<script src="/script.js"></script>' : "";
+    response.end(`<html><body><h1>${request.headers["x-portable"] ?? "missing"}</h1>${script}</body></html>`);
   });
   await new Promise((resolve, reject) => {
     fixture.once("error", reject);
@@ -70,9 +76,9 @@ test("real WASM artifact is reachable through package CDP", { skip: !modulePath 
     await client.command("Network.enable", {}, sessionId);
     await client.command("Page.navigate", { url: fixtureUrl }, sessionId);
     await new Promise((resolve) => setTimeout(resolve, 0));
-    const requestEvent = networkEvents.find((event) => event.method === "Network.requestWillBeSent");
-    const responseEvent = networkEvents.find((event) => event.method === "Network.responseReceived");
-    const finishedEvent = networkEvents.find((event) => event.method === "Network.loadingFinished");
+    const requestEvent = networkEvents.find((event) => event.method === "Network.requestWillBeSent" && event.params.request.url === fixtureUrl);
+    const responseEvent = networkEvents.find((event) => event.method === "Network.responseReceived" && event.params.requestId === requestEvent?.params?.requestId);
+    const finishedEvent = networkEvents.find((event) => event.method === "Network.loadingFinished" && event.params.requestId === requestEvent?.params?.requestId);
     assert.ok(requestEvent?.params?.requestId);
     assert.equal(requestEvent.params.request.url, fixtureUrl);
     assert.equal(responseEvent?.params?.response.status, 200);
@@ -80,6 +86,20 @@ test("real WASM artifact is reachable through package CDP", { skip: !modulePath 
     const responseBody = await client.command("Network.getResponseBody", { requestId: requestEvent.params.requestId }, sessionId);
     const responseText = responseBody.base64Encoded ? Buffer.from(responseBody.body, "base64").toString("utf8") : responseBody.body;
     assert.match(responseText, /<h1>wasm<\/h1>/);
+    const scriptUrl = new URL("/script.js", fixtureUrl).href;
+    const scriptRequestEvent = networkEvents.find((event) => event.method === "Network.requestWillBeSent" && event.params.request.url === scriptUrl);
+    assert.ok(scriptRequestEvent?.params?.requestId);
+    assert.equal(scriptRequestEvent.params.type, "Script");
+    const scriptResponseBody = await client.command("Network.getResponseBody", { requestId: scriptRequestEvent.params.requestId }, sessionId);
+    const scriptText = scriptResponseBody.base64Encoded
+      ? Buffer.from(scriptResponseBody.body, "base64").toString("utf8")
+      : scriptResponseBody.body;
+    assert.match(scriptText, /__portableScriptLoaded/);
+    const scriptLoaded = await client.command("Runtime.evaluate", {
+      expression: "globalThis.__portableScriptLoaded === true",
+      returnByValue: true,
+    }, sessionId);
+    assert.equal(scriptLoaded.result.value, true);
     const apiUrl = new URL("/api", fixtureUrl).href;
     await client.command("Runtime.evaluate", {
       expression: "globalThis.__fetchValue = null; fetch('/api').then((response) => response.text()).then((value) => { globalThis.__fetchValue = value; }); undefined",

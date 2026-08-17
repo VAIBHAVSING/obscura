@@ -2127,22 +2127,91 @@ function startBootstrapFetch(url, method, headersJson, body, pageOrigin, mode, c
   return id;
 }
 
-async function fetchClassicScript(url, requestTimeoutMs, allowPrivateNetwork) {
+async function fetchClassicScript(url, requestTimeoutMs, allowPrivateNetwork, { initiatorType = "parser" } = {}) {
   validateNavigationUrl(url, allowPrivateNetwork);
   if (url.startsWith("data:")) {
     return decodeInlineNavigation(url).bytes;
   }
+  const requestId = `script-${nextBootstrapNetworkRequestId++}`;
+  if (nextBootstrapNetworkRequestId > 0xffff_ffff) nextBootstrapNetworkRequestId = 1;
+  const loaderId = currentNavigationLoaderId();
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(new Error("script fetch timed out")), requestTimeoutMs);
   timer.unref?.();
+  let response;
+  let recorded = false;
   try {
     const headers = {};
     const cookie = cookieHeaderForUrl(url, "include");
     if (cookie) headers.Cookie = cookie;
-    const response = await fetch(url, { headers, redirect: "follow", signal: controller.signal });
+    response = await fetch(url, { headers, redirect: "follow", signal: controller.signal });
     storeResponseCookies(response.url || url, response);
-    if (!response.ok) throw new Error(`script fetch returned HTTP ${response.status}`);
-    return await readBoundedResponseBytes(response);
+    const { headers: responseHeaders } = responseHeadersObject(response);
+    const responseUrl = response.url || url;
+    if (!response.ok) {
+      queueBootstrapNetworkEvent({
+        generation: bridgeGeneration,
+        runtime: bootstrapRuntime,
+        ...networkRecord({
+          requestId,
+          loaderId,
+          url: responseUrl,
+          method: "GET",
+          requestHeaders: headers,
+          status: response.status,
+          responseHeaders,
+          mimeType: responseHeaders["content-type"] ?? "",
+          bodySize: 0,
+          resourceType: "Script",
+          initiatorType,
+        }),
+      });
+      recorded = true;
+      try { await response.body?.cancel(); } catch {}
+      throw new Error(`script fetch returned HTTP ${response.status}`);
+    }
+    const bytes = await readBoundedResponseBytes(response);
+    queueBootstrapNetworkEvent({
+      generation: bridgeGeneration,
+      runtime: bootstrapRuntime,
+      ...networkRecord({
+        requestId,
+        loaderId,
+        url: responseUrl,
+        method: "GET",
+        requestHeaders: headers,
+        status: response.status,
+        responseHeaders,
+        mimeType: responseHeaders["content-type"] ?? "",
+        body: bytes,
+        bodySize: bytes.byteLength,
+        resourceType: "Script",
+        initiatorType,
+      }),
+    });
+    recorded = true;
+    return bytes;
+  } catch (error) {
+    if (!recorded) {
+      queueBootstrapNetworkEvent({
+        generation: bridgeGeneration,
+        runtime: bootstrapRuntime,
+        ...networkRecord({
+          requestId,
+          loaderId,
+          url: response?.url || url,
+          method: "GET",
+          requestHeaders: {},
+          status: response?.status ?? 0,
+          responseHeaders: {},
+          mimeType: "",
+          bodySize: 0,
+          resourceType: "Script",
+          initiatorType,
+        }),
+      });
+    }
+    throw error;
   } finally {
     clearTimeout(timer);
   }
@@ -2267,7 +2336,7 @@ async function loadModuleRecord(url, requestTimeoutMs, allowPrivateNetwork) {
     throw new RangeError(`module graph exceeds the ${MAX_MODULES_PER_DOCUMENT}-module limit`);
   }
   validateNavigationUrl(url, allowPrivateNetwork);
-  const sourceBytes = await fetchClassicScript(url, requestTimeoutMs, allowPrivateNetwork);
+  const sourceBytes = await fetchClassicScript(url, requestTimeoutMs, allowPrivateNetwork, { initiatorType: "script" });
   const source = new TextDecoder("utf-8", { fatal: false }).decode(sourceBytes);
   requireBoundedString(source, MAX_SCRIPT_SOURCE_BYTES, "module source");
   const record = { url, module: null, linkPromise: null, evaluatePromise: null };
@@ -2416,7 +2485,7 @@ async function executeDocumentScripts({ requestTimeoutMs, allowPrivateNetwork })
     try {
       if (script.src) {
         sourceUrl = new URL(script.src, base).href;
-        const bytes = await fetchClassicScript(sourceUrl, requestTimeoutMs, allowPrivateNetwork);
+        const bytes = await fetchClassicScript(sourceUrl, requestTimeoutMs, allowPrivateNetwork, { initiatorType: "parser" });
         source = new TextDecoder("utf-8", { fatal: false }).decode(bytes);
       }
       requireBoundedString(source, MAX_SCRIPT_SOURCE_BYTES, "script source");
