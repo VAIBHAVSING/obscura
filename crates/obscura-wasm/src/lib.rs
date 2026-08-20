@@ -2068,6 +2068,12 @@ pub fn cdp_abi_version() -> u32 {
     cdp::CDP_ABI_VERSION
 }
 
+/// Versioned wire-level CDP protocol shared with native transports.
+#[wasm_bindgen(js_name = sharedCdpProtocolAbiVersion)]
+pub fn shared_cdp_protocol_abi_version() -> u32 {
+    obscura_cdp::protocol::PROTOCOL_ABI_VERSION
+}
+
 #[cfg(feature = "render")]
 #[wasm_bindgen(js_name = pdfAbiVersion)]
 pub fn pdf_abi_version() -> u32 {

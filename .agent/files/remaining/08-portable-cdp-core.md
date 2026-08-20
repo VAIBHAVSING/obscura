@@ -1,5 +1,11 @@
 # Packet C1: portable CDP state and dispatch core
 
+> Superseded for the final architecture by
+> `18-reuse-obscura-cdp-in-wasm.md`, which migrates the existing
+> `crates/obscura-cdp` implementation into WASM instead of retaining a second
+> portable dispatcher. Keep this packet as historical context for the
+> host-action ABI already implemented.
+
 ## Goal
 
 Move CDP target/session/domain semantics behind a portable WASM ABI. Node owns

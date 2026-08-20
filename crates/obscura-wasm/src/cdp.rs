@@ -15,13 +15,18 @@ use serde_json::{json, Map, Value};
 use url::Url;
 use wasm_bindgen::prelude::*;
 
+use obscura_cdp::action::{ActionQueue, HostActionResult};
+use obscura_cdp::engine::{
+    ActionId as EngineActionId, ActionResult as EngineActionResult, CdpEngine, CdpFailure,
+    ContextId, ContextOptions, EngineAction, PageId,
+};
+use obscura_cdp::protocol::{MAX_MESSAGE_BYTES, MAX_METHOD_BYTES, MAX_SESSION_BYTES};
+use obscura_cdp::state::{BrowserState, ConnectionId, SessionId};
+
 use crate::ObscuraCore;
 use crate::navigation::{MAX_NAVIGATION_HEADERS_BYTES, MAX_NAVIGATION_URL_BYTES};
 
 pub const CDP_ABI_VERSION: u32 = 1;
-const MAX_MESSAGE_BYTES: usize = 8 * 1024 * 1024;
-const MAX_METHOD_BYTES: usize = 256;
-const MAX_SESSION_BYTES: usize = 256;
 const MAX_EVENT_QUEUE: usize = 512;
 const MAX_EVENT_BYTES: usize = 4 * 1024 * 1024;
 const MAX_ACTION_RESULT_BYTES: usize = 16 * 1024 * 1024;
@@ -238,14 +243,24 @@ struct Connection {
 /// native runtime is reachable from this type.
 #[wasm_bindgen]
 pub struct PortableCdp {
+    /// Shared transport-free identity state. The legacy maps below retain the
+    /// string-shaped CDP payloads during migration, while this state owns
+    /// monotonic context/page/connection/session lifetimes for the eventual
+    /// shared dispatcher cutover.
+    shared_state: BrowserState,
+    shared_contexts: BTreeMap<String, ContextId>,
+    shared_pages: BTreeMap<String, PageId>,
+    shared_connections: BTreeMap<u32, ConnectionId>,
+    shared_sessions: BTreeMap<String, SessionId>,
+    shared_actions: BTreeMap<u32, EngineActionId>,
     targets: BTreeMap<String, Target>,
     connections: BTreeMap<u32, Connection>,
     actions: BTreeMap<u32, Action>,
+    action_queue: ActionQueue,
     contexts: BTreeSet<String>,
     next_connection_id: u32,
     next_target_id: u32,
     next_session_id: u32,
-    next_action_id: u32,
     next_loader_id: u32,
     streams: BTreeMap<String, Stream>,
     next_stream_id: u32,
@@ -259,6 +274,11 @@ impl PortableCdp {
         let core = ObscuraCore::new(html)?;
         let document_handle = core.document_handle();
         let revision = core.page_revision();
+        let mut shared_state = BrowserState::new();
+        let default_context = shared_state.default_context();
+        let default_page = shared_state
+            .create_page(&default_context, "about:blank")
+            .map_err(|error| js_error(&format!("shared CDP state initialization failed: {error}")))?;
         let mut targets = BTreeMap::new();
         targets.insert(
             "page-1".to_string(),
@@ -287,14 +307,20 @@ impl PortableCdp {
         let mut contexts = BTreeSet::new();
         contexts.insert("default".to_string());
         Ok(Self {
+            shared_state,
+            shared_contexts: BTreeMap::from([("default".to_string(), default_context)]),
+            shared_pages: BTreeMap::from([("page-1".to_string(), default_page)]),
+            shared_connections: BTreeMap::new(),
+            shared_sessions: BTreeMap::new(),
+            shared_actions: BTreeMap::new(),
             targets,
             connections: BTreeMap::new(),
             actions: BTreeMap::new(),
+            action_queue: ActionQueue::new(1),
             contexts,
             next_connection_id: 0,
             next_target_id: 1,
             next_session_id: 0,
-            next_action_id: 0,
             next_loader_id: 0,
             streams: BTreeMap::new(),
             next_stream_id: 0,
@@ -336,7 +362,12 @@ impl PortableCdp {
             .next_connection_id
             .checked_add(1)
             .ok_or_else(|| js_range_error("CDP connection ID space is exhausted"))?;
+        let shared_id = self
+            .shared_state
+            .open_connection()
+            .map_err(|error| js_error(&format!("shared CDP connection allocation failed: {error}")))?;
         self.next_connection_id = id;
+        self.shared_connections.insert(id, shared_id);
         self.connections.insert(
             id,
             Connection {
@@ -366,9 +397,14 @@ impl PortableCdp {
                 }
                 let _ = self.disable_fetch_for_session(target_id, &session_id);
             }
+            if let Some(shared_session) = self.shared_sessions.remove(&session_id) {
+                self.shared_state.detach(shared_session);
+            }
         }
-        self.actions
-            .retain(|_, action| action.connection_id != connection_id);
+        if let Some(shared_id) = self.shared_connections.remove(&connection_id) {
+            self.shared_state.close_connection(shared_id);
+        }
+        self.cancel_actions_where(|action| action.connection_id == connection_id);
         self.streams
             .retain(|_, stream| stream.connection_id != connection_id);
         Ok(())
@@ -416,11 +452,35 @@ impl PortableCdp {
         // the ownership again immediately before accepting its result.
         if !self.action_is_live(&action) {
             self.actions.remove(&action_id);
+            let _ = self.action_queue.cancel(action_id);
             return Err(js_error("CDP action target session is no longer live"));
         }
-        self.actions.remove(&action_id);
         let mut result: Value = serde_json::from_str(result_json)
             .map_err(|error| js_error(&format!("invalid CDP action result: {error}")))?;
+        let generation = self.action_queue.generation();
+        self.action_queue
+            .complete(&HostActionResult {
+                action_id,
+                generation,
+                ok: true,
+                value: Value::Null,
+            })
+            .map_err(|_| js_error("stale or unknown CDP action"))?;
+        let shared_action_id = self
+            .shared_actions
+            .remove(&action_id)
+            .ok_or_else(|| js_error("shared CDP action is missing"))?;
+        let shared_result = if let Some(error) = result.get("error").and_then(Value::as_object) {
+            let message = error.get("message").and_then(Value::as_str).unwrap_or("Portable host action failed");
+            EngineActionResult::Failed(CdpFailure::host(message))
+        } else {
+            EngineActionResult::Value(result.clone())
+        };
+        match self.shared_state.complete_action(shared_action_id, shared_result) {
+            Ok(()) | Err(CdpFailure::Host(_)) => {}
+            Err(error) => return Err(js_error(&format!("shared CDP action completion failed: {error}"))),
+        }
+        self.actions.remove(&action_id);
         if action.kind == "navigate" || action.kind == "reload" || action.kind == "setDocumentContent" {
             if let Some(target) = self.targets.get_mut(&action.target_id) {
                 if let Some(url) = result.get("url").and_then(Value::as_str) {
@@ -611,7 +671,7 @@ impl PortableCdp {
             "cdpAbiVersion": CDP_ABI_VERSION,
             "targets": self.targets.len(),
             "connections": self.connections.len(),
-            "pendingActions": self.actions.len(),
+            "pendingActions": self.action_queue.pending_len(),
             "eventQueueLimit": MAX_EVENT_QUEUE,
             "actionResultBytes": MAX_ACTION_RESULT_BYTES,
             "streamBytes": MAX_STREAM_BYTES,
@@ -1031,7 +1091,12 @@ impl PortableCdp {
                 session,
             ),
             "Target.createBrowserContext" => {
-                let id = format!("context-{}", self.contexts.len());
+                let shared_id = match self.shared_state.create_context(ContextOptions::default()) {
+                    Ok(id) => id,
+                    Err(error) => return cdp_error_response(&request.id, -32000, error.to_string(), session),
+                };
+                let id = format!("context-{}", shared_id.get());
+                self.shared_contexts.insert(id.clone(), shared_id);
                 self.contexts.insert(id.clone());
                 cdp_result_response(&request.id, json!({"browserContextId": id}), session)
             }
@@ -1039,15 +1104,23 @@ impl PortableCdp {
                 let Some(id) = request.params.get("browserContextId").and_then(Value::as_str) else {
                     return cdp_error_response(&request.id, -32602, "browserContextId is required", session);
                 };
-                if id == "default" || !self.contexts.remove(id) {
+                if id == "default" || !self.contexts.contains(id) {
                     return cdp_error_response(&request.id, -32000, "browser context cannot be disposed", session);
                 }
+                let Some(shared_id) = self.shared_contexts.get(id).copied() else {
+                    return cdp_error_response(&request.id, -32000, "shared browser context was not found", session);
+                };
                 let doomed: Vec<String> = self
                     .targets
                     .values()
                     .filter(|target| target.context_id == id)
                     .map(|target| target.id.clone())
                     .collect();
+                if let Err(error) = self.shared_state.dispose_context(&shared_id) {
+                    return cdp_error_response(&request.id, -32000, error.to_string(), session);
+                }
+                self.contexts.remove(id);
+                self.shared_contexts.remove(id);
                 for target_id in doomed {
                     self.destroy_target(&target_id);
                 }
@@ -1671,11 +1744,35 @@ impl PortableCdp {
     }
 
     fn queue_action(&mut self, connection_id: u32, request: Request, target_id: String, kind: &str, payload: Value) -> Value {
-        let action_id = match self.next_action_id.checked_add(1) {
-            Some(value) => value,
-            None => return cdp_error_response(&request.id, -32000, "CDP action ID space is exhausted", request.session_id.as_deref()),
+        let shared_action = match self.shared_engine_action(&target_id, kind, &payload) {
+            Ok(action) => action,
+            Err(error) => return cdp_error_response(&request.id, -32000, error.to_string(), request.session_id.as_deref()),
         };
-        self.next_action_id = action_id;
+        let action_id = match self.action_queue.enqueue(kind, payload.clone()) {
+            Ok(value) => value,
+            Err(error) => {
+                let message = match error {
+                    obscura_cdp::action::ActionError::QueueFull => "CDP action queue is full",
+                    obscura_cdp::action::ActionError::PayloadTooLarge => "CDP action payload exceeds the byte limit",
+                    obscura_cdp::action::ActionError::IdExhausted => "CDP action ID space is exhausted",
+                    obscura_cdp::action::ActionError::UnknownAction | obscura_cdp::action::ActionError::StaleGeneration => "CDP action queue is invalid",
+                };
+                return cdp_error_response(&request.id, -32000, message, request.session_id.as_deref());
+            }
+        };
+        // The CDP response is the transport-facing action drain. Keep the
+        // shared queue's pending ownership, but remove its ready copy so the
+        // host cannot accidentally execute the same action twice by polling
+        // both legacy and shared paths.
+        let _ = self.action_queue.drain(1);
+        let shared_action_id = match self.shared_state.start_action(shared_action) {
+            Ok(id) => id,
+            Err(error) => {
+                let _ = self.action_queue.cancel(action_id);
+                return cdp_error_response(&request.id, -32000, error.to_string(), request.session_id.as_deref());
+            }
+        };
+        self.shared_actions.insert(action_id, shared_action_id);
         self.actions.insert(action_id, Action {
             connection_id,
             request_id: request.id.clone(),
@@ -1691,9 +1788,73 @@ impl PortableCdp {
         }}), request.session_id.as_deref())
     }
 
+    fn shared_engine_action(
+        &self,
+        target_id: &str,
+        kind: &str,
+        payload: &Value,
+    ) -> Result<EngineAction, CdpFailure> {
+        let page = self
+            .shared_pages
+            .get(target_id)
+            .copied()
+            .ok_or_else(|| CdpFailure::UnknownPage(PageId::new(0)))?;
+        let string_field = |name: &str, default: &str| {
+            payload.get(name).and_then(Value::as_str).unwrap_or(default).to_string()
+        };
+        Ok(match kind {
+            "navigate" | "reload" | "setDocumentContent" => EngineAction::Navigate {
+                page,
+                url: string_field("url", "about:blank"),
+            },
+            "evaluate" => EngineAction::Evaluate {
+                page,
+                expression: string_field("expression", ""),
+            },
+            "callFunctionOn" => EngineAction::CallFunctionOn {
+                page,
+                declaration: string_field("functionDeclaration", ""),
+            },
+            "getProperties" => EngineAction::GetProperties {
+                page,
+                object_id: string_field("objectId", ""),
+            },
+            "releaseObject" | "releaseObjectGroup" => EngineAction::ReleaseObject {
+                page,
+                object_id: string_field("objectId", ""),
+            },
+            "dispatchMouseEvent" | "dispatchKeyEvent" | "insertText" => EngineAction::DeliverInput {
+                page,
+                payload: payload.clone(),
+            },
+            "screenshot" => EngineAction::CaptureScreenshot {
+                page,
+                format: string_field("format", "png"),
+            },
+            "pdf" => EngineAction::PrintToPdf {
+                page,
+                options: payload.clone(),
+            },
+            "getIsolateId" => EngineAction::Wake {
+                deadline_millis: 0,
+            },
+            _ => return Err(CdpFailure::Unsupported(format!("unknown host action kind {kind}"))),
+        })
+    }
+
     fn create_target(&mut self, context_id: &str, url: &str, html: &str) -> String {
         self.next_target_id = self.next_target_id.saturating_add(1);
         let target_id = format!("page-{}", self.next_target_id);
+        let shared_context = self
+            .shared_contexts
+            .get(context_id)
+            .copied()
+            .expect("portable CDP target context must be registered");
+        let shared_page = self
+            .shared_state
+            .create_page(&shared_context, url)
+            .expect("portable CDP target page must fit shared state bounds");
+        self.shared_pages.insert(target_id.clone(), shared_page);
         let mut core = ObscuraCore::new(html).expect("empty document is valid");
         let _ = core.set_document_metadata(url, "", "UTF-8");
         let loader_id = format!("loader-{target_id}-{}", self.next_loader_id);
@@ -1800,6 +1961,14 @@ impl PortableCdp {
         if let Some(target) = self.targets.get_mut(target_id) {
             target.sessions.insert(session_id.clone());
         }
+        if let (Some(shared_connection), Some(shared_page)) = (
+            self.shared_connections.get(&connection_id).copied(),
+            self.shared_pages.get(target_id).copied(),
+        ) {
+            if let Ok(shared_session) = self.shared_state.attach(shared_connection, shared_page) {
+                self.shared_sessions.insert(session_id.clone(), shared_session);
+            }
+        }
         session_id
     }
 
@@ -1816,9 +1985,12 @@ impl PortableCdp {
             target.network_enabled_sessions.remove(session_id);
             target.fetch_patterns.remove(session_id);
         }
+        if let Some(shared_session) = self.shared_sessions.remove(session_id) {
+            self.shared_state.detach(shared_session);
+        }
         let _ = self.disable_fetch_for_session(&target_id, session_id);
-        self.actions.retain(|_, action| {
-            action.connection_id != connection_id || action.session_id.as_deref() != Some(session_id)
+        self.cancel_actions_where(|action| {
+            action.connection_id == connection_id && action.session_id.as_deref() == Some(session_id)
         });
         if let Some(connection) = self.connections.get_mut(&connection_id) {
             discard_session_events(connection, session_id);
@@ -1834,6 +2006,17 @@ impl PortableCdp {
 
     fn destroy_target(&mut self, target_id: &str) {
         let Some(target) = self.targets.remove(target_id) else { return; };
+        if let Some(shared_page) = self.shared_pages.remove(target_id) {
+            let _ = self.shared_state.close_page(&shared_page);
+        }
+        let shared_sessions: Vec<SessionId> = target
+            .sessions
+            .iter()
+            .filter_map(|session_id| self.shared_sessions.remove(session_id))
+            .collect();
+        for shared_session in shared_sessions {
+            self.shared_state.detach(shared_session);
+        }
         for request_id in target.paused_fetches.keys() {
             if self.fetch_resolutions.len() >= MAX_FETCH_RESOLUTIONS {
                 break;
@@ -1847,7 +2030,7 @@ impl PortableCdp {
         // A target close can arrive while its host operation is in flight.
         // Completing one of those actions must be rejected, not applied to a
         // subsequent page with a coincidentally similar identifier.
-        self.actions.retain(|_, action| action.target_id != target.id);
+        self.cancel_actions_where(|action| action.target_id == target.id);
         for connection in self.connections.values_mut() {
             let doomed: Vec<String> = connection.sessions.iter().filter(|(_, id)| *id == &target.id).map(|(session, _)| session.clone()).collect();
             for session_id in doomed {
@@ -1873,6 +2056,27 @@ impl PortableCdp {
                 .targets
                 .get(&action.target_id)
                 .is_some_and(|target| target.sessions.contains(session_id))
+    }
+
+    fn cancel_actions_where<F>(&mut self, mut predicate: F)
+    where
+        F: FnMut(&Action) -> bool,
+    {
+        let ids: Vec<u32> = self
+            .actions
+            .iter()
+            .filter_map(|(id, action)| predicate(action).then_some(*id))
+            .collect();
+        for id in ids {
+            self.actions.remove(&id);
+            let _ = self.action_queue.cancel(id);
+            if let Some(shared_id) = self.shared_actions.remove(&id) {
+                let _ = self.shared_state.complete_action(
+                    shared_id,
+                    EngineActionResult::Failed(CdpFailure::StaleAction(shared_id)),
+                );
+            }
+        }
     }
 
     fn target_info(target: &Target) -> Value {

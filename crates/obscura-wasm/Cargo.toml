@@ -20,6 +20,7 @@ crate-type = ["cdylib", "rlib"]
 base64 = { workspace = true }
 html5ever = { workspace = true }
 js-sys = "0.3"
+obscura-cdp = { workspace = true, default-features = false, features = ["portable"] }
 obscura-dom = { workspace = true }
 obscura-platform = { workspace = true }
 obscura-render = { workspace = true, optional = true }

@@ -137,6 +137,12 @@ Never edit, delete, stage or commit it.
 
 ## Completion boundary
 
+Final CDP consolidation is specified in
+`18-reuse-obscura-cdp-in-wasm.md`. It supersedes maintaining the current
+second `PortableCdp` implementation: the existing `crates/obscura-cdp` domain
+logic becomes the shared portable dispatcher, while npm retains only transport
+and typed host-action execution.
+
 The migration is complete only when all of the following are simultaneously
 true:
 
@@ -207,6 +213,7 @@ R: resource discovery checkpoint
 | H | `13-security-performance.md` | continuous; final after C3 |
 | V | `14-final-verification-release.md` | all implementation packets |
 | A | `15-multi-agent-operating-guide.md` | use for every delegation |
+| C3R | `18-reuse-obscura-cdp-in-wasm.md` | begin with C3.0 parity corpus |
 
 ## Repository-wide rules for every packet
 

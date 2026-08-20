@@ -19,7 +19,7 @@ render = ["obscura-browser/render", "obscura-cdp/render", "obscura-mcp/render"]
 [dependencies]
 obscura-browser = { workspace = true }
 obscura-mcp = { workspace = true }
-obscura-cdp = { workspace = true }
+obscura-cdp = { workspace = true, features = ["native-server"] }
 obscura-dom = { workspace = true }
 obscura-net = { workspace = true }
 obscura-js = { workspace = true }
