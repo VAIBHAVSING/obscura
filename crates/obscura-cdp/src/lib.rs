@@ -1,6 +1,7 @@
 pub mod action;
 pub mod engine;
 pub mod protocol;
+pub mod portable_target;
 pub mod state;
 
 // `server` is the legacy native TCP/WebSocket transport. Keep it out of the
@@ -16,6 +17,12 @@ pub mod dispatch;
 pub mod types;
 #[cfg(feature = "native-engine")]
 pub mod domains;
+// `domains::browser` is stateless and can be shared by the portable adapter.
+// Keep the full native domain tree behind `native-engine`, but expose this
+// one source file without pulling Page/V8/Tokio into the WASM graph.
+#[cfg(any(feature = "native-engine", feature = "portable"))]
+#[path = "domains/browser.rs"]
+pub mod portable_browser;
 #[cfg(feature = "native-engine")]
 pub mod cookie_params;
 #[cfg(feature = "native-engine")]

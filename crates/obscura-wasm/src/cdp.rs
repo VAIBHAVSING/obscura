@@ -523,6 +523,20 @@ impl PortableCdp {
                 }
             }
         }
+        if action.kind == "navigate" || action.kind == "reload" || action.kind == "setDocumentContent" {
+            if let (Some(shared_page), Some(target)) = (
+                self.shared_pages.get(&action.target_id).copied(),
+                self.targets.get(&action.target_id),
+            ) {
+                let _ = self.shared_state.update_page(
+                    &shared_page,
+                    Some(&target.url),
+                    Some(&target.title),
+                    Some(&target.loader_id),
+                    Some(u64::from(target.revision)),
+                );
+            }
+        }
         let mut network_metadata = None;
         if let Value::Object(ref mut object) = result {
             network_metadata = object.remove("__obscuraNetwork");
@@ -1073,6 +1087,14 @@ impl PortableCdp {
 
     fn dispatch_browser(&mut self, connection_id: u32, request: Request) -> Value {
         let session = request.session_id.as_deref();
+        if matches!(
+            request.method.as_str(),
+            "Browser.getVersion" | "Target.getBrowserContexts" | "Target.getTargets"
+        ) {
+            if let Some(shared_response) = self.shared_read_only_target_response(&request) {
+                return shared_response;
+            }
+        }
         match request.method.as_str() {
             "Browser.getVersion" => cdp_result_response(
                 &request.id,
@@ -1209,6 +1231,18 @@ impl PortableCdp {
             }
             _ => cdp_error_response(&request.id, -32601, "method is not implemented", session),
         }
+    }
+
+    fn shared_read_only_target_response(&mut self, request: &Request) -> Option<Value> {
+        let id = request.id.as_u64()?;
+        let shared_request = obscura_cdp::protocol::CdpRequest {
+            id,
+            method: request.method.clone(),
+            params: Value::Object(request.params.clone()),
+            session_id: request.session_id.clone(),
+        };
+        let response = obscura_cdp::portable_target::dispatch(&shared_request, &mut self.shared_state);
+        serde_json::to_value(response).ok()
     }
 
     fn dispatch_page(&mut self, connection_id: u32, target_id: String, session_id: Option<String>, request: Request) -> Value {

@@ -194,6 +194,35 @@ impl BrowserState {
         self.actions.len()
     }
 
+    /// Update target metadata after a host navigation or document commit.
+    /// The identity remains stable while the document generation advances.
+    pub fn update_page(
+        &mut self,
+        id: &PageId,
+        url: Option<&str>,
+        title: Option<&str>,
+        loader_id: Option<&str>,
+        document_generation: Option<u64>,
+    ) -> Result<(), CdpFailure> {
+        if let Some(url) = url {
+            Self::validate_url(url)?;
+        }
+        let page = self.pages.get_mut(id).ok_or(CdpFailure::UnknownPage(*id))?;
+        if let Some(url) = url {
+            page.url = url.to_string();
+        }
+        if let Some(title) = title {
+            page.title = title.to_string();
+        }
+        if let Some(loader_id) = loader_id {
+            page.loader_id = loader_id.to_string();
+        }
+        if let Some(document_generation) = document_generation {
+            page.document_generation = document_generation;
+        }
+        Ok(())
+    }
+
     pub fn open_connection(&mut self) -> Result<ConnectionId, CdpFailure> {
         self.ensure_open()?;
         if self.connections.len() >= MAX_CONNECTIONS {
@@ -245,6 +274,10 @@ impl BrowserState {
 
     pub fn attached_page(&self, id: SessionId) -> Option<PageId> {
         self.sessions.get(&id).copied()
+    }
+
+    pub fn page_is_attached(&self, id: PageId) -> bool {
+        self.sessions.values().any(|page| *page == id)
     }
 
     pub fn close(&mut self) {
