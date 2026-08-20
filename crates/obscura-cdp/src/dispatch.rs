@@ -89,7 +89,7 @@ pub struct CdpContext {
     // chunk-by-chunk via IO.read and freed on IO.close (issue #360). The store
     // caps how many bodies (and how many bytes) can be held at once, evicting
     // the oldest, so an abandoned or disconnected stream cannot leak unbounded.
-    pub io_streams: crate::domains::io::IoStreamStore,
+    pub io_streams: crate::io::IoStreamStore,
     /// Serializes V8 work within THIS connection. With the thread-per-connection
     /// server (#430) each connection runs on its own OS thread, so isolates never
     /// collide across connections; this per-connection lock keeps a connection's
@@ -172,7 +172,7 @@ impl CdpContext {
             isolated_worlds: Vec::new(),
             valid_context_ids,
             next_isolated_context_id: 100,
-            io_streams: crate::domains::io::IoStreamStore::default(),
+            io_streams: crate::io::IoStreamStore::default(),
             v8_lock: Arc::new(tokio::sync::Mutex::new(())),
         }
     }

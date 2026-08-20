@@ -166,12 +166,6 @@ struct Action {
     kind: String,
 }
 
-struct Stream {
-    connection_id: u32,
-    data: Vec<u8>,
-    offset: usize,
-}
-
 struct ResponseBody {
     body: String,
     base64_encoded: bool,
@@ -262,8 +256,8 @@ pub struct PortableCdp {
     next_target_id: u32,
     next_session_id: u32,
     next_loader_id: u32,
-    streams: BTreeMap<String, Stream>,
-    next_stream_id: u32,
+    streams: obscura_cdp::io::IoStreamStore,
+    stream_connections: BTreeMap<String, u32>,
     fetch_resolutions: VecDeque<Value>,
 }
 
@@ -322,8 +316,8 @@ impl PortableCdp {
             next_target_id: 1,
             next_session_id: 0,
             next_loader_id: 0,
-            streams: BTreeMap::new(),
-            next_stream_id: 0,
+            streams: obscura_cdp::io::IoStreamStore::with_limits(128, MAX_STREAM_BYTES),
+            stream_connections: BTreeMap::new(),
             fetch_resolutions: VecDeque::new(),
         })
     }
@@ -345,13 +339,11 @@ impl PortableCdp {
                 "CDP stream data exceeds the {MAX_STREAM_BYTES}-byte limit"
             )));
         }
-        let id = self
-            .next_stream_id
-            .checked_add(1)
-            .ok_or_else(|| js_error("CDP stream ID space is exhausted"))?;
-        self.next_stream_id = id;
-        let handle = format!("portable-stream-{id}");
-        self.streams.insert(handle.clone(), Stream { connection_id, data, offset: 0 });
+        let handle = self
+            .streams
+            .insert(data)
+            .map_err(|error| js_error(&error))?;
+        self.stream_connections.insert(handle.clone(), connection_id);
         Ok(handle)
     }
 
@@ -405,8 +397,15 @@ impl PortableCdp {
             self.shared_state.close_connection(shared_id);
         }
         self.cancel_actions_where(|action| action.connection_id == connection_id);
-        self.streams
-            .retain(|_, stream| stream.connection_id != connection_id);
+        let owned: Vec<String> = self
+            .stream_connections
+            .iter()
+            .filter_map(|(handle, owner)| (*owner == connection_id).then_some(handle.clone()))
+            .collect();
+        for handle in owned {
+            self.stream_connections.remove(&handle);
+            self.streams.remove(&handle);
+        }
         Ok(())
     }
 
@@ -1653,26 +1652,24 @@ impl PortableCdp {
                 let size = usize::try_from(requested)
                     .unwrap_or(MAX_STREAM_CHUNK_BYTES)
                     .min(MAX_STREAM_CHUNK_BYTES);
-                let Some(stream) = self.streams.get_mut(handle) else {
-                    return cdp_error_response(&request.id, -32000, "Invalid stream handle", session);
-                };
-                if stream.connection_id != connection_id {
+                if self.stream_connections.get(handle) != Some(&connection_id) {
                     return cdp_error_response(&request.id, -32000, "Invalid stream handle", session);
                 }
                 let offset = request
                     .params
                     .get("offset")
                     .and_then(Value::as_u64)
-                    .and_then(|value| usize::try_from(value).ok())
-                    .unwrap_or(stream.offset);
-                if offset > stream.data.len() {
-                    return cdp_error_response(&request.id, -32602, "stream offset is out of range", session);
+                    .and_then(|value| usize::try_from(value).ok());
+                if let Some(offset) = offset {
+                    if self.streams.byte_len(handle).is_none_or(|length| offset > length) {
+                        return cdp_error_response(&request.id, -32602, "stream offset is out of range", session);
+                    }
                 }
-                let end = offset.saturating_add(size).min(stream.data.len());
-                let data = BASE64.encode(&stream.data[offset..end]);
-                stream.offset = end;
-                let eof = end >= stream.data.len();
+                let Some((data, eof)) = self.streams.read(handle, offset, size) else {
+                    return cdp_error_response(&request.id, -32000, "Invalid stream handle", session);
+                };
                 if eof {
+                    self.stream_connections.remove(handle);
                     self.streams.remove(handle);
                 }
                 cdp_result_response(
@@ -1685,11 +1682,8 @@ impl PortableCdp {
                 let Some(handle) = request.params.get("handle").and_then(Value::as_str) else {
                     return cdp_error_response(&request.id, -32602, "handle is required", session);
                 };
-                if self
-                    .streams
-                    .get(handle)
-                    .is_some_and(|stream| stream.connection_id == connection_id)
-                {
+                if self.stream_connections.get(handle) == Some(&connection_id) {
+                    self.stream_connections.remove(handle);
                     self.streams.remove(handle);
                 }
                 cdp_result_response(&request.id, json!({}), session)
