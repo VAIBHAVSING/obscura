@@ -1089,6 +1089,10 @@ impl PortableCdp {
         if matches!(
             request.method.as_str(),
             "Browser.getVersion"
+                | "Browser.getWindowForTarget"
+                | "Browser.getWindowBounds"
+                | "Browser.setWindowBounds"
+                | "Browser.setDownloadBehavior"
                 | "Target.getBrowserContexts"
                 | "Target.getTargets"
                 | "Target.createBrowserContext"

@@ -65,16 +65,21 @@ fn wire_page(id: PageId) -> String {
 /// until their own target-neutral cutover packet lands.
 pub fn dispatch(request: &CdpRequest, state: &mut BrowserState) -> CdpResponse {
     match request.method.as_str() {
-        "Browser.getVersion" => CdpResponse::success(
-            request.id,
-            crate::portable_browser::handle_portable(
-                "getVersion",
+        "Browser.getVersion"
+        | "Browser.getWindowForTarget"
+        | "Browser.getWindowBounds"
+        | "Browser.setWindowBounds"
+        | "Browser.setDownloadBehavior" => {
+            let method = request.method.strip_prefix("Browser.").unwrap_or_default();
+            match crate::portable_browser::handle_portable(
+                method,
                 &request.params,
                 crate::portable_browser::BrowserIdentity::wasm(),
-            )
-            .unwrap_or_else(|error| json!({"error": error})),
-            request.session_id.clone(),
-        ),
+            ) {
+                Ok(result) => CdpResponse::success(request.id, result, request.session_id.clone()),
+                Err(message) => error(request, -32601, message),
+            }
+        }
         "Target.getBrowserContexts" => {
             let ids: Vec<String> = state
                 .contexts()
@@ -166,7 +171,15 @@ mod tests {
         let mut state = BrowserState::new();
         let version = dispatch(&request(1, "Browser.getVersion", json!({})), &mut state);
         assert_eq!(version.result.unwrap()["product"], "Obscura/WASM");
-        let created = dispatch(&request(2, "Target.createBrowserContext", json!({})), &mut state);
+        for (id, method) in [
+            (2, "Browser.getWindowForTarget"),
+            (3, "Browser.getWindowBounds"),
+            (4, "Browser.setWindowBounds"),
+            (5, "Browser.setDownloadBehavior"),
+        ] {
+            assert!(dispatch(&request(id, method, json!({})), &mut state).error.is_none(), "{method}");
+        }
+        let created = dispatch(&request(6, "Target.createBrowserContext", json!({})), &mut state);
         let context = created.result.unwrap()["browserContextId"].as_str().unwrap().to_string();
         assert_eq!(context, "context-2");
         let listed = dispatch(&request(3, "Target.getBrowserContexts", json!({})), &mut state);
