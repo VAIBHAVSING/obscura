@@ -3001,3 +3001,116 @@ mod tests {
         assert_eq!(events[0]["params"]["sessionId"], session);
     }
 }
+
+/// Make the existing portable dispatcher usable through the shared CDP
+/// engine contract. The wire-facing methods above remain stable for current
+/// hosts; this adapter is the cutover seam for the future shared domain
+/// dispatcher and keeps browser identity/action ownership in `obscura-cdp`.
+impl CdpEngine for PortableCdp {
+    fn create_context(&mut self, options: ContextOptions) -> Result<ContextId, CdpFailure> {
+        let id = self.shared_state.create_context(options)?;
+        let wire_id = format!("context-{}", id.get());
+        self.shared_contexts.insert(wire_id.clone(), id);
+        self.contexts.insert(wire_id);
+        Ok(id)
+    }
+
+    fn dispose_context(&mut self, id: &ContextId) -> Result<(), CdpFailure> {
+        let wire_id = self
+            .shared_contexts
+            .iter()
+            .find_map(|(wire_id, shared_id)| (shared_id == id).then_some(wire_id.clone()))
+            .ok_or(CdpFailure::UnknownContext(*id))?;
+        if wire_id == "default" {
+            return Err(CdpFailure::invalid_argument("default context cannot be disposed"));
+        }
+        let doomed: Vec<String> = self
+            .targets
+            .values()
+            .filter(|target| target.context_id == wire_id)
+            .map(|target| target.id.clone())
+            .collect();
+        self.shared_state.dispose_context(id)?;
+        self.contexts.remove(&wire_id);
+        self.shared_contexts.remove(&wire_id);
+        for target_id in doomed {
+            self.destroy_target(&target_id);
+        }
+        Ok(())
+    }
+
+    fn create_page(&mut self, context: &ContextId, url: &str) -> Result<PageId, CdpFailure> {
+        let wire_context = self
+            .shared_contexts
+            .iter()
+            .find_map(|(wire_id, shared_id)| (shared_id == context).then_some(wire_id.clone()))
+            .ok_or(CdpFailure::UnknownContext(*context))?;
+        let wire_page = self.create_target(&wire_context, url, "");
+        self.shared_pages
+            .get(&wire_page)
+            .copied()
+            .ok_or_else(|| CdpFailure::UnknownPage(PageId::new(0)))
+    }
+
+    fn close_page(&mut self, page: &PageId) -> Result<(), CdpFailure> {
+        let wire_page = self
+            .shared_pages
+            .iter()
+            .find_map(|(wire_id, shared_id)| (shared_id == page).then_some(wire_id.clone()))
+            .ok_or(CdpFailure::UnknownPage(*page))?;
+        if !self.targets.contains_key(&wire_page) {
+            return Err(CdpFailure::UnknownPage(*page));
+        }
+        self.destroy_target(&wire_page);
+        Ok(())
+    }
+
+    fn page_snapshot(&self, page: &PageId) -> Result<obscura_cdp::engine::PageSnapshot, CdpFailure> {
+        let wire_page = self
+            .shared_pages
+            .iter()
+            .find_map(|(wire_id, shared_id)| (shared_id == page).then_some(wire_id))
+            .ok_or(CdpFailure::UnknownPage(*page))?;
+        let target = self.targets.get(wire_page).ok_or(CdpFailure::UnknownPage(*page))?;
+        let context_id = self
+            .shared_contexts
+            .get(&target.context_id)
+            .copied()
+            .ok_or_else(|| CdpFailure::UnknownContext(ContextId::new(0)))?;
+        Ok(obscura_cdp::engine::PageSnapshot {
+            page_id: *page,
+            context_id,
+            url: target.url.clone(),
+            title: target.title.clone(),
+            frame_id: target.frame_id.clone(),
+            loader_id: target.loader_id.clone(),
+            document_generation: u64::from(target.revision),
+        })
+    }
+
+    fn start_action(&mut self, action: EngineAction) -> Result<EngineActionId, CdpFailure> {
+        self.shared_state.start_action(action)
+    }
+
+    fn complete_action(&mut self, id: EngineActionId, result: EngineActionResult) -> Result<(), CdpFailure> {
+        self.shared_state.complete_action(id, result)
+    }
+}
+
+#[cfg(test)]
+mod shared_engine_tests {
+    use super::*;
+
+    #[test]
+    fn shared_engine_adapter_owns_page_lifecycle() {
+        let mut cdp = PortableCdp::new("").unwrap();
+        let context = ContextId::new(1);
+        let page = CdpEngine::create_page(&mut cdp, &context, "https://example.test/").unwrap();
+        let snapshot = CdpEngine::page_snapshot(&cdp, &page).unwrap();
+        assert_eq!(snapshot.page_id, page);
+        assert_eq!(snapshot.context_id, context);
+        assert_eq!(snapshot.url, "https://example.test/");
+        CdpEngine::close_page(&mut cdp, &page).unwrap();
+        assert_eq!(CdpEngine::page_snapshot(&cdp, &page), Err(CdpFailure::UnknownPage(page)));
+    }
+}
