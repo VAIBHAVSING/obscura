@@ -1088,9 +1088,14 @@ impl PortableCdp {
         let session = request.session_id.as_deref();
         if matches!(
             request.method.as_str(),
-            "Browser.getVersion" | "Target.getBrowserContexts" | "Target.getTargets"
+            "Browser.getVersion"
+                | "Target.getBrowserContexts"
+                | "Target.getTargets"
+                | "Target.createBrowserContext"
+                | "Target.disposeBrowserContext"
+                | "Target.closeTarget"
         ) {
-            if let Some(shared_response) = self.shared_read_only_target_response(&request) {
+            if let Some(shared_response) = self.shared_target_response(&request) {
                 return shared_response;
             }
         }
@@ -1232,7 +1237,7 @@ impl PortableCdp {
         }
     }
 
-    fn shared_read_only_target_response(&mut self, request: &Request) -> Option<Value> {
+    fn shared_target_response(&mut self, request: &Request) -> Option<Value> {
         let id = request.id.as_u64()?;
         let shared_request = obscura_cdp::protocol::CdpRequest {
             id,
@@ -1241,6 +1246,61 @@ impl PortableCdp {
             session_id: request.session_id.clone(),
         };
         let response = obscura_cdp::portable_target::dispatch(&shared_request, &mut self.shared_state);
+        if response.error.is_none() {
+            match request.method.as_str() {
+                "Target.createBrowserContext" => {
+                    if let Some(id) = response
+                        .result
+                        .as_ref()
+                        .and_then(|value| value.get("browserContextId"))
+                        .and_then(Value::as_str)
+                    {
+                        if let Some(shared_id) = id
+                            .strip_prefix("context-")
+                            .and_then(|value| value.parse::<u64>().ok())
+                            .map(ContextId::new)
+                        {
+                            self.shared_contexts.insert(id.to_string(), shared_id);
+                            self.contexts.insert(id.to_string());
+                        }
+                    }
+                }
+                "Target.disposeBrowserContext" => {
+                    let context_id = request.params.get("browserContextId").and_then(Value::as_str);
+                    let doomed: Vec<String> = context_id
+                        .filter(|id| *id != "default")
+                        .map(|id| {
+                            self.targets
+                                .values()
+                                .filter(|target| target.context_id == id)
+                                .map(|target| target.id.clone())
+                                .collect()
+                        })
+                        .unwrap_or_default();
+                    if let Some(id) = context_id {
+                        self.contexts.remove(id);
+                        self.shared_contexts.remove(id);
+                    }
+                    for target_id in doomed {
+                        self.destroy_target(&target_id);
+                    }
+                }
+                "Target.closeTarget" => {
+                    if response
+                        .result
+                        .as_ref()
+                        .and_then(|value| value.get("success"))
+                        .and_then(Value::as_bool)
+                        == Some(true)
+                    {
+                        if let Some(target_id) = request.params.get("targetId").and_then(Value::as_str) {
+                            self.destroy_target(target_id);
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
         serde_json::to_value(response).ok()
     }
 
