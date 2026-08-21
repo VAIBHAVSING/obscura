@@ -5,9 +5,10 @@
 //! and the future WASM dispatcher can use while a host remains responsible for
 //! transport and asynchronous actions.
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
 
 use crate::engine::{
     ActionId, ActionResult, CdpEngine, CdpFailure, ContextId, ContextOptions, EngineAction,
@@ -28,6 +29,10 @@ pub const MAX_NETWORK_RESPONSE_WIRE_BYTES: usize = MAX_NETWORK_RESPONSE_BODY_BYT
 pub const MAX_NETWORK_REQUEST_ID_BYTES: usize = 256;
 pub const MAX_NETWORK_HEADERS: usize = 256;
 pub const MAX_NETWORK_HEADER_BYTES: usize = 64 * 1024;
+pub const MAX_FETCH_PATTERNS: usize = 64;
+pub const MAX_FETCH_PATTERN_BYTES: usize = 2048;
+pub const MAX_FETCH_REQUESTS: usize = 256;
+pub const MAX_FETCH_RESOLUTIONS: usize = 256;
 pub const DEFAULT_VIEWPORT_WIDTH: u32 = 800;
 pub const DEFAULT_VIEWPORT_HEIGHT: u32 = 600;
 pub const MAX_VIEWPORT_DIMENSION: u32 = 4096;
@@ -114,6 +119,8 @@ pub struct PageNetworkState {
     pub cache_disabled: bool,
     pub extra_headers: BTreeMap<String, String>,
     pub response_bodies: BTreeMap<String, NetworkResponseBody>,
+    pub fetch_patterns: BTreeMap<SessionId, Vec<FetchPatternState>>,
+    pub paused_requests: BTreeSet<String>,
     response_body_order: BTreeMap<u64, String>,
     response_body_bytes: usize,
     next_response_order: u64,
@@ -123,6 +130,12 @@ pub struct PageNetworkState {
 pub struct NetworkResponseBody {
     pub body: String,
     pub base64_encoded: bool,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct FetchPatternState {
+    pub url_pattern: String,
+    pub request_stage: String,
 }
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
@@ -192,6 +205,7 @@ pub struct BrowserState {
     contexts: BTreeMap<ContextId, ContextState>,
     pages: BTreeMap<PageId, PageState>,
     display: BTreeMap<PageId, PageDisplayState>,
+    fetch_resolutions: BTreeMap<PageId, VecDeque<Value>>,
     connections: BTreeSet<ConnectionId>,
     sessions: BTreeMap<SessionId, PageId>,
     session_connections: BTreeMap<SessionId, ConnectionId>,
@@ -228,6 +242,7 @@ impl BrowserState {
             contexts,
             pages: BTreeMap::new(),
             display: BTreeMap::new(),
+            fetch_resolutions: BTreeMap::new(),
             connections: BTreeSet::new(),
             sessions: BTreeMap::new(),
             session_connections: BTreeMap::new(),
@@ -288,6 +303,13 @@ impl BrowserState {
 
     pub fn display_state(&self, id: &PageId) -> Option<&PageDisplayState> {
         self.display.get(id)
+    }
+
+    pub fn context_for_page(&self, id: &PageId) -> Result<ContextId, CdpFailure> {
+        self.pages
+            .get(id)
+            .map(|page| page.context_id)
+            .ok_or(CdpFailure::UnknownPage(*id))
     }
 
     pub fn set_device_metrics(
@@ -461,6 +483,117 @@ impl BrowserState {
         Ok(())
     }
 
+    pub fn set_fetch_patterns(
+        &mut self,
+        page: &PageId,
+        session: SessionId,
+        patterns: Vec<FetchPatternState>,
+    ) -> Result<(), CdpFailure> {
+        if patterns.is_empty() || patterns.len() > MAX_FETCH_PATTERNS {
+            return Err(CdpFailure::invalid_argument("Fetch patterns exceed the item limit"));
+        }
+        if patterns.iter().any(|pattern| {
+            pattern.url_pattern.len() > MAX_FETCH_PATTERN_BYTES
+                || !matches!(pattern.request_stage.as_str(), "Request" | "Response")
+        }) {
+            return Err(CdpFailure::invalid_argument("Fetch pattern is invalid"));
+        }
+        let page = self.pages.get_mut(page).ok_or(CdpFailure::UnknownPage(*page))?;
+        page.network.fetch_patterns.insert(session, patterns);
+        Ok(())
+    }
+
+    pub fn fetch_patterns(&self, page: &PageId, session: SessionId) -> Option<&[FetchPatternState]> {
+        self.pages
+            .get(page)
+            .and_then(|page| page.network.fetch_patterns.get(&session))
+            .map(Vec::as_slice)
+    }
+
+    pub fn clear_fetch_patterns(&mut self, page: &PageId, session: SessionId) -> Result<(), CdpFailure> {
+        let continue_all = {
+            let page_state = self.pages.get_mut(page).ok_or(CdpFailure::UnknownPage(*page))?;
+            page_state.network.fetch_patterns.remove(&session);
+            page_state.network.fetch_patterns.is_empty()
+        };
+        if !continue_all {
+            return Ok(());
+        }
+        let paused: Vec<String> = self
+            .pages
+            .get(page)
+            .map(|page| page.network.paused_requests.iter().cloned().collect())
+            .unwrap_or_default();
+        for request_id in paused {
+            self.queue_fetch_resolution(
+                page,
+                request_id.clone(),
+                serde_json::json!({"requestId": request_id, "action": "continue"}),
+            )?;
+        }
+        Ok(())
+    }
+
+    pub fn register_paused_request(&mut self, page: &PageId, request_id: &str) -> Result<(), CdpFailure> {
+        if request_id.is_empty() || request_id.len() > MAX_NETWORK_REQUEST_ID_BYTES {
+            return Err(CdpFailure::invalid_argument("Fetch requestId is invalid"));
+        }
+        let page = self.pages.get_mut(page).ok_or(CdpFailure::UnknownPage(*page))?;
+        if page.network.paused_requests.len() >= MAX_FETCH_REQUESTS
+            && !page.network.paused_requests.contains(request_id)
+        {
+            return Err(CdpFailure::ActionQueueFull);
+        }
+        page.network.paused_requests.insert(request_id.to_string());
+        Ok(())
+    }
+
+    pub fn cancel_paused_request(&mut self, page: &PageId, request_id: &str) -> Result<(), CdpFailure> {
+        let page = self.pages.get_mut(page).ok_or(CdpFailure::UnknownPage(*page))?;
+        page.network.paused_requests.remove(request_id);
+        Ok(())
+    }
+
+    pub fn queue_fetch_resolution(
+        &mut self,
+        page: &PageId,
+        request_id: String,
+        resolution: Value,
+    ) -> Result<bool, CdpFailure> {
+        let was_paused = {
+            let page_state = self.pages.get_mut(page).ok_or(CdpFailure::UnknownPage(*page))?;
+            page_state.network.paused_requests.remove(&request_id)
+        };
+        if !was_paused {
+            return Ok(false);
+        }
+        let queue = self.fetch_resolutions.entry(*page).or_default();
+        if queue.len() >= MAX_FETCH_RESOLUTIONS {
+            if let Some(page_state) = self.pages.get_mut(page) {
+                page_state.network.paused_requests.insert(request_id);
+            }
+            return Err(CdpFailure::ActionQueueFull);
+        }
+        queue.push_back(resolution);
+        Ok(true)
+    }
+
+    pub fn drain_fetch_resolutions(&mut self, page: &PageId, max_items: usize) -> Vec<Value> {
+        let Some(queue) = self.fetch_resolutions.get_mut(page) else {
+            return Vec::new();
+        };
+        let count = max_items.min(queue.len());
+        let values: Vec<Value> = queue.drain(..count).collect();
+        if queue.is_empty() {
+            self.fetch_resolutions.remove(page);
+        }
+        values
+    }
+
+    pub fn fetch_resolution_count(&self) -> usize {
+        self.fetch_resolutions.values().map(VecDeque::len).sum()
+    }
+
     /// Update target metadata after a host navigation or document commit.
     /// The identity remains stable while the document generation advances.
     pub fn update_page(
@@ -540,6 +673,7 @@ impl BrowserState {
             if let Some(page) = self.pages.get_mut(&page_id) {
                 page.network.enabled_sessions.remove(&id);
             }
+            let _ = self.clear_fetch_patterns(&page_id, id);
         }
         page
     }
@@ -557,6 +691,7 @@ impl BrowserState {
         self.contexts.clear();
         self.pages.clear();
         self.display.clear();
+        self.fetch_resolutions.clear();
         self.connections.clear();
         self.sessions.clear();
         self.session_connections.clear();
@@ -602,6 +737,7 @@ impl BrowserState {
             return Err(CdpFailure::UnknownPage(id));
         }
         self.display.remove(&id);
+        self.fetch_resolutions.remove(&id);
         self.sessions.retain(|_, page| *page != id);
         let live_sessions: BTreeSet<SessionId> = self.sessions.keys().copied().collect();
         self.session_connections.retain(|session, _| live_sessions.contains(session));

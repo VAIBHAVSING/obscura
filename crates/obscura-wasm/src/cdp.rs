@@ -386,8 +386,10 @@ impl PortableCdp {
                     target.sessions.remove(&session_id);
                     target.network_enabled_sessions.remove(&session_id);
                     target.fetch_patterns.remove(&session_id);
+                    if target.fetch_patterns.is_empty() {
+                        target.paused_fetches.clear();
+                    }
                 }
-                let _ = self.disable_fetch_for_session(target_id, &session_id);
             }
             if let Some(shared_session) = self.shared_sessions.remove(&session_id) {
                 self.shared_state.detach(shared_session);
@@ -610,6 +612,14 @@ impl PortableCdp {
     #[wasm_bindgen(js_name = drainFetchResolutions)]
     pub fn drain_fetch_resolutions_json(&mut self) -> Result<String, JsValue> {
         let mut resolutions = Vec::new();
+        let shared_pages: Vec<PageId> = self.shared_pages.values().copied().collect();
+        for page_id in shared_pages {
+            let remaining = MAX_FETCH_RESOLUTIONS.saturating_sub(resolutions.len());
+            if remaining == 0 {
+                break;
+            }
+            resolutions.extend(self.shared_state.drain_fetch_resolutions(&page_id, remaining));
+        }
         while let Some(resolution) = self.fetch_resolutions.pop_front() {
             resolutions.push(resolution);
         }
@@ -661,6 +671,11 @@ impl PortableCdp {
     pub fn cancel_fetch_request_json(&mut self, target_id: &str, request_id: &str) -> Result<(), JsValue> {
         bounded(target_id, MAX_METHOD_BYTES, "CDP target ID")?;
         bounded(request_id, MAX_METHOD_BYTES, "Fetch request ID")?;
+        if let Some(shared_page) = self.shared_pages.get(target_id).copied() {
+            self.shared_state
+                .cancel_paused_request(&shared_page, request_id)
+                .map_err(|error| js_error(&format!("portable Fetch target is not known: {error}")))?;
+        }
         if let Some(target) = self.targets.get_mut(target_id) {
             target.paused_fetches.remove(request_id);
         }
@@ -705,7 +720,7 @@ impl PortableCdp {
             "responseBodies": self.targets.values().map(|target| target.response_bodies.len()).sum::<usize>(),
             "fetchPatternLimit": MAX_FETCH_PATTERNS,
             "fetchPausedRequestLimit": MAX_FETCH_REQUESTS,
-            "fetchResolutionQueue": self.fetch_resolutions.len(),
+            "fetchResolutionQueue": self.fetch_resolutions.len() + self.shared_state.fetch_resolution_count(),
         })
         .to_string()
     }
@@ -935,6 +950,11 @@ impl PortableCdp {
             .collect();
         if matching_sessions.is_empty() {
             return Ok(json!({"paused": false, "requestId": request_id}));
+        }
+        if let Some(shared_page) = shared_page {
+            self.shared_state
+                .register_paused_request(&shared_page, request_id)
+                .map_err(|error| js_error(&format!("portable Fetch paused-request state failed: {error}")))?;
         }
         let paused = PausedFetch {
             request_id: request_id.to_string(),
@@ -1513,7 +1533,62 @@ impl PortableCdp {
         serde_json::to_value(response).ok()
     }
 
+    fn shared_fetch_response(&mut self, request: &Request, target_id: &str) -> Option<Value> {
+        if !obscura_cdp::portable_fetch::supports(&request.method) {
+            return None;
+        }
+        let id = request.id.as_u64()?;
+        let page_id = *self.shared_pages.get(target_id)?;
+        let shared_session = request
+            .session_id
+            .as_ref()
+            .and_then(|session| self.shared_sessions.get(session).copied());
+        let shared_request = obscura_cdp::protocol::CdpRequest {
+            id,
+            method: request.method.clone(),
+            params: Value::Object(request.params.clone()),
+            session_id: request.session_id.clone(),
+        };
+        let response = obscura_cdp::portable_fetch::dispatch(
+            &shared_request,
+            &mut self.shared_state,
+            page_id,
+            shared_session,
+        );
+        if response.error.is_none() {
+            if let Some(target) = self.targets.get_mut(target_id) {
+                match request.method.as_str() {
+                    "Fetch.enable" => {
+                        if let Some(session_id) = request.session_id.as_ref() {
+                            if let Ok(patterns) = parse_fetch_patterns(&request.params) {
+                                target.fetch_patterns.insert(session_id.clone(), patterns);
+                            }
+                        }
+                    }
+                    "Fetch.disable" => {
+                        if let Some(session_id) = request.session_id.as_ref() {
+                            target.fetch_patterns.remove(session_id);
+                        }
+                        if target.fetch_patterns.is_empty() {
+                            target.paused_fetches.clear();
+                        }
+                    }
+                    "Fetch.continueRequest" | "Fetch.fulfillRequest" | "Fetch.failRequest" => {
+                        if let Some(request_id) = request.params.get("requestId").and_then(Value::as_str) {
+                            target.paused_fetches.remove(request_id);
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
+        serde_json::to_value(response).ok()
+    }
+
     fn dispatch_page(&mut self, connection_id: u32, target_id: String, session_id: Option<String>, request: Request) -> Value {
+        if let Some(shared_response) = self.shared_fetch_response(&request, &target_id) {
+            return shared_response;
+        }
         if let Some(shared_response) = self.shared_emulation_response(&request, &target_id) {
             return shared_response;
         }
@@ -2388,11 +2463,13 @@ impl PortableCdp {
             target.sessions.remove(session_id);
             target.network_enabled_sessions.remove(session_id);
             target.fetch_patterns.remove(session_id);
+            if target.fetch_patterns.is_empty() {
+                target.paused_fetches.clear();
+            }
         }
         if let Some(shared_session) = self.shared_sessions.remove(session_id) {
             self.shared_state.detach(shared_session);
         }
-        let _ = self.disable_fetch_for_session(&target_id, session_id);
         self.cancel_actions_where(|action| {
             action.connection_id == connection_id && action.session_id.as_deref() == Some(session_id)
         });
@@ -2410,7 +2487,41 @@ impl PortableCdp {
 
     fn destroy_target(&mut self, target_id: &str) {
         let Some(target) = self.targets.remove(target_id) else { return; };
-        if let Some(shared_page) = self.shared_pages.remove(target_id) {
+        let shared_page = self.shared_pages.remove(target_id);
+        for request_id in target.paused_fetches.keys() {
+            let queued = shared_page
+                .and_then(|page| {
+                    self.shared_state
+                        .queue_fetch_resolution(
+                            &page,
+                            request_id.clone(),
+                            json!({
+                                "requestId": request_id,
+                                "action": "fail",
+                                "reason": "TargetClosed",
+                            }),
+                        )
+                        .ok()
+                })
+                .unwrap_or(false);
+            if !queued && self.fetch_resolutions.len() < MAX_FETCH_RESOLUTIONS {
+                self.fetch_resolutions.push_back(json!({
+                    "requestId": request_id,
+                    "action": "fail",
+                    "reason": "TargetClosed",
+                }));
+            }
+        }
+        if let Some(shared_page) = shared_page {
+            let pending = self
+                .shared_state
+                .drain_fetch_resolutions(&shared_page, MAX_FETCH_RESOLUTIONS);
+            for resolution in pending {
+                if self.fetch_resolutions.len() >= MAX_FETCH_RESOLUTIONS {
+                    break;
+                }
+                self.fetch_resolutions.push_back(resolution);
+            }
             let _ = self.shared_state.close_page(&shared_page);
         }
         let shared_sessions: Vec<SessionId> = target
@@ -2420,16 +2531,6 @@ impl PortableCdp {
             .collect();
         for shared_session in shared_sessions {
             self.shared_state.detach(shared_session);
-        }
-        for request_id in target.paused_fetches.keys() {
-            if self.fetch_resolutions.len() >= MAX_FETCH_RESOLUTIONS {
-                break;
-            }
-            self.fetch_resolutions.push_back(json!({
-                "requestId": request_id,
-                "action": "fail",
-                "reason": "TargetClosed",
-            }));
         }
         // A target close can arrive while its host operation is in flight.
         // Completing one of those actions must be rejected, not applied to a
@@ -3156,6 +3257,34 @@ mod tests {
         ).unwrap());
         assert_eq!(continued["result"], json!({}));
         assert_eq!(json(&cdp.drain_fetch_resolutions_json().unwrap())[0]["action"], "continue");
+    }
+
+    #[test]
+    fn portable_fetch_target_close_drains_shared_failure_resolution() {
+        let mut cdp = PortableCdp::new("").unwrap();
+        let connection = cdp.open_connection().unwrap();
+        let attached = json(&cdp.cdp_request(
+            connection,
+            r#"{"id":1,"method":"Target.attachToTarget","params":{"targetId":"page-1","flatten":true}}"#,
+        ).unwrap());
+        let session = attached["result"]["sessionId"].as_str().unwrap().to_string();
+        let enabled = json(&cdp.cdp_request(
+            connection,
+            &format!(r#"{{"id":2,"sessionId":"{session}","method":"Fetch.enable"}}"#),
+        ).unwrap());
+        assert_eq!(enabled["result"], json!({}));
+        let paused = json(&cdp.intercept_fetch_request_json(
+            "page-1",
+            r#"{"requestId":"close-me","url":"https://example.test/close","method":"GET","headers":{},"resourceType":"Fetch","frameId":"page-1"}"#,
+        ).unwrap());
+        assert_eq!(paused["paused"], true);
+        assert_eq!(json(&cdp.cdp_request(
+            connection,
+            r#"{"id":3,"method":"Target.closeTarget","params":{"targetId":"page-1"}}"#,
+        ).unwrap())["result"]["success"], true);
+        let resolutions = json(&cdp.drain_fetch_resolutions_json().unwrap());
+        assert_eq!(resolutions[0]["action"], "fail");
+        assert_eq!(resolutions[0]["reason"], "TargetClosed");
     }
 
     #[test]
