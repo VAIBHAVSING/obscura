@@ -1402,7 +1402,7 @@ impl PortableCdp {
         serde_json::to_value(response).ok()
     }
 
-    fn shared_page_response(&self, request: &Request, target_id: &str) -> Option<Value> {
+    fn shared_page_response(&mut self, request: &Request, target_id: &str) -> Option<Value> {
         if !obscura_cdp::portable_page::supports(&request.method) {
             return None;
         }
@@ -1414,7 +1414,7 @@ impl PortableCdp {
             params: Value::Object(request.params.clone()),
             session_id: request.session_id.clone(),
         };
-        let response = obscura_cdp::portable_page::dispatch(&shared_request, &self.shared_state, page_id);
+        let response = obscura_cdp::portable_page::dispatch(&shared_request, &mut self.shared_state, page_id);
         serde_json::to_value(response).ok()
     }
 
@@ -3446,9 +3446,21 @@ mod tests {
         ).unwrap());
         assert_eq!(history["result"]["currentIndex"], 0);
         assert_eq!(history["result"]["entries"].as_array().unwrap().len(), 1);
+        let navigate = json(&cdp.cdp_request(
+            connection,
+            &format!(r#"{{"id":3,"sessionId":"{session}","method":"Page.navigate","params":{{"url":"https://example.test/next"}}}}"#),
+        ).unwrap());
+        let action_id = navigate["result"]["obscuraAction"]["actionId"].as_u64().unwrap() as u32;
+        let _ = cdp.complete_action(action_id, r#"{"url":"https://example.test/next","loaderId":"loader-next","title":"Next"}"#).unwrap();
+        let history = json(&cdp.cdp_request(
+            connection,
+            &format!(r#"{{"id":4,"sessionId":"{session}","method":"Page.getNavigationHistory"}}"#),
+        ).unwrap());
+        assert_eq!(history["result"]["currentIndex"], 1);
+        assert_eq!(history["result"]["entries"].as_array().unwrap().len(), 2);
         let reload = json(&cdp.cdp_request(
             connection,
-            &format!(r#"{{"id":3,"sessionId":"{session}","method":"Page.reload"}}"#),
+            &format!(r#"{{"id":5,"sessionId":"{session}","method":"Page.reload"}}"#),
         ).unwrap());
         assert_eq!(reload["result"]["obscuraAction"]["kind"], "reload");
     }

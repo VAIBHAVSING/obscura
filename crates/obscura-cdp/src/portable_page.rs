@@ -29,15 +29,19 @@ pub fn supports(method: &str) -> bool {
 }
 
 /// Dispatch one metadata-only Page command for a known shared page.
-pub fn dispatch(request: &CdpRequest, state: &BrowserState, page_id: PageId) -> CdpResponse {
+pub fn dispatch(request: &CdpRequest, state: &mut BrowserState, page_id: PageId) -> CdpResponse {
     let Some(page) = state.page(&page_id) else {
         return error(request, -32000, format!("unknown page {page_id}"));
     };
 
     match request.method.as_str() {
-        "Page.enable" | "Page.disable" | "Page.resetNavigationHistory" => {
+        "Page.enable" | "Page.disable" => {
             CdpResponse::success(request.id, json!({}), request.session_id.clone())
         }
+        "Page.resetNavigationHistory" => match state.reset_navigation_history(&page_id) {
+            Ok(()) => CdpResponse::success(request.id, json!({}), request.session_id.clone()),
+            Err(failure) => error(request, -32000, failure.to_string()),
+        },
         "Page.getFrameTree" => CdpResponse::success(
             request.id,
             json!({
@@ -53,20 +57,16 @@ pub fn dispatch(request: &CdpRequest, state: &BrowserState, page_id: PageId) -> 
             }),
             request.session_id.clone(),
         ),
-        "Page.getNavigationHistory" => CdpResponse::success(
-            request.id,
-            json!({
-                "currentIndex": 0,
-                "entries": [{
-                    "id": 1,
-                    "url": page.url,
-                    "userTypedURL": page.url,
-                    "title": page.title,
-                    "transitionType": "typed"
-                }]
-            }),
-            request.session_id.clone(),
-        ),
+        "Page.getNavigationHistory" => {
+            let Some(history) = state.history(&page_id) else {
+                return error(request, -32000, "unknown page history");
+            };
+            CdpResponse::success(
+                request.id,
+                json!({"currentIndex": history.current_index, "entries": history.entries}),
+                request.session_id.clone(),
+            )
+        }
         _ => error(request, -32601, "method is not implemented by portable Page dispatch"),
     }
 }
@@ -96,7 +96,7 @@ mod tests {
 
         let frame = dispatch(
             &request(1, "Page.getFrameTree", Some("page-1-session-1")),
-            &state,
+            &mut state,
             page,
         );
         assert!(frame.error.is_none());
@@ -104,15 +104,27 @@ mod tests {
         assert_eq!(frame.result.as_ref().unwrap()["frameTree"]["frame"]["loaderId"], "loader-7");
         assert_eq!(frame.session_id.as_deref(), Some("page-1-session-1"));
 
-        let history = dispatch(&request(2, "Page.getNavigationHistory", None), &state, page);
+        let history = dispatch(&request(2, "Page.getNavigationHistory", None), &mut state, page);
         assert_eq!(history.result.as_ref().unwrap()["currentIndex"], 0);
         assert_eq!(history.result.as_ref().unwrap()["entries"][0]["title"], "Example");
+        assert_eq!(history.result.as_ref().unwrap()["entries"][0]["userTypedURL"], "https://example.test/path");
+        state
+            .update_page(&page, Some("https://example.test/next"), Some("Next"), None, None)
+            .unwrap();
+        let history = dispatch(&request(3, "Page.getNavigationHistory", None), &mut state, page);
+        assert_eq!(history.result.as_ref().unwrap()["currentIndex"], 1);
+        assert_eq!(history.result.as_ref().unwrap()["entries"].as_array().unwrap().len(), 2);
+        let reset = dispatch(&request(4, "Page.resetNavigationHistory", None), &mut state, page);
+        assert!(reset.error.is_none());
+        let history = dispatch(&request(5, "Page.getNavigationHistory", None), &mut state, page);
+        assert_eq!(history.result.as_ref().unwrap()["currentIndex"], 0);
+        assert_eq!(history.result.as_ref().unwrap()["entries"].as_array().unwrap().len(), 1);
     }
 
     #[test]
     fn unsupported_page_commands_remain_explicit() {
-        let state = BrowserState::new();
-        let response = dispatch(&request(1, "Page.navigate", None), &state, PageId::new(1));
+        let mut state = BrowserState::new();
+        let response = dispatch(&request(1, "Page.navigate", None), &mut state, PageId::new(1));
         assert_eq!(response.error.unwrap().code, -32000);
         assert!(!supports("Page.navigate"));
         assert!(supports("Page.getFrameTree"));

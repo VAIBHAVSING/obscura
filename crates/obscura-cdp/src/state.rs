@@ -35,6 +35,7 @@ pub const MAX_FETCH_REQUESTS: usize = 256;
 pub const MAX_FETCH_RESOLUTIONS: usize = 256;
 pub const MAX_COOKIE_COUNT: usize = 4096;
 pub const MAX_COOKIE_BYTES: usize = 64 * 1024;
+pub const MAX_HISTORY_ENTRIES: usize = 128;
 pub const DEFAULT_VIEWPORT_WIDTH: u32 = 800;
 pub const DEFAULT_VIEWPORT_HEIGHT: u32 = 600;
 pub const MAX_VIEWPORT_DIMENSION: u32 = 4096;
@@ -123,6 +124,23 @@ pub struct PageState {
     pub loader_id: String,
     pub document_generation: u64,
     pub network: PageNetworkState,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PageHistoryEntry {
+    pub id: u64,
+    pub url: String,
+    #[serde(rename = "userTypedURL")]
+    pub user_typed_url: String,
+    pub title: String,
+    pub transition_type: String,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct PageHistoryState {
+    pub current_index: usize,
+    pub entries: Vec<PageHistoryEntry>,
 }
 
 /// Per-page Network policy and response-body state shared by CDP adapters.
@@ -224,6 +242,7 @@ pub struct BrowserState {
     display: BTreeMap<PageId, PageDisplayState>,
     fetch_resolutions: BTreeMap<PageId, VecDeque<Value>>,
     cookies: BTreeMap<ContextId, BTreeMap<(String, String, String), ContextCookieState>>,
+    history: BTreeMap<PageId, PageHistoryState>,
     connections: BTreeSet<ConnectionId>,
     sessions: BTreeMap<SessionId, PageId>,
     session_connections: BTreeMap<SessionId, ConnectionId>,
@@ -262,6 +281,7 @@ impl BrowserState {
             display: BTreeMap::new(),
             fetch_resolutions: BTreeMap::new(),
             cookies: BTreeMap::from([(default_id, BTreeMap::new())]),
+            history: BTreeMap::new(),
             connections: BTreeSet::new(),
             sessions: BTreeMap::new(),
             session_connections: BTreeMap::new(),
@@ -322,6 +342,19 @@ impl BrowserState {
 
     pub fn display_state(&self, id: &PageId) -> Option<&PageDisplayState> {
         self.display.get(id)
+    }
+
+    pub fn history(&self, id: &PageId) -> Option<&PageHistoryState> {
+        self.history.get(id)
+    }
+
+    pub fn reset_navigation_history(&mut self, page: &PageId) -> Result<(), CdpFailure> {
+        let history = self.history.get_mut(page).ok_or(CdpFailure::UnknownPage(*page))?;
+        if let Some(current) = history.entries.get(history.current_index).cloned() {
+            history.entries = vec![current];
+            history.current_index = 0;
+        }
+        Ok(())
     }
 
     pub fn context_for_page(&self, id: &PageId) -> Result<ContextId, CdpFailure> {
@@ -732,6 +765,7 @@ impl BrowserState {
             Self::validate_url(url)?;
         }
         let page = self.pages.get_mut(id).ok_or(CdpFailure::UnknownPage(*id))?;
+        let previous_url = page.url.clone();
         if let Some(url) = url {
             page.url = url.to_string();
         }
@@ -743,6 +777,38 @@ impl BrowserState {
         }
         if let Some(document_generation) = document_generation {
             page.document_generation = document_generation;
+        }
+        if let Some(history) = self.history.get_mut(id) {
+            if let Some(url) = url {
+                if url != previous_url {
+                    history.entries.truncate(history.current_index.saturating_add(1));
+                    let next_id = history
+                        .entries
+                        .iter()
+                        .map(|entry| entry.id)
+                        .max()
+                        .unwrap_or(0)
+                        .checked_add(1)
+                        .ok_or(CdpFailure::IdExhausted)?;
+                    history.entries.push(PageHistoryEntry {
+                        id: next_id,
+                        url: url.to_string(),
+                        user_typed_url: url.to_string(),
+                        title: page.title.clone(),
+                        transition_type: "typed".to_string(),
+                    });
+                    history.current_index = history.entries.len().saturating_sub(1);
+                    if history.entries.len() > MAX_HISTORY_ENTRIES {
+                        history.entries.remove(0);
+                        history.current_index = history.current_index.saturating_sub(1);
+                    }
+                }
+            }
+            if let Some(title) = title {
+                if let Some(current) = history.entries.get_mut(history.current_index) {
+                    current.title = title.to_string();
+                }
+            }
         }
         Ok(())
     }
@@ -817,6 +883,7 @@ impl BrowserState {
         self.display.clear();
         self.fetch_resolutions.clear();
         self.cookies.clear();
+        self.history.clear();
         self.connections.clear();
         self.sessions.clear();
         self.session_connections.clear();
@@ -863,6 +930,7 @@ impl BrowserState {
         }
         self.display.remove(&id);
         self.fetch_resolutions.remove(&id);
+        self.history.remove(&id);
         self.sessions.retain(|_, page| *page != id);
         let live_sessions: BTreeSet<SessionId> = self.sessions.keys().copied().collect();
         self.session_connections.retain(|session, _| live_sessions.contains(session));
@@ -958,6 +1026,19 @@ impl CdpEngine for BrowserState {
             },
         );
         self.display.insert(id, PageDisplayState::default());
+        self.history.insert(
+            id,
+            PageHistoryState {
+                current_index: 0,
+                entries: vec![PageHistoryEntry {
+                    id: 1,
+                    url: url.to_string(),
+                    user_typed_url: url.to_string(),
+                    title: String::new(),
+                    transition_type: "typed".to_string(),
+                }],
+            },
+        );
         Ok(id)
     }
 
