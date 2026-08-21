@@ -1306,6 +1306,9 @@ impl PortableCdp {
     }
 
     fn shared_target_response(&mut self, request: &Request) -> Option<Value> {
+        if !obscura_cdp::portable_dispatch::supports_browser(&request.method) {
+            return None;
+        }
         let id = request.id.as_u64()?;
         let shared_request = obscura_cdp::protocol::CdpRequest {
             id,
@@ -1313,7 +1316,7 @@ impl PortableCdp {
             params: Value::Object(request.params.clone()),
             session_id: request.session_id.clone(),
         };
-        let response = obscura_cdp::portable_target::dispatch(&shared_request, &mut self.shared_state);
+        let response = obscura_cdp::portable_dispatch::dispatch_browser(&shared_request, &mut self.shared_state)?;
         if response.error.is_none() {
             match request.method.as_str() {
                 "Target.createBrowserContext" => {
@@ -1402,238 +1405,168 @@ impl PortableCdp {
         serde_json::to_value(response).ok()
     }
 
-    fn shared_page_response(&mut self, request: &Request, target_id: &str) -> Option<Value> {
-        if !obscura_cdp::portable_page::supports(&request.method) {
-            return None;
-        }
-        let id = request.id.as_u64()?;
-        let page_id = *self.shared_pages.get(target_id)?;
-        let shared_request = obscura_cdp::protocol::CdpRequest {
-            id,
-            method: request.method.clone(),
-            params: Value::Object(request.params.clone()),
-            session_id: request.session_id.clone(),
-        };
-        let response = obscura_cdp::portable_page::dispatch(&shared_request, &mut self.shared_state, page_id);
-        serde_json::to_value(response).ok()
-    }
-
-    fn shared_network_response(&mut self, request: &Request, target_id: &str) -> Option<Value> {
-        if !obscura_cdp::portable_network::supports(&request.method) {
-            return None;
-        }
-        let id = request.id.as_u64()?;
-        let page_id = *self.shared_pages.get(target_id)?;
-        let shared_session = request
-            .session_id
-            .as_ref()
-            .and_then(|session| self.shared_sessions.get(session).copied());
-        let shared_request = obscura_cdp::protocol::CdpRequest {
-            id,
-            method: request.method.clone(),
-            params: Value::Object(request.params.clone()),
-            session_id: request.session_id.clone(),
-        };
-        let response = obscura_cdp::portable_network::dispatch(
-            &shared_request,
-            &mut self.shared_state,
-            page_id,
-            shared_session,
-        );
-        if response.error.is_none() {
-            if let Some(target) = self.targets.get_mut(target_id) {
-                match request.method.as_str() {
-                    "Network.enable" => {
-                        if let Some(session) = request.session_id.as_ref() {
-                            target.network_enabled_sessions.insert(session.clone());
-                        }
-                    }
-                    "Network.disable" => {
-                        if let Some(session) = request.session_id.as_ref() {
-                            target.network_enabled_sessions.remove(session);
-                        }
-                        target.response_bodies.clear();
-                    }
-                    "Network.setCacheDisabled" => {
-                        target.cache_disabled = request
-                            .params
-                            .get("cacheDisabled")
-                            .and_then(Value::as_bool)
-                            .unwrap_or(false);
-                    }
-                    "Network.setExtraHTTPHeaders" => {
-                        if let Some(headers) = request.params.get("headers").and_then(Value::as_object) {
-                            target.extra_headers = headers
-                                .iter()
-                                .filter_map(|(name, value)| value.as_str().map(|value| (name.clone(), value.to_string())))
-                                .collect();
-                        }
-                    }
-                    "Network.clearBrowserCache" => target.response_bodies.clear(),
-                    _ => {}
-                }
-            }
-        }
-        serde_json::to_value(response).ok()
-    }
-
-    fn shared_emulation_response(&mut self, request: &Request, target_id: &str) -> Option<Value> {
-        if !obscura_cdp::portable_emulation::supports(&request.method) {
-            return None;
-        }
-        let id = request.id.as_u64()?;
-        let page_id = *self.shared_pages.get(target_id)?;
-        let shared_request = obscura_cdp::protocol::CdpRequest {
-            id,
-            method: request.method.clone(),
-            params: Value::Object(request.params.clone()),
-            session_id: request.session_id.clone(),
-        };
-        let response = obscura_cdp::portable_emulation::dispatch(
-            &shared_request,
-            &mut self.shared_state,
-            page_id,
-        );
-        if response.error.is_none() {
-            if let Some(target) = self.targets.get_mut(target_id) {
-                match request.method.as_str() {
-                    "Emulation.setDeviceMetricsOverride" => {
-                        if let (Some(width), Some(height)) = (
-                            request.params.get("width").and_then(Value::as_u64),
-                            request.params.get("height").and_then(Value::as_u64),
-                        ) {
-                            target.viewport = Viewport {
-                                width: u32::try_from(width).unwrap_or(Viewport::default().width),
-                                height: u32::try_from(height).unwrap_or(Viewport::default().height),
-                            };
-                        }
-                    }
-                    "Emulation.clearDeviceMetricsOverride" => {
-                        target.viewport = Viewport::default();
-                    }
-                    "Emulation.setEmulatedMedia" => {
-                        target.emulated_media = request
-                            .params
-                            .get("media")
-                            .and_then(Value::as_str)
-                            .unwrap_or("")
-                            .to_string();
-                    }
-                    "Emulation.setFocusEmulationEnabled" => {
-                        target.focus_emulation = request
-                            .params
-                            .get("enabled")
-                            .and_then(Value::as_bool)
-                            .unwrap_or(false);
-                    }
-                    _ => {}
-                }
-            }
-        }
-        serde_json::to_value(response).ok()
-    }
-
-    fn shared_fetch_response(&mut self, request: &Request, target_id: &str) -> Option<Value> {
-        if !obscura_cdp::portable_fetch::supports(&request.method) {
-            return None;
-        }
-        let id = request.id.as_u64()?;
-        let page_id = *self.shared_pages.get(target_id)?;
-        let shared_session = request
-            .session_id
-            .as_ref()
-            .and_then(|session| self.shared_sessions.get(session).copied());
-        let shared_request = obscura_cdp::protocol::CdpRequest {
-            id,
-            method: request.method.clone(),
-            params: Value::Object(request.params.clone()),
-            session_id: request.session_id.clone(),
-        };
-        let response = obscura_cdp::portable_fetch::dispatch(
-            &shared_request,
-            &mut self.shared_state,
-            page_id,
-            shared_session,
-        );
-        if response.error.is_none() {
-            if let Some(target) = self.targets.get_mut(target_id) {
-                match request.method.as_str() {
-                    "Fetch.enable" => {
-                        if let Some(session_id) = request.session_id.as_ref() {
-                            if let Ok(patterns) = parse_fetch_patterns(&request.params) {
-                                target.fetch_patterns.insert(session_id.clone(), patterns);
-                            }
-                        }
-                    }
-                    "Fetch.disable" => {
-                        if let Some(session_id) = request.session_id.as_ref() {
-                            target.fetch_patterns.remove(session_id);
-                        }
-                        if target.fetch_patterns.is_empty() {
-                            target.paused_fetches.clear();
-                        }
-                    }
-                    "Fetch.continueRequest" | "Fetch.fulfillRequest" | "Fetch.failRequest" => {
-                        if let Some(request_id) = request.params.get("requestId").and_then(Value::as_str) {
-                            target.paused_fetches.remove(request_id);
-                        }
-                    }
-                    _ => {}
-                }
-            }
-        }
-        serde_json::to_value(response).ok()
-    }
-
-    fn shared_storage_response(&mut self, request: &Request, target_id: &str) -> Option<Value> {
-        if !obscura_cdp::portable_storage::supports(&request.method) {
+    /// Route all state-only page commands through the reusable CDP dispatcher.
+    /// The mirrors below are temporary host-runtime synchronization: the
+    /// portable crate owns the protocol result and canonical state, while the
+    /// WASM adapter keeps its ObscuraCore fields coherent for DOM/actions that
+    /// have not migrated yet.
+    fn shared_portable_page_response(&mut self, request: &Request, target_id: &str) -> Option<Value> {
+        if !obscura_cdp::portable_dispatch::supports_page(&request.method) {
             return None;
         }
         let id = request.id.as_u64()?;
         let page_id = *self.shared_pages.get(target_id)?;
         let now = cookie_clock(&request.params).unwrap_or(0);
-        let existing = self
-            .targets
-            .get(target_id)
-            .and_then(|target| target.core.cdp_all_cookies(now).ok())
-            .and_then(|raw| serde_json::from_str::<Vec<ContextCookieState>>(&raw).ok())
-            .unwrap_or_default();
-        if !existing.is_empty() {
-            let _ = self.shared_state.merge_context_cookies(&page_id, existing, now);
+        if obscura_cdp::portable_storage::supports(&request.method) {
+            let existing = self
+                .targets
+                .get(target_id)
+                .and_then(|target| target.core.cdp_all_cookies(now).ok())
+                .and_then(|raw| serde_json::from_str::<Vec<ContextCookieState>>(&raw).ok())
+                .unwrap_or_default();
+            if !existing.is_empty() {
+                let _ = self.shared_state.merge_context_cookies(&page_id, existing, now);
+            }
         }
+        let shared_session = request
+            .session_id
+            .as_ref()
+            .and_then(|session| self.shared_sessions.get(session).copied());
         let shared_request = obscura_cdp::protocol::CdpRequest {
             id,
             method: request.method.clone(),
             params: Value::Object(request.params.clone()),
             session_id: request.session_id.clone(),
         };
-        let response = obscura_cdp::portable_storage::dispatch(&shared_request, &mut self.shared_state, page_id);
-        if response.error.is_none()
-            && matches!(
-                request.method.as_str(),
-                "Network.setCookies"
-                    | "Storage.setCookies"
-                    | "Network.deleteCookies"
-                    | "Network.clearBrowserCookies"
-                    | "Storage.clearDataForOrigin"
-            )
-        {
-            if let Ok(cookie_json) = self.shared_state.context_cookies_json(&page_id, now) {
-                let context_id = self.targets.get(target_id).map(|target| target.context_id.clone());
-                let targets: Vec<String> = context_id
-                    .as_deref()
-                    .map(|context| {
-                        self.targets
-                            .iter()
-                            .filter(|(_, target)| target.context_id == context)
-                            .map(|(target_id, _)| target_id.clone())
-                            .collect()
-                    })
-                    .unwrap_or_default();
-                for target_id in targets {
-                    if let Some(target) = self.targets.get_mut(&target_id) {
-                        let _ = target.core.cdp_clear_cookies();
-                        let _ = target.core.cdp_import_cookies(&cookie_json, now);
+        let response = obscura_cdp::portable_dispatch::dispatch_page(
+            &shared_request,
+            &mut self.shared_state,
+            page_id,
+            shared_session,
+        )?;
+        if response.error.is_none() {
+            if obscura_cdp::portable_network::supports(&request.method) {
+                if let Some(target) = self.targets.get_mut(target_id) {
+                    match request.method.as_str() {
+                        "Network.enable" => {
+                            if let Some(session) = request.session_id.as_ref() {
+                                target.network_enabled_sessions.insert(session.clone());
+                            }
+                        }
+                        "Network.disable" => {
+                            if let Some(session) = request.session_id.as_ref() {
+                                target.network_enabled_sessions.remove(session);
+                            }
+                            target.response_bodies.clear();
+                        }
+                        "Network.setCacheDisabled" => {
+                            target.cache_disabled = request
+                                .params
+                                .get("cacheDisabled")
+                                .and_then(Value::as_bool)
+                                .unwrap_or(false);
+                        }
+                        "Network.setExtraHTTPHeaders" => {
+                            if let Some(headers) = request.params.get("headers").and_then(Value::as_object) {
+                                target.extra_headers = headers
+                                    .iter()
+                                    .filter_map(|(name, value)| value.as_str().map(|value| (name.clone(), value.to_string())))
+                                    .collect();
+                            }
+                        }
+                        "Network.clearBrowserCache" => target.response_bodies.clear(),
+                        _ => {}
+                    }
+                }
+            }
+            if obscura_cdp::portable_emulation::supports(&request.method) {
+                if let Some(target) = self.targets.get_mut(target_id) {
+                    match request.method.as_str() {
+                        "Emulation.setDeviceMetricsOverride" => {
+                            if let (Some(width), Some(height)) = (
+                                request.params.get("width").and_then(Value::as_u64),
+                                request.params.get("height").and_then(Value::as_u64),
+                            ) {
+                                target.viewport = Viewport {
+                                    width: u32::try_from(width).unwrap_or(Viewport::default().width),
+                                    height: u32::try_from(height).unwrap_or(Viewport::default().height),
+                                };
+                            }
+                        }
+                        "Emulation.clearDeviceMetricsOverride" => target.viewport = Viewport::default(),
+                        "Emulation.setEmulatedMedia" => {
+                            target.emulated_media = request
+                                .params
+                                .get("media")
+                                .and_then(Value::as_str)
+                                .unwrap_or("")
+                                .to_string();
+                        }
+                        "Emulation.setFocusEmulationEnabled" => {
+                            target.focus_emulation = request
+                                .params
+                                .get("enabled")
+                                .and_then(Value::as_bool)
+                                .unwrap_or(false);
+                        }
+                        _ => {}
+                    }
+                }
+            }
+            if obscura_cdp::portable_fetch::supports(&request.method) {
+                if let Some(target) = self.targets.get_mut(target_id) {
+                    match request.method.as_str() {
+                        "Fetch.enable" => {
+                            if let Some(session_id) = request.session_id.as_ref() {
+                                if let Ok(patterns) = parse_fetch_patterns(&request.params) {
+                                    target.fetch_patterns.insert(session_id.clone(), patterns);
+                                }
+                            }
+                        }
+                        "Fetch.disable" => {
+                            if let Some(session_id) = request.session_id.as_ref() {
+                                target.fetch_patterns.remove(session_id);
+                            }
+                            if target.fetch_patterns.is_empty() {
+                                target.paused_fetches.clear();
+                            }
+                        }
+                        "Fetch.continueRequest" | "Fetch.fulfillRequest" | "Fetch.failRequest" => {
+                            if let Some(request_id) = request.params.get("requestId").and_then(Value::as_str) {
+                                target.paused_fetches.remove(request_id);
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+            }
+            if obscura_cdp::portable_storage::supports(&request.method)
+                && matches!(
+                    request.method.as_str(),
+                    "Network.setCookies"
+                        | "Storage.setCookies"
+                        | "Network.deleteCookies"
+                        | "Network.clearBrowserCookies"
+                        | "Storage.clearDataForOrigin"
+                )
+            {
+                if let Ok(cookie_json) = self.shared_state.context_cookies_json(&page_id, now) {
+                    let context_id = self.targets.get(target_id).map(|target| target.context_id.clone());
+                    let targets: Vec<String> = context_id
+                        .as_deref()
+                        .map(|context| {
+                            self.targets
+                                .iter()
+                                .filter(|(_, target)| target.context_id == context)
+                                .map(|(target_id, _)| target_id.clone())
+                                .collect()
+                        })
+                        .unwrap_or_default();
+                    for target_id in targets {
+                        if let Some(target) = self.targets.get_mut(&target_id) {
+                            let _ = target.core.cdp_clear_cookies();
+                            let _ = target.core.cdp_import_cookies(&cookie_json, now);
+                        }
                     }
                 }
             }
@@ -1642,19 +1575,7 @@ impl PortableCdp {
     }
 
     fn dispatch_page(&mut self, connection_id: u32, target_id: String, session_id: Option<String>, request: Request) -> Value {
-        if let Some(shared_response) = self.shared_storage_response(&request, &target_id) {
-            return shared_response;
-        }
-        if let Some(shared_response) = self.shared_fetch_response(&request, &target_id) {
-            return shared_response;
-        }
-        if let Some(shared_response) = self.shared_emulation_response(&request, &target_id) {
-            return shared_response;
-        }
-        if let Some(shared_response) = self.shared_network_response(&request, &target_id) {
-            return shared_response;
-        }
-        if let Some(shared_response) = self.shared_page_response(&request, &target_id) {
+        if let Some(shared_response) = self.shared_portable_page_response(&request, &target_id) {
             return shared_response;
         }
         let session = session_id.as_deref();

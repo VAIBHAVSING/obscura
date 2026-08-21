@@ -60,6 +60,26 @@ fn wire_page(id: PageId) -> String {
     format!("page-{}", id.get())
 }
 
+/// Returns whether Browser/Target is handled by the transport-free state
+/// dispatcher. Target attachment/subscription commands still need a host
+/// connection and remain with the adapter until their event queue migrates.
+pub fn supports(method: &str) -> bool {
+    matches!(
+        method,
+        "Browser.getVersion"
+            | "Browser.getWindowForTarget"
+            | "Browser.getWindowBounds"
+            | "Browser.setWindowBounds"
+            | "Browser.setDownloadBehavior"
+            | "Target.getBrowserContexts"
+            | "Target.createBrowserContext"
+            | "Target.disposeBrowserContext"
+            | "Target.getTargets"
+            | "Target.createTarget"
+            | "Target.closeTarget"
+    )
+}
+
 /// Dispatch one Browser/Target command against the shared portable state.
 /// Unsupported domains should continue through the legacy/native dispatcher
 /// until their own target-neutral cutover packet lands.

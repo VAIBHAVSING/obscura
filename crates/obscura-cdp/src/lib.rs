@@ -3,6 +3,7 @@ pub mod engine;
 pub mod io;
 pub mod protocol;
 pub mod portable_target;
+pub mod portable_dispatch;
 pub mod portable_page;
 pub mod portable_network;
 pub mod portable_emulation;

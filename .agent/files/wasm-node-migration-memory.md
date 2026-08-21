@@ -1055,3 +1055,31 @@ new entry while preserving exact CDP wire names such as `userTypedURL` and
 Verification: portable CDP **29/29 passed**, WASM **70/70 passed**,
 render-enabled WASM **76/76 passed**, native-server CDP check passed, wasm32
 render check passed, and `git diff --check` passed.
+
+## Shared portable CDP router checkpoint (2026-08-21)
+
+The transport-free `obscura-cdp` crate now exposes
+`portable_dispatch::{dispatch_browser, dispatch_page}` as the single domain
+selection layer for the migrated Browser/Target, Storage, Fetch, Emulation,
+Network, and Page metadata commands. The WASM adapter no longer invokes each
+portable domain dispatcher from its main page path or keeps the removed
+per-domain routing helpers. It calls the shared router, then mirrors only the
+legacy `ObscuraCore` fields still needed by DOM/runtime/render host actions.
+Host-backed Runtime, DOM, Input, navigation, event queues, and capture remain
+outside this state-only router by design until their action/backend contracts
+are migrated.
+
+Verification for this checkpoint:
+
+- Portable `obscura-cdp`: **31/31 passed** with `--no-default-features
+  --features portable`.
+- `obscura-wasm`: **70/70 passed** without render and **76/76 passed** with
+  render.
+- Native-server `obscura-cdp` check passed.
+- wasm32 render check passed.
+- `git diff --check` passed.
+
+The remaining C3 work is still substantial: move connection/session/event
+ownership into the shared router, define portable DOM/Runtime/Input host
+contracts, cut over navigation and render actions, remove the legacy target
+maps, and run final package/Playwright/Puppeteer/concurrency gates.
