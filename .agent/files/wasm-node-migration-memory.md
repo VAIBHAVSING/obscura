@@ -990,8 +990,8 @@ remain open.
 
 ## Shared CDP Emulation and Fetch checkpoint (2026-08-21)
 
-Source commits: `1a3943c` (`feat: share portable emulation state`) and the
-following uncommitted Fetch slice pending its own verification commit.
+Source commits: `1a3943c` (`feat: share portable emulation state`) and
+`7261490` (`feat: share portable Fetch state`).
 
 The reusable `obscura-cdp` portable state now owns page display metrics (bounded
 viewport, device scale, mobile flag, emulated media, and focus emulation) and
@@ -1002,13 +1002,13 @@ Tokio, sockets, V8, or native browser dependencies. The WASM dispatcher routes
 these commands through that shared state while retaining a temporary target
 mirror for legacy event/render paths.
 
-The next C3 slice adds `portable_fetch.rs`. Shared state owns Fetch patterns,
+The Fetch slice adds `portable_fetch.rs`. Shared state owns Fetch patterns,
 paused request IDs, bounded one-shot continue/fulfill/fail resolutions, and
 Fetch response-body lookup. The WASM adapter routes Fetch command handling to
 that module, registers pauses and drains shared resolutions, while the host
 continues to supply request metadata and perform network I/O.
 
-Verification before commit:
+Verification:
 
 - Portable `obscura-cdp` tests: **27/27 passed**.
 - `obscura-wasm` tests: **68/68 passed** without render and **74/74 passed**
@@ -1017,10 +1017,11 @@ Verification before commit:
 - wasm32 render check passed.
 - `git diff --check` passed.
 
-The migration is not complete: cookies/storage are still owned by the WASM
-page core, DOM/accessibility/input/runtime/navigation remain partly in the
-legacy dispatcher, event subscriptions are not yet in shared CDP state, and
-the final ABI/package and Playwright/Puppeteer acceptance gates remain open.
+The migration is not complete: local/session storage and document-cookie
+runtime synchronization remain partial, DOM/accessibility/input/runtime and
+navigation actions remain partly in the legacy dispatcher, event subscriptions
+are not yet in shared CDP state, and the final ABI/package and
+Playwright/Puppeteer acceptance gates remain open.
 
 ## Shared CDP context-cookie checkpoint (2026-08-21)
 
