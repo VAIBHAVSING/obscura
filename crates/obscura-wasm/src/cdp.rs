@@ -1097,6 +1097,7 @@ impl PortableCdp {
                 | "Target.getTargets"
                 | "Target.createBrowserContext"
                 | "Target.disposeBrowserContext"
+                | "Target.createTarget"
                 | "Target.closeTarget"
         ) {
             if let Some(shared_response) = self.shared_target_response(&request) {
@@ -1299,6 +1300,36 @@ impl PortableCdp {
                     {
                         if let Some(target_id) = request.params.get("targetId").and_then(Value::as_str) {
                             self.destroy_target(target_id);
+                        }
+                    }
+                }
+                "Target.createTarget" => {
+                    let context_id = request
+                        .params
+                        .get("browserContextId")
+                        .and_then(Value::as_str)
+                        .unwrap_or("default");
+                    let url = request
+                        .params
+                        .get("url")
+                        .and_then(Value::as_str)
+                        .unwrap_or("about:blank");
+                    if let Some(target_id) = response
+                        .result
+                        .as_ref()
+                        .and_then(|value| value.get("targetId"))
+                        .and_then(Value::as_str)
+                    {
+                        if let Some(page_number) = target_id
+                            .strip_prefix("page-")
+                            .and_then(|value| value.parse::<u64>().ok())
+                        {
+                            self.create_target_with_shared_page(
+                                context_id,
+                                url,
+                                "",
+                                PageId::new(page_number),
+                            );
                         }
                     }
                 }
@@ -1935,8 +1966,6 @@ impl PortableCdp {
     }
 
     fn create_target(&mut self, context_id: &str, url: &str, html: &str) -> String {
-        self.next_target_id = self.next_target_id.saturating_add(1);
-        let target_id = format!("page-{}", self.next_target_id);
         let shared_context = self
             .shared_contexts
             .get(context_id)
@@ -1946,6 +1975,19 @@ impl PortableCdp {
             .shared_state
             .create_page(&shared_context, url)
             .expect("portable CDP target page must fit shared state bounds");
+        self.create_target_with_shared_page(context_id, url, html, shared_page)
+    }
+
+    fn create_target_with_shared_page(
+        &mut self,
+        context_id: &str,
+        url: &str,
+        html: &str,
+        shared_page: PageId,
+    ) -> String {
+        let page_number = u32::try_from(shared_page.get()).expect("portable page ID fits wire ID");
+        self.next_target_id = self.next_target_id.max(page_number);
+        let target_id = format!("page-{page_number}");
         self.shared_pages.insert(target_id.clone(), shared_page);
         let mut core = ObscuraCore::new(html).expect("empty document is valid");
         let _ = core.set_document_metadata(url, "", "UTF-8");
