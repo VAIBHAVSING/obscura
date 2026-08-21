@@ -2,6 +2,7 @@ pub mod action;
 pub mod portable_action;
 pub mod portable_dom;
 pub mod portable_runtime;
+pub mod portable_io;
 pub mod engine;
 pub mod io;
 pub mod protocol;

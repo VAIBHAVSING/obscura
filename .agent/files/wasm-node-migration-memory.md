@@ -1124,3 +1124,21 @@ Verification for this working checkpoint:
 Remaining C3 work includes DOMSnapshot/Accessibility, render wire handlers,
 shared event/session ownership, navigation completion/lifecycle cutover,
 legacy target-map removal, ABI/package finalization, and real client gates.
+
+## Shared portable IO checkpoint (2026-08-21)
+
+`obscura-cdp::portable_io::IoState` now owns bounded IO stream bytes,
+connection ownership, eviction cleanup, `IO.read`/`IO.close` validation, and
+connection teardown. The WASM adapter only decodes host-provided bytes,
+registers them with the shared state, and forwards the request; its duplicate
+IO command match and stream-owner map were removed. Evicted handles are also
+removed from the owner map so repeated captures cannot grow metadata without
+bound.
+
+Verification: portable `obscura-cdp` **39/39 passed**, `obscura-wasm`
+**70/70 passed**, render-enabled WASM **76/76 passed**, wasm32 render check
+passed, native-server CDP check passed, and `git diff --check` passed.
+
+Remaining C3 work is DOMSnapshot/Accessibility, render wire semantics, shared
+event/session ownership, navigation lifecycle cutover, legacy target-map
+removal, ABI/package finalization, and real client/concurrency gates.

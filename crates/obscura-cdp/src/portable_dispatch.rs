@@ -36,6 +36,15 @@ pub fn dispatch_browser(request: &CdpRequest, state: &mut BrowserState) -> Optio
     supports_browser(&request.method).then(|| crate::portable_target::dispatch(request, state))
 }
 
+/// Dispatch connection-owned IO stream commands through the shared state.
+pub fn dispatch_io(
+    request: &CdpRequest,
+    state: &mut crate::portable_io::IoState,
+    connection: crate::state::ConnectionId,
+) -> Option<CdpResponse> {
+    state.dispatch(request, connection)
+}
+
 /// Whether the shared page-domain dispatcher owns this command.
 pub fn supports_page(method: &str) -> bool {
     crate::portable_storage::supports(method)

@@ -69,6 +69,10 @@ impl IoStreamStore {
         self.streams.get(handle).map(|(bytes, _)| bytes.len())
     }
 
+    pub fn contains(&self, handle: &str) -> bool {
+        self.streams.contains_key(handle)
+    }
+
     /// Store a body, evicting oldest streams when entry/byte caps are reached.
     pub fn insert(&mut self, bytes: Vec<u8>) -> Result<String, String> {
         if bytes.len() > self.max_bytes {

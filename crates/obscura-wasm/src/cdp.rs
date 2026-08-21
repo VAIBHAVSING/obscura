@@ -256,8 +256,7 @@ pub struct PortableCdp {
     next_target_id: u32,
     next_session_id: u32,
     next_loader_id: u32,
-    streams: obscura_cdp::io::IoStreamStore,
-    stream_connections: BTreeMap<String, u32>,
+    io: obscura_cdp::portable_io::IoState,
     fetch_resolutions: VecDeque<Value>,
 }
 
@@ -316,8 +315,7 @@ impl PortableCdp {
             next_target_id: 1,
             next_session_id: 0,
             next_loader_id: 0,
-            streams: obscura_cdp::io::IoStreamStore::with_limits(128, MAX_STREAM_BYTES),
-            stream_connections: BTreeMap::new(),
+            io: obscura_cdp::portable_io::IoState::with_limits(128, MAX_STREAM_BYTES),
             fetch_resolutions: VecDeque::new(),
         })
     }
@@ -340,10 +338,9 @@ impl PortableCdp {
             )));
         }
         let handle = self
-            .streams
-            .insert(data)
+            .io
+            .insert(ConnectionId::new(u64::from(connection_id)), data)
             .map_err(|error| js_error(&error))?;
-        self.stream_connections.insert(handle.clone(), connection_id);
         Ok(handle)
     }
 
@@ -396,18 +393,10 @@ impl PortableCdp {
             }
         }
         if let Some(shared_id) = self.shared_connections.remove(&connection_id) {
+            self.io.close_connection(shared_id);
             self.shared_state.close_connection(shared_id);
         }
         self.cancel_actions_where(|action| action.connection_id == connection_id);
-        let owned: Vec<String> = self
-            .stream_connections
-            .iter()
-            .filter_map(|(handle, owner)| (*owner == connection_id).then_some(handle.clone()))
-            .collect();
-        for handle in owned {
-            self.stream_connections.remove(&handle);
-            self.streams.remove(&handle);
-        }
         Ok(())
     }
 
@@ -715,7 +704,7 @@ impl PortableCdp {
             "actionResultBytes": MAX_ACTION_RESULT_BYTES,
             "streamBytes": MAX_STREAM_BYTES,
             "streamChunkBytes": MAX_STREAM_CHUNK_BYTES,
-            "streams": self.streams.len(),
+            "streams": self.io.len(),
             "responseBodyBytes": MAX_RESPONSE_BODY_BYTES,
             "responseBodies": self.targets.values().map(|target| target.response_bodies.len()).sum::<usize>(),
             "fetchPatternLimit": MAX_FETCH_PATTERNS,
@@ -1405,6 +1394,25 @@ impl PortableCdp {
         serde_json::to_value(response).ok()
     }
 
+    fn shared_io_response(&mut self, connection_id: u32, request: &Request) -> Option<Value> {
+        if !matches!(request.method.as_str(), "IO.read" | "IO.close") {
+            return None;
+        }
+        let id = request.id.as_u64()?;
+        let shared_request = obscura_cdp::protocol::CdpRequest {
+            id,
+            method: request.method.clone(),
+            params: Value::Object(request.params.clone()),
+            session_id: request.session_id.clone(),
+        };
+        let response = obscura_cdp::portable_dispatch::dispatch_io(
+            &shared_request,
+            &mut self.io,
+            ConnectionId::new(u64::from(connection_id)),
+        )?;
+        serde_json::to_value(response).ok()
+    }
+
     /// Route all state-only page commands through the reusable CDP dispatcher.
     /// The mirrors below are temporary host-runtime synchronization: the
     /// portable crate owns the protocol result and canonical state, while the
@@ -1591,6 +1599,9 @@ impl PortableCdp {
     }
 
     fn dispatch_page(&mut self, connection_id: u32, target_id: String, session_id: Option<String>, request: Request) -> Value {
+        if let Some(shared_response) = self.shared_io_response(connection_id, &request) {
+            return shared_response;
+        }
         if let Some(shared_response) = self.shared_portable_page_response(connection_id, &request, &target_id) {
             return shared_response;
         }
@@ -1890,57 +1901,6 @@ impl PortableCdp {
                 }), session)
             }
             "Page.resetNavigationHistory" => cdp_result_response(&request.id, json!({}), session),
-            "IO.read" => {
-                let Some(handle) = request.params.get("handle").and_then(Value::as_str) else {
-                    return cdp_error_response(&request.id, -32602, "handle is required", session);
-                };
-                let requested = request
-                    .params
-                    .get("size")
-                    .and_then(Value::as_u64)
-                    .unwrap_or(MAX_STREAM_CHUNK_BYTES as u64);
-                if requested == 0 {
-                    return cdp_error_response(&request.id, -32602, "size must be greater than zero", session);
-                }
-                let size = usize::try_from(requested)
-                    .unwrap_or(MAX_STREAM_CHUNK_BYTES)
-                    .min(MAX_STREAM_CHUNK_BYTES);
-                if self.stream_connections.get(handle) != Some(&connection_id) {
-                    return cdp_error_response(&request.id, -32000, "Invalid stream handle", session);
-                }
-                let offset = request
-                    .params
-                    .get("offset")
-                    .and_then(Value::as_u64)
-                    .and_then(|value| usize::try_from(value).ok());
-                if let Some(offset) = offset {
-                    if self.streams.byte_len(handle).is_none_or(|length| offset > length) {
-                        return cdp_error_response(&request.id, -32602, "stream offset is out of range", session);
-                    }
-                }
-                let Some((data, eof)) = self.streams.read(handle, offset, size) else {
-                    return cdp_error_response(&request.id, -32000, "Invalid stream handle", session);
-                };
-                if eof {
-                    self.stream_connections.remove(handle);
-                    self.streams.remove(handle);
-                }
-                cdp_result_response(
-                    &request.id,
-                    json!({"base64Encoded": true, "data": data, "eof": eof}),
-                    session,
-                )
-            }
-            "IO.close" => {
-                let Some(handle) = request.params.get("handle").and_then(Value::as_str) else {
-                    return cdp_error_response(&request.id, -32602, "handle is required", session);
-                };
-                if self.stream_connections.get(handle) == Some(&connection_id) {
-                    self.stream_connections.remove(handle);
-                    self.streams.remove(handle);
-                }
-                cdp_result_response(&request.id, json!({}), session)
-            }
             #[cfg(feature = "render")]
             "Page.captureScreenshot" => self.capture_screenshot(&request, target_id, session),
             #[cfg(not(feature = "render"))]
@@ -2069,11 +2029,13 @@ impl PortableCdp {
             Err(_) => return cdp_error_response(&request.id, -32000, "portable PDF failed", session),
         };
         if request.params.get("transferMode").and_then(Value::as_str) == Some("ReturnAsStream") {
-            let handle = match self.streams.insert(bytes) {
+            let handle = match self
+                .io
+                .insert(ConnectionId::new(u64::from(connection_id)), bytes)
+            {
                 Ok(handle) => handle,
                 Err(error) => return cdp_error_response(&request.id, -32000, error, session),
             };
-            self.stream_connections.insert(handle.clone(), connection_id);
             return cdp_result_response(
                 &request.id,
                 json!({"data": "", "stream": handle}),
