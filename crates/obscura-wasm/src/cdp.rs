@@ -2247,47 +2247,7 @@ impl PortableCdp {
             .get(target_id)
             .copied()
             .ok_or_else(|| CdpFailure::UnknownPage(PageId::new(0)))?;
-        let string_field = |name: &str, default: &str| {
-            payload.get(name).and_then(Value::as_str).unwrap_or(default).to_string()
-        };
-        Ok(match kind {
-            "navigate" | "reload" | "setDocumentContent" => EngineAction::Navigate {
-                page,
-                url: string_field("url", "about:blank"),
-            },
-            "evaluate" => EngineAction::Evaluate {
-                page,
-                expression: string_field("expression", ""),
-            },
-            "callFunctionOn" => EngineAction::CallFunctionOn {
-                page,
-                declaration: string_field("functionDeclaration", ""),
-            },
-            "getProperties" => EngineAction::GetProperties {
-                page,
-                object_id: string_field("objectId", ""),
-            },
-            "releaseObject" | "releaseObjectGroup" => EngineAction::ReleaseObject {
-                page,
-                object_id: string_field("objectId", ""),
-            },
-            "dispatchMouseEvent" | "dispatchKeyEvent" | "insertText" => EngineAction::DeliverInput {
-                page,
-                payload: payload.clone(),
-            },
-            "screenshot" => EngineAction::CaptureScreenshot {
-                page,
-                format: string_field("format", "png"),
-            },
-            "pdf" => EngineAction::PrintToPdf {
-                page,
-                options: payload.clone(),
-            },
-            "getIsolateId" => EngineAction::Wake {
-                deadline_millis: 0,
-            },
-            _ => return Err(CdpFailure::Unsupported(format!("unknown host action kind {kind}"))),
-        })
+        obscura_cdp::portable_action::from_kind(page, kind, payload)
     }
 
     fn create_target(&mut self, context_id: &str, url: &str, html: &str) -> String {

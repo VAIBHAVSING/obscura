@@ -1083,3 +1083,18 @@ The remaining C3 work is still substantial: move connection/session/event
 ownership into the shared router, define portable DOM/Runtime/Input host
 contracts, cut over navigation and render actions, remove the legacy target
 maps, and run final package/Playwright/Puppeteer/concurrency gates.
+
+## Shared portable host-action mapping checkpoint (2026-08-21)
+
+The portable CDP crate now owns `portable_action::from_kind`, the data-only
+mapping from navigation, Runtime, Input, screenshot/PDF, and isolate-wake
+operations to `EngineAction`. `obscura-wasm` retains host execution and action
+completion, but no longer defines the protocol-to-engine action variants.
+Unknown kinds fail as bounded `CdpFailure::Unsupported` values before any host
+queue side effect.
+
+Verification: portable `obscura-cdp` **33/33 passed**, `obscura-wasm`
+**70/70 passed**, and prior render/wasm32 checks remain green from the router
+checkpoint. The remaining migration still includes portable DOM/runtime
+backend contracts, shared event ownership, legacy target-map removal, and
+final package/client acceptance gates.
