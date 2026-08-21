@@ -1413,6 +1413,34 @@ impl PortableCdp {
         serde_json::to_value(response).ok()
     }
 
+    #[cfg(feature = "render")]
+    fn shared_render_response(
+        &mut self,
+        connection_id: u32,
+        request: &Request,
+        target_id: &str,
+    ) -> Option<Value> {
+        if !obscura_cdp::portable_render::supports(&request.method) {
+            return None;
+        }
+        let id = request.id.as_u64()?;
+        let shared_request = obscura_cdp::protocol::CdpRequest {
+            id,
+            method: request.method.clone(),
+            params: Value::Object(request.params.clone()),
+            session_id: request.session_id.clone(),
+        };
+        let target = self.targets.get_mut(target_id)?;
+        let mut backend = CoreRenderBackend { target };
+        let response = obscura_cdp::portable_dispatch::dispatch_render(
+            &shared_request,
+            &mut backend,
+            &mut self.io,
+            ConnectionId::new(u64::from(connection_id)),
+        )?;
+        serde_json::to_value(response).ok()
+    }
+
     /// Route all state-only page commands through the reusable CDP dispatcher.
     /// The mirrors below are temporary host-runtime synchronization: the
     /// portable crate owns the protocol result and canonical state, while the
@@ -1599,6 +1627,10 @@ impl PortableCdp {
     }
 
     fn dispatch_page(&mut self, connection_id: u32, target_id: String, session_id: Option<String>, request: Request) -> Value {
+        #[cfg(feature = "render")]
+        if let Some(shared_response) = self.shared_render_response(connection_id, &request, &target_id) {
+            return shared_response;
+        }
         if let Some(shared_response) = self.shared_io_response(connection_id, &request) {
             return shared_response;
         }
@@ -1901,14 +1933,10 @@ impl PortableCdp {
                 }), session)
             }
             "Page.resetNavigationHistory" => cdp_result_response(&request.id, json!({}), session),
-            #[cfg(feature = "render")]
-            "Page.captureScreenshot" => self.capture_screenshot(&request, target_id, session),
             #[cfg(not(feature = "render"))]
             "Page.captureScreenshot" => self.queue_action(connection_id, request.clone(), target_id, "screenshot", json!({
                 "format": request.params.get("format").and_then(Value::as_str).unwrap_or("png"),
             })),
-            #[cfg(feature = "render")]
-            "Page.printToPDF" => self.print_to_pdf(connection_id, &request, target_id, session),
             #[cfg(not(feature = "render"))]
             "Page.printToPDF" => self.queue_action(connection_id, request.clone(), target_id, "pdf", json!({
                 "landscape": request.params.get("landscape").and_then(Value::as_bool).unwrap_or(false),
@@ -1960,89 +1988,6 @@ impl PortableCdp {
             "targetId": target_id,
             "payload": payload,
         }}), request.session_id.as_deref())
-    }
-
-    #[cfg(feature = "render")]
-    fn capture_screenshot(&mut self, request: &Request, target_id: String, session: Option<&str>) -> Value {
-        let format = request.params.get("format").and_then(Value::as_str).unwrap_or("png");
-        if format != "png" {
-            return cdp_error_response(&request.id, -32602, "portable WASM screenshots currently support only PNG", session);
-        }
-        let Some(target) = self.targets.get_mut(&target_id) else {
-            return cdp_error_response(&request.id, -32000, "target is not known", session);
-        };
-        let bytes = match target
-            .core
-            .screenshot_png(target.viewport.width, target.viewport.height, 0.0, 0.0)
-        {
-            Ok(bytes) if bytes.len() <= MAX_ACTION_RESULT_BYTES => bytes,
-            Ok(_) => {
-                return cdp_error_response(
-                    &request.id,
-                    -32000,
-                    "portable screenshot exceeds the response limit",
-                    session,
-                )
-            }
-            Err(_) => {
-                return cdp_error_response(&request.id, -32000, "portable screenshot failed", session)
-            }
-        };
-        cdp_result_response(
-            &request.id,
-            json!({"data": BASE64.encode(bytes), "fromSurface": true}),
-            session,
-        )
-    }
-
-    #[cfg(feature = "render")]
-    fn print_to_pdf(
-        &mut self,
-        connection_id: u32,
-        request: &Request,
-        target_id: String,
-        session: Option<&str>,
-    ) -> Value {
-        let Some(target) = self.targets.get_mut(&target_id) else {
-            return cdp_error_response(&request.id, -32000, "target is not known", session);
-        };
-        let mut options_value = Value::Object(request.params.clone());
-        if let Some(object) = options_value.as_object_mut() {
-            // transferMode belongs to the CDP envelope, not the portable PDF
-            // options schema, which intentionally denies unknown fields.
-            object.remove("transferMode");
-        }
-        let options = match serde_json::to_string(&options_value) {
-            Ok(options) => options,
-            Err(_) => return cdp_error_response(&request.id, -32602, "invalid PDF options", session),
-        };
-        let bytes = match target.core.pdf(&options, target.document_handle, target.revision) {
-            Ok(bytes) if bytes.len() <= MAX_ACTION_RESULT_BYTES => bytes,
-            Ok(_) => {
-                return cdp_error_response(
-                    &request.id,
-                    -32000,
-                    "portable PDF exceeds the response limit",
-                    session,
-                )
-            }
-            Err(_) => return cdp_error_response(&request.id, -32000, "portable PDF failed", session),
-        };
-        if request.params.get("transferMode").and_then(Value::as_str) == Some("ReturnAsStream") {
-            let handle = match self
-                .io
-                .insert(ConnectionId::new(u64::from(connection_id)), bytes)
-            {
-                Ok(handle) => handle,
-                Err(error) => return cdp_error_response(&request.id, -32000, error, session),
-            };
-            return cdp_result_response(
-                &request.id,
-                json!({"data": "", "stream": handle}),
-                session,
-            );
-        }
-        cdp_result_response(&request.id, json!({"data": BASE64.encode(bytes)}), session)
     }
 
     fn shared_engine_action(
@@ -2434,6 +2379,29 @@ impl obscura_cdp::portable_dom::DomBackend for CoreDomBackend<'_> {
 
     fn describe_children(&mut self, node_id: u32, depth: usize) -> Result<Vec<Value>, String> {
         describe_children(self.core, node_id, depth, 0)
+    }
+}
+
+#[cfg(feature = "render")]
+struct CoreRenderBackend<'a> {
+    target: &'a mut Target,
+}
+
+#[cfg(feature = "render")]
+impl obscura_cdp::portable_render::RenderBackend for CoreRenderBackend<'_> {
+    fn capture_screenshot(&mut self, _format: &str) -> Result<Vec<u8>, String> {
+        self.target
+            .core
+            .screenshot_png(self.target.viewport.width, self.target.viewport.height, 0.0, 0.0)
+            .map_err(|_| "portable screenshot failed".to_string())
+    }
+
+    fn print_to_pdf(&mut self, options: &Value) -> Result<Vec<u8>, String> {
+        let options = serde_json::to_string(options).map_err(|_| "invalid PDF options".to_string())?;
+        self.target
+            .core
+            .pdf(&options, self.target.document_handle, self.target.revision)
+            .map_err(|_| "portable PDF failed".to_string())
     }
 }
 

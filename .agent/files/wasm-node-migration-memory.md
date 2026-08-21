@@ -1142,3 +1142,20 @@ passed, native-server CDP check passed, and `git diff --check` passed.
 Remaining C3 work is DOMSnapshot/Accessibility, render wire semantics, shared
 event/session ownership, navigation lifecycle cutover, legacy target-map
 removal, ABI/package finalization, and real client/concurrency gates.
+
+## Shared portable render wire checkpoint (2026-08-21)
+
+`obscura-cdp::portable_render` now owns screenshot/PDF command validation,
+PNG/PDF response shapes, result-size bounds, PDF `ReturnAsStream` handling,
+and stream ownership handoff. WASM supplies `CoreRenderBackend`, which calls
+the existing in-module layout/paint/PNG/PDF implementation. The old render
+command response helpers were removed from `obscura-wasm/src/cdp.rs`; the
+non-render build still represents capture as a bounded host action.
+
+Verification: portable `obscura-cdp` **41/41 passed**, `obscura-wasm`
+**70/70 passed** without render and **76/76 passed** with render, native-server
+CDP check passed, wasm32 render check passed, and `git diff --check` passed.
+
+Remaining C3 work is DOMSnapshot/Accessibility, shared event/session
+ownership, navigation lifecycle cutover, legacy target-map removal,
+ABI/package finalization, and real Playwright/Puppeteer/concurrency gates.

@@ -45,6 +45,16 @@ pub fn dispatch_io(
     state.dispatch(request, connection)
 }
 
+/// Dispatch render-domain wire semantics through a portable renderer backend.
+pub fn dispatch_render<B: crate::portable_render::RenderBackend>(
+    request: &CdpRequest,
+    backend: &mut B,
+    io: &mut crate::portable_io::IoState,
+    connection: crate::state::ConnectionId,
+) -> Option<CdpResponse> {
+    crate::portable_render::dispatch(request, backend, io, connection)
+}
+
 /// Whether the shared page-domain dispatcher owns this command.
 pub fn supports_page(method: &str) -> bool {
     crate::portable_storage::supports(method)
