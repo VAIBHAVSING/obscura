@@ -14,7 +14,7 @@ use crate::engine::{
     ActionId, ActionResult, CdpEngine, CdpFailure, ContextId, ContextOptions, EngineAction,
     PageId, PageSnapshot,
 };
-use crate::protocol::MAX_METHOD_BYTES;
+use crate::protocol::{CdpEvent, MAX_METHOD_BYTES};
 
 pub const MAX_CONTEXTS: usize = 256;
 pub const MAX_PAGES: usize = 4096;
@@ -36,6 +36,8 @@ pub const MAX_FETCH_RESOLUTIONS: usize = 256;
 pub const MAX_COOKIE_COUNT: usize = 4096;
 pub const MAX_COOKIE_BYTES: usize = 64 * 1024;
 pub const MAX_HISTORY_ENTRIES: usize = 128;
+pub const MAX_EVENTS_PER_CONNECTION: usize = 512;
+pub const MAX_EVENT_BYTES_PER_CONNECTION: usize = 4 * 1024 * 1024;
 pub const DEFAULT_VIEWPORT_WIDTH: u32 = 800;
 pub const DEFAULT_VIEWPORT_HEIGHT: u32 = 600;
 pub const MAX_VIEWPORT_DIMENSION: u32 = 4096;
@@ -246,6 +248,8 @@ pub struct BrowserState {
     connections: BTreeSet<ConnectionId>,
     sessions: BTreeMap<SessionId, PageId>,
     session_connections: BTreeMap<SessionId, ConnectionId>,
+    #[serde(skip)]
+    events: BTreeMap<ConnectionId, VecDeque<CdpEvent>>,
     actions: BTreeMap<ActionId, PendingAction>,
     next_context: u64,
     next_page: u64,
@@ -285,6 +289,7 @@ impl BrowserState {
             connections: BTreeSet::new(),
             sessions: BTreeMap::new(),
             session_connections: BTreeMap::new(),
+            events: BTreeMap::new(),
             actions: BTreeMap::new(),
             next_context: 1,
             next_page: 0,
@@ -334,6 +339,70 @@ impl BrowserState {
 
     pub fn pending_action_count(&self) -> usize {
         self.actions.len()
+    }
+
+    pub fn event_count(&self, connection: ConnectionId) -> usize {
+        self.events.get(&connection).map_or(0, VecDeque::len)
+    }
+
+    /// Queue one bounded event for a live connection. Oldest events are
+    /// evicted at the deterministic per-connection cap.
+    pub fn queue_event(&mut self, connection: ConnectionId, event: CdpEvent) -> Result<(), CdpFailure> {
+        if !self.connections.contains(&connection) {
+            return Err(CdpFailure::InvalidArgument("connection is not open".to_string()));
+        }
+        let event_bytes = serde_json::to_vec(&event)
+            .map_err(|error| CdpFailure::host(format!("event serialization failed: {error}")))?;
+        if event_bytes.len() > MAX_EVENT_BYTES_PER_CONNECTION {
+            return Err(CdpFailure::invalid_argument("CDP event exceeds the byte limit"));
+        }
+        let queue = self.events.entry(connection).or_default();
+        queue.push_back(event);
+        while queue.len() > MAX_EVENTS_PER_CONNECTION
+            || queue
+                .iter()
+                .map(|event| serde_json::to_vec(event).map_or(usize::MAX, |bytes| bytes.len()))
+                .sum::<usize>()
+                > MAX_EVENT_BYTES_PER_CONNECTION
+        {
+            if queue.pop_front().is_none() {
+                break;
+            }
+        }
+        Ok(())
+    }
+
+    /// Drain at most `max_items` and `max_bytes` complete event frames.
+    pub fn drain_events(&mut self, connection: ConnectionId, max_items: usize, max_bytes: usize) -> Vec<CdpEvent> {
+        let Some(queue) = self.events.get_mut(&connection) else {
+            return Vec::new();
+        };
+        let mut bytes = 0usize;
+        let mut drained = Vec::new();
+        while drained.len() < max_items.min(MAX_EVENTS_PER_CONNECTION) {
+            let Some(event) = queue.front() else {
+                break;
+            };
+            let event_size = serde_json::to_vec(event).map_or(usize::MAX, |value| value.len());
+            if event_size > max_bytes || bytes.saturating_add(event_size) > max_bytes {
+                break;
+            }
+            bytes = bytes.saturating_add(event_size);
+            drained.push(queue.pop_front().expect("event queue front remains present"));
+        }
+        if queue.is_empty() {
+            self.events.remove(&connection);
+        }
+        drained
+    }
+
+    pub fn discard_session_events(&mut self, connection: ConnectionId, session: &str) {
+        if let Some(queue) = self.events.get_mut(&connection) {
+            queue.retain(|event| event.session_id.as_deref() != Some(session));
+            if queue.is_empty() {
+                self.events.remove(&connection);
+            }
+        }
     }
 
     pub fn network_state(&self, id: &PageId) -> Option<&PageNetworkState> {
@@ -827,6 +896,7 @@ impl BrowserState {
     pub fn close_connection(&mut self, id: ConnectionId) -> bool {
         let removed = self.connections.remove(&id);
         if removed {
+            self.events.remove(&id);
             let sessions: Vec<SessionId> = self
                 .session_connections
                 .iter()
@@ -887,6 +957,7 @@ impl BrowserState {
         self.connections.clear();
         self.sessions.clear();
         self.session_connections.clear();
+        self.events.clear();
         self.actions.clear();
         self.generation = self.generation.saturating_add(1);
     }
@@ -1163,5 +1234,23 @@ mod tests {
         assert!(state.is_closed());
         assert_eq!(state.open_connection(), Err(CdpFailure::Closed));
         assert_eq!(state.create_context(ContextOptions::default()), Err(CdpFailure::Closed));
+    }
+
+    #[test]
+    fn event_queue_is_bounded_and_session_cleanup_is_deterministic() {
+        let mut state = BrowserState::new();
+        let connection = state.open_connection().unwrap();
+        for index in 0..=MAX_EVENTS_PER_CONNECTION {
+            state
+                .queue_event(connection, CdpEvent::with_session("Test.event", serde_json::json!({"index": index}), "session".into()))
+                .unwrap();
+        }
+        assert_eq!(state.event_count(connection), MAX_EVENTS_PER_CONNECTION);
+        state.discard_session_events(connection, "session");
+        assert_eq!(state.event_count(connection), 0);
+        state.queue_event(connection, CdpEvent::new("Test.event", serde_json::json!({}))).unwrap();
+        let drained = state.drain_events(connection, 1, MAX_EVENT_BYTES_PER_CONNECTION);
+        assert_eq!(drained.len(), 1);
+        assert_eq!(state.event_count(connection), 0);
     }
 }

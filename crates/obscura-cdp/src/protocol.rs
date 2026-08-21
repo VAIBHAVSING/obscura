@@ -55,7 +55,7 @@ pub struct CdpError {
     pub message: String,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct CdpEvent {
     pub method: String,
     pub params: Value,

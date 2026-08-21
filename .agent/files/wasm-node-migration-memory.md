@@ -1159,3 +1159,27 @@ CDP check passed, wasm32 render check passed, and `git diff --check` passed.
 Remaining C3 work is DOMSnapshot/Accessibility, shared event/session
 ownership, navigation lifecycle cutover, legacy target-map removal,
 ABI/package finalization, and real Playwright/Puppeteer/concurrency gates.
+
+## Shared portable event queue checkpoint (2026-08-21)
+
+`BrowserState` now owns bounded per-connection `CdpEvent` queues, byte/count
+eviction, polling with complete-frame byte limits, session-event cleanup, and
+connection/terminal teardown cleanup. The WASM adapter's `Connection` keeps
+only discovery and attachment metadata; target discovery, auto-attach,
+network, Fetch, detach, and target-destroy notifications now enter the shared
+queue. The old WASM-local `VecDeque<Value>` and queue helpers were removed.
+
+Verification for this checkpoint:
+
+- Portable `obscura-cdp`: **42/42 passed** with
+  `--no-default-features --features portable`.
+- `obscura-wasm`: **70/70 passed** without render and **76/76 passed** with
+  render.
+- wasm32 render check passed.
+- `git diff --check` passed.
+
+The queue checkpoint does not yet remove the WASM target/session maps or
+numeric-to-wire identity maps. Remaining C3 work is DOMSnapshot/Accessibility,
+shared session identity cutover, navigation lifecycle completion, legacy target
+state removal, ABI/package finalization, and real Playwright/Puppeteer/
+concurrency gates.

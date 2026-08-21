@@ -225,7 +225,6 @@ struct Target {
 struct Connection {
     browser_session: String,
     sessions: HashMap<String, String>,
-    events: VecDeque<Value>,
     discover_targets: bool,
     auto_attach: bool,
 }
@@ -362,7 +361,6 @@ impl PortableCdp {
             Connection {
                 browser_session: format!("browser-connection-{id}"),
                 sessions: HashMap::new(),
-                events: VecDeque::new(),
                 discover_targets: false,
                 auto_attach: false,
             },
@@ -674,18 +672,17 @@ impl PortableCdp {
     /// Return and remove up to `max_items` queued events for a connection.
     #[wasm_bindgen(js_name = pollCdpEvents)]
     pub fn poll_cdp_events(&mut self, connection_id: u32, max_items: u32) -> Result<String, JsValue> {
-        let Some(connection) = self.connections.get_mut(&connection_id) else {
+        if !self.connections.contains_key(&connection_id) {
             return Err(js_error("unknown CDP connection"));
+        }
+        let Some(shared_connection) = self.shared_connections.get(&connection_id).copied() else {
+            return Err(js_error("shared CDP connection is missing"));
         };
         let max_items = usize::try_from(max_items)
             .map_err(|_| js_range_error("event count is not representable"))?;
-        let mut events = Vec::with_capacity(max_items.min(MAX_EVENT_QUEUE));
-        for _ in 0..max_items.min(MAX_EVENT_QUEUE) {
-            let Some(event) = connection.events.pop_front() else {
-                break;
-            };
-            events.push(event);
-        }
+        let events = self
+            .shared_state
+            .drain_events(shared_connection, max_items.min(MAX_EVENT_QUEUE), MAX_EVENT_BYTES);
         let text = serde_json::to_string(&events)
             .map_err(|error| js_error(&format!("CDP event serialization failed: {error}")))?;
         bounded(&text, MAX_EVENT_BYTES, "CDP event batch")?;
@@ -725,6 +722,7 @@ impl PortableCdp {
         }
         let shared_page = self.shared_pages.get(target_id).copied();
         let mut shared_bodies = Vec::new();
+        let mut pending_events: Vec<(u32, String, &'static str, Value)> = Vec::new();
         let Some(target) = self.targets.get_mut(target_id) else {
             return Err(js_error("portable network target is not known"));
         };
@@ -783,11 +781,10 @@ impl PortableCdp {
                         (mapped_target == target_id && target.network_enabled_sessions.contains(session_id))
                             .then_some((*connection_id, session_id.clone()))
                     })
-                })
+            })
                 .collect();
             for (connection_id, session_id) in session_ids {
-                let Some(connection) = self.connections.get_mut(&connection_id) else { continue; };
-                queue_event(connection, "Network.requestWillBeSent", json!({
+                pending_events.push((connection_id, session_id.clone(), "Network.requestWillBeSent", json!({
                     "requestId": request_id,
                     "loaderId": loader_id,
                     "documentURL": document_url,
@@ -797,21 +794,24 @@ impl PortableCdp {
                     "initiator": {"type": event.get("initiatorType").and_then(Value::as_str).unwrap_or("other")},
                     "type": resource_type,
                     "frameId": frame_id,
-                }), Some(&session_id));
-                queue_event(connection, "Network.responseReceived", json!({
+                })));
+                pending_events.push((connection_id, session_id.clone(), "Network.responseReceived", json!({
                     "requestId": request_id,
                     "loaderId": loader_id,
                     "timestamp": timestamp,
                     "type": resource_type,
                     "response": {"url": url, "status": status, "statusText": "", "headers": response_headers, "mimeType": mime_type},
                     "frameId": frame_id,
-                }), Some(&session_id));
-                queue_event(connection, "Network.loadingFinished", json!({
+                })));
+                pending_events.push((connection_id, session_id, "Network.loadingFinished", json!({
                     "requestId": request_id,
                     "timestamp": timestamp,
                     "encodedDataLength": event.get("bodySize").and_then(Value::as_u64).unwrap_or(0),
-                }), Some(&session_id));
+                })));
             }
+        }
+        for (connection_id, session_id, method, params) in pending_events {
+            self.queue_event(connection_id, method, params, Some(&session_id));
         }
         if let Some(shared_page) = shared_page {
             for (request_id, body, base64_encoded) in shared_bodies {
@@ -973,25 +973,27 @@ impl PortableCdp {
                     .collect::<Vec<_>>()
             });
         let response_status = metadata.get("responseStatusCode").and_then(Value::as_u64);
+        let mut pending_events: Vec<(u32, String, Value)> = Vec::new();
         for (connection_id, session_id) in &matching_sessions {
-            if let Some(connection) = self.connections.get_mut(connection_id) {
-                let mut paused_event = json!({
-                    "requestId": request.request_id,
-                    "request": request_payload,
-                    "resourceType": request.resource_type,
-                    "frameId": request.frame_id,
-                    "networkId": request.request_id,
-                });
-                if request.request_stage == "Response" {
-                    if let Some(status) = response_status {
-                        paused_event["responseStatusCode"] = json!(status);
-                    }
-                    if let Some(headers) = response_headers.clone() {
-                        paused_event["responseHeaders"] = json!(headers);
-                    }
+            let mut paused_event = json!({
+                "requestId": request.request_id,
+                "request": request_payload,
+                "resourceType": request.resource_type,
+                "frameId": request.frame_id,
+                "networkId": request.request_id,
+            });
+            if request.request_stage == "Response" {
+                if let Some(status) = response_status {
+                    paused_event["responseStatusCode"] = json!(status);
                 }
-                queue_event(connection, "Fetch.requestPaused", paused_event, Some(session_id));
+                if let Some(headers) = response_headers.clone() {
+                    paused_event["responseHeaders"] = json!(headers);
+                }
             }
+            pending_events.push((*connection_id, session_id.clone(), paused_event));
+        }
+        for (connection_id, session_id, params) in pending_events {
+            self.queue_event(connection_id, "Fetch.requestPaused", params, Some(&session_id));
         }
         Ok(json!({"paused": true, "requestId": request_id, "sessionCount": matching_sessions.len()}))
     }
@@ -1217,11 +1219,11 @@ impl PortableCdp {
                 let discover = request.params.get("discover").and_then(Value::as_bool).unwrap_or(false);
                 if let Some(connection) = self.connections.get_mut(&connection_id) {
                     connection.discover_targets = discover;
-                    if discover {
-                        let infos: Vec<Value> = self.targets.values().map(Self::target_info).collect();
-                        for info in infos {
-                            queue_event(connection, "Target.targetCreated", json!({"targetInfo": info}), None);
-                        }
+                }
+                if discover {
+                    let infos: Vec<Value> = self.targets.values().map(Self::target_info).collect();
+                    for info in infos {
+                        self.queue_event(connection_id, "Target.targetCreated", json!({"targetInfo": info}), None);
                     }
                 }
                 cdp_result_response(&request.id, json!({}), session)
@@ -1252,14 +1254,12 @@ impl PortableCdp {
                 }
                 let session_id = self.allocate_session(connection_id, target_id);
                 let info = self.targets.get(target_id).map(Self::target_info).unwrap_or(Value::Null);
-                if let Some(connection) = self.connections.get_mut(&connection_id) {
-                    queue_event(
-                        connection,
-                        "Target.attachedToTarget",
-                        json!({"sessionId": session_id, "targetInfo": info, "waitingForDebugger": false}),
-                        None,
-                    );
-                }
+                self.queue_event(
+                    connection_id,
+                    "Target.attachedToTarget",
+                    json!({"sessionId": session_id, "targetInfo": info, "waitingForDebugger": false}),
+                    None,
+                );
                 cdp_result_response(&request.id, json!({"sessionId": session_id}), session)
             }
             "Target.detachFromTarget" => {
@@ -1492,9 +1492,7 @@ impl PortableCdp {
             (output.response, output.events)
         };
         for event in events {
-            if let Some(connection) = self.connections.get_mut(&connection_id) {
-                queue_event(connection, &event.method, event.params, event.session_id.as_deref());
-            }
+            self.queue_event(connection_id, &event.method, event.params, event.session_id.as_deref());
         }
         if response.error.is_none() {
             if obscura_cdp::portable_network::supports(&request.method) {
@@ -2078,20 +2076,16 @@ impl PortableCdp {
                 })
                 .unwrap_or((false, false, true));
             if discover {
-                if let Some(connection) = self.connections.get_mut(&connection_id) {
-                    queue_event(connection, "Target.targetCreated", json!({"targetInfo": info}), None);
-                }
+                self.queue_event(connection_id, "Target.targetCreated", json!({"targetInfo": info}), None);
             }
             if auto_attach && !already_attached {
                 let session_id = self.allocate_session(connection_id, target_id);
-                if let Some(connection) = self.connections.get_mut(&connection_id) {
-                    queue_event(
-                        connection,
-                        "Target.attachedToTarget",
-                        json!({"sessionId": session_id, "targetInfo": info, "waitingForDebugger": false}),
-                        None,
-                    );
-                }
+                self.queue_event(
+                    connection_id,
+                    "Target.attachedToTarget",
+                    json!({"sessionId": session_id, "targetInfo": info, "waitingForDebugger": false}),
+                    None,
+                );
             }
         }
     }
@@ -2114,14 +2108,12 @@ impl PortableCdp {
                 continue;
             };
             let session_id = self.allocate_session(connection_id, &target_id);
-            if let Some(connection) = self.connections.get_mut(&connection_id) {
-                queue_event(
-                    connection,
-                    "Target.attachedToTarget",
-                    json!({"sessionId": session_id, "targetInfo": info, "waitingForDebugger": false}),
-                    None,
-                );
-            }
+            self.queue_event(
+                connection_id,
+                "Target.attachedToTarget",
+                json!({"sessionId": session_id, "targetInfo": info, "waitingForDebugger": false}),
+                None,
+            );
         }
     }
 
@@ -2167,15 +2159,13 @@ impl PortableCdp {
         self.cancel_actions_where(|action| {
             action.connection_id == connection_id && action.session_id.as_deref() == Some(session_id)
         });
-        if let Some(connection) = self.connections.get_mut(&connection_id) {
-            discard_session_events(connection, session_id);
-            queue_event(
-                connection,
-                "Target.detachedFromTarget",
-                json!({"sessionId": session_id, "targetId": target_id}),
-                None,
-            );
-        }
+        self.discard_session_events(connection_id, session_id);
+        self.queue_event(
+            connection_id,
+            "Target.detachedFromTarget",
+            json!({"sessionId": session_id, "targetId": target_id}),
+            None,
+        );
         Some(target_id)
     }
 
@@ -2230,15 +2220,33 @@ impl PortableCdp {
         // Completing one of those actions must be rejected, not applied to a
         // subsequent page with a coincidentally similar identifier.
         self.cancel_actions_where(|action| action.target_id == target.id);
-        for connection in self.connections.values_mut() {
+        let mut pending_events: Vec<(u32, Option<String>)> = Vec::new();
+        for (connection_id, connection) in self.connections.iter_mut() {
             let doomed: Vec<String> = connection.sessions.iter().filter(|(_, id)| *id == &target.id).map(|(session, _)| session.clone()).collect();
             for session_id in doomed {
                 connection.sessions.remove(&session_id);
-                discard_session_events(connection, &session_id);
-                queue_event(connection, "Target.detachedFromTarget", json!({"sessionId": session_id, "targetId": target.id}), None);
+                pending_events.push((*connection_id, Some(session_id)));
             }
             if connection.discover_targets {
-                queue_event(connection, "Target.targetDestroyed", json!({"targetId": target.id}), None);
+                pending_events.push((*connection_id, None));
+            }
+        }
+        for (connection_id, session_id) in pending_events {
+            if let Some(session_id) = session_id {
+                self.discard_session_events(connection_id, &session_id);
+                self.queue_event(
+                    connection_id,
+                    "Target.detachedFromTarget",
+                    json!({"sessionId": session_id, "targetId": target.id}),
+                    None,
+                );
+            } else {
+                self.queue_event(
+                    connection_id,
+                    "Target.targetDestroyed",
+                    json!({"targetId": target.id}),
+                    None,
+                );
             }
         }
     }
@@ -2289,6 +2297,21 @@ impl PortableCdp {
             "canAccessOpener": false,
             "browserContextId": target.context_id,
         })
+    }
+
+    fn queue_event(&mut self, connection_id: u32, method: &str, params: Value, session_id: Option<&str>) {
+        let event = match session_id {
+            Some(session_id) => obscura_cdp::protocol::CdpEvent::with_session(method, params, session_id.to_string()),
+            None => obscura_cdp::protocol::CdpEvent::new(method, params),
+        };
+        let _ = self
+            .shared_state
+            .queue_event(ConnectionId::new(u64::from(connection_id)), event);
+    }
+
+    fn discard_session_events(&mut self, connection_id: u32, session_id: &str) {
+        self.shared_state
+            .discard_session_events(ConnectionId::new(u64::from(connection_id)), session_id);
     }
 }
 
@@ -2693,31 +2716,6 @@ fn describe_node(
         }
     }
     Ok(node)
-}
-
-fn queue_event(connection: &mut Connection, method: &str, params: Value, session_id: Option<&str>) {
-    if connection.events.len() >= MAX_EVENT_QUEUE {
-        connection.events.pop_front();
-    }
-    let mut event = Map::new();
-    event.insert("method".to_string(), Value::String(method.to_string()));
-    event.insert("params".to_string(), params);
-    if let Some(session_id) = session_id {
-        event.insert("sessionId".to_string(), Value::String(session_id.to_string()));
-    }
-    connection.events.push_back(Value::Object(event));
-}
-
-/// Remove queued page-domain events for a session which has just been
-/// invalidated. Target lifecycle notifications intentionally do not carry a
-/// top-level `sessionId`, so they remain in order around the detach event.
-fn discard_session_events(connection: &mut Connection, session_id: &str) {
-    connection.events.retain(|event| {
-        event
-            .get("sessionId")
-            .and_then(Value::as_str)
-            .is_none_or(|queued_session| queued_session != session_id)
-    });
 }
 
 #[cfg(test)]
