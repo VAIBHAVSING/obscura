@@ -1339,7 +1339,26 @@ impl PortableCdp {
         serde_json::to_value(response).ok()
     }
 
+    fn shared_page_response(&self, request: &Request, target_id: &str) -> Option<Value> {
+        if !obscura_cdp::portable_page::supports(&request.method) {
+            return None;
+        }
+        let id = request.id.as_u64()?;
+        let page_id = *self.shared_pages.get(target_id)?;
+        let shared_request = obscura_cdp::protocol::CdpRequest {
+            id,
+            method: request.method.clone(),
+            params: Value::Object(request.params.clone()),
+            session_id: request.session_id.clone(),
+        };
+        let response = obscura_cdp::portable_page::dispatch(&shared_request, &self.shared_state, page_id);
+        serde_json::to_value(response).ok()
+    }
+
     fn dispatch_page(&mut self, connection_id: u32, target_id: String, session_id: Option<String>, request: Request) -> Value {
+        if let Some(shared_response) = self.shared_page_response(&request, &target_id) {
+            return shared_response;
+        }
         let session = session_id.as_deref();
         match request.method.as_str() {
             "Runtime.enable" => {
