@@ -4,6 +4,7 @@ pub mod io;
 pub mod protocol;
 pub mod portable_target;
 pub mod portable_page;
+pub mod portable_network;
 pub mod state;
 
 // `server` is the legacy native TCP/WebSocket transport. Keep it out of the

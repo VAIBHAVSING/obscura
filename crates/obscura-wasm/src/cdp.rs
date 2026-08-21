@@ -625,10 +625,13 @@ impl PortableCdp {
     #[wasm_bindgen(js_name = cacheDisabled)]
     pub fn cache_disabled_json(&self, target_id: &str) -> Result<bool, JsValue> {
         bounded(target_id, MAX_METHOD_BYTES, "CDP target ID")?;
-        self.targets
+        let page_id = self
+            .shared_pages
             .get(target_id)
-            .map(|target| target.cache_disabled)
-            .ok_or_else(|| js_error("portable cache target is not known"))
+            .ok_or_else(|| js_error("portable cache target is not known"))?;
+        self.shared_state
+            .cache_disabled(page_id)
+            .map_err(|error| js_error(&format!("portable cache target is not known: {error}")))
     }
 
     /// Clear response-body ownership associated with a target. The host
@@ -637,6 +640,14 @@ impl PortableCdp {
     #[wasm_bindgen(js_name = clearResponseCache)]
     pub fn clear_response_cache(&mut self, target_id: &str) -> Result<(), JsValue> {
         bounded(target_id, MAX_METHOD_BYTES, "CDP target ID")?;
+        let page_id = self
+            .shared_pages
+            .get(target_id)
+            .copied()
+            .ok_or_else(|| js_error("portable cache target is not known"))?;
+        self.shared_state
+            .clear_response_bodies(&page_id)
+            .map_err(|error| js_error(&format!("portable cache target is not known: {error}")))?;
         let Some(target) = self.targets.get_mut(target_id) else {
             return Err(js_error("portable cache target is not known"));
         };
@@ -708,6 +719,8 @@ impl PortableCdp {
         if events.len() > MAX_EVENT_QUEUE {
             return Err(js_range_error("portable network metadata exceeds the event limit"));
         }
+        let shared_page = self.shared_pages.get(target_id).copied();
+        let mut shared_bodies = Vec::new();
         let Some(target) = self.targets.get_mut(target_id) else {
             return Err(js_error("portable network target is not known"));
         };
@@ -747,6 +760,7 @@ impl PortableCdp {
                     body: body_base64.to_string(),
                     base64_encoded: true,
                 });
+                shared_bodies.push((request_id.to_string(), body_base64.to_string(), true));
             }
 
             let request_headers = event.get("requestHeaders").cloned().unwrap_or_else(|| Value::Object(Map::new()));
@@ -795,6 +809,13 @@ impl PortableCdp {
                 }), Some(&session_id));
             }
         }
+        if let Some(shared_page) = shared_page {
+            for (request_id, body, base64_encoded) in shared_bodies {
+                self.shared_state
+                    .store_response_body(&shared_page, &request_id, body, base64_encoded)
+                    .map_err(|error| js_error(&format!("portable network response state failed: {error}")))?;
+            }
+        }
         Ok(())
     }
 
@@ -810,6 +831,35 @@ impl PortableCdp {
         }
         bounded(url, MAX_NAVIGATION_URL_BYTES, "Fetch request URL")?;
         bounded(method, 32, "Fetch request method")?;
+        let request_stage = metadata
+            .get("requestStage")
+            .and_then(Value::as_str)
+            .unwrap_or("Request");
+        if request_stage != "Request" && request_stage != "Response" {
+            return Err(js_error("Fetch requestStage must be Request or Response"));
+        }
+        let shared_page = self.shared_pages.get(target_id).copied();
+        let shared_response_body = if request_stage == "Response" {
+            if let Some(body_base64) = metadata.get("responseBodyBase64").and_then(Value::as_str) {
+                bounded(body_base64, MAX_ACTION_RESULT_BYTES, "Fetch response body")?;
+                let body = BASE64
+                    .decode(body_base64)
+                    .map_err(|_| js_error("Fetch response body is not valid base64"))?;
+                if body.len() > MAX_RESPONSE_BODY_BYTES {
+                    return Err(js_range_error("Fetch response body exceeds the 4MiB limit"));
+                }
+                Some(body_base64.to_string())
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+        if let (Some(shared_page), Some(body)) = (shared_page, shared_response_body.as_ref()) {
+            self.shared_state
+                .store_response_body(&shared_page, request_id, body.clone(), true)
+                .map_err(|error| js_error(&format!("portable Fetch response state failed: {error}")))?;
+        }
         let Some(target) = self.targets.get_mut(target_id) else {
             return Err(js_error("portable Fetch target is not known"));
         };
@@ -834,13 +884,6 @@ impl PortableCdp {
             .and_then(Value::as_str)
             .unwrap_or("Fetch");
         bounded(resource_type, 64, "Fetch resource type")?;
-        let request_stage = metadata
-            .get("requestStage")
-            .and_then(Value::as_str)
-            .unwrap_or("Request");
-        if request_stage != "Request" && request_stage != "Response" {
-            return Err(js_error("Fetch requestStage must be Request or Response"));
-        }
         let post_data = metadata.get("postData").and_then(Value::as_str).map(str::to_string);
         if let Some(post_data) = post_data.as_deref() {
             bounded(post_data, MAX_ACTION_RESULT_BYTES, "Fetch postData")?;
@@ -1355,7 +1398,69 @@ impl PortableCdp {
         serde_json::to_value(response).ok()
     }
 
+    fn shared_network_response(&mut self, request: &Request, target_id: &str) -> Option<Value> {
+        if !obscura_cdp::portable_network::supports(&request.method) {
+            return None;
+        }
+        let id = request.id.as_u64()?;
+        let page_id = *self.shared_pages.get(target_id)?;
+        let shared_session = request
+            .session_id
+            .as_ref()
+            .and_then(|session| self.shared_sessions.get(session).copied());
+        let shared_request = obscura_cdp::protocol::CdpRequest {
+            id,
+            method: request.method.clone(),
+            params: Value::Object(request.params.clone()),
+            session_id: request.session_id.clone(),
+        };
+        let response = obscura_cdp::portable_network::dispatch(
+            &shared_request,
+            &mut self.shared_state,
+            page_id,
+            shared_session,
+        );
+        if response.error.is_none() {
+            if let Some(target) = self.targets.get_mut(target_id) {
+                match request.method.as_str() {
+                    "Network.enable" => {
+                        if let Some(session) = request.session_id.as_ref() {
+                            target.network_enabled_sessions.insert(session.clone());
+                        }
+                    }
+                    "Network.disable" => {
+                        if let Some(session) = request.session_id.as_ref() {
+                            target.network_enabled_sessions.remove(session);
+                        }
+                        target.response_bodies.clear();
+                    }
+                    "Network.setCacheDisabled" => {
+                        target.cache_disabled = request
+                            .params
+                            .get("cacheDisabled")
+                            .and_then(Value::as_bool)
+                            .unwrap_or(false);
+                    }
+                    "Network.setExtraHTTPHeaders" => {
+                        if let Some(headers) = request.params.get("headers").and_then(Value::as_object) {
+                            target.extra_headers = headers
+                                .iter()
+                                .filter_map(|(name, value)| value.as_str().map(|value| (name.clone(), value.to_string())))
+                                .collect();
+                        }
+                    }
+                    "Network.clearBrowserCache" => target.response_bodies.clear(),
+                    _ => {}
+                }
+            }
+        }
+        serde_json::to_value(response).ok()
+    }
+
     fn dispatch_page(&mut self, connection_id: u32, target_id: String, session_id: Option<String>, request: Request) -> Value {
+        if let Some(shared_response) = self.shared_network_response(&request, &target_id) {
+            return shared_response;
+        }
         if let Some(shared_response) = self.shared_page_response(&request, &target_id) {
             return shared_response;
         }

@@ -13,6 +13,7 @@ use crate::engine::{
     ActionId, ActionResult, CdpEngine, CdpFailure, ContextId, ContextOptions, EngineAction,
     PageId, PageSnapshot,
 };
+use crate::protocol::MAX_METHOD_BYTES;
 
 pub const MAX_CONTEXTS: usize = 256;
 pub const MAX_PAGES: usize = 4096;
@@ -21,6 +22,12 @@ pub const MAX_SESSIONS: usize = 8192;
 pub const MAX_ACTIONS: usize = 512;
 pub const MAX_URL_BYTES: usize = 8 * 1024 * 1024;
 pub const MAX_STORAGE_STATE_BYTES: usize = 16 * 1024 * 1024;
+pub const MAX_NETWORK_RESPONSE_BODIES: usize = 128;
+pub const MAX_NETWORK_RESPONSE_BODY_BYTES: usize = 4 * 1024 * 1024;
+pub const MAX_NETWORK_RESPONSE_WIRE_BYTES: usize = MAX_NETWORK_RESPONSE_BODY_BYTES * 2;
+pub const MAX_NETWORK_REQUEST_ID_BYTES: usize = 256;
+pub const MAX_NETWORK_HEADERS: usize = 256;
+pub const MAX_NETWORK_HEADER_BYTES: usize = 64 * 1024;
 
 #[derive(Clone, Copy, Debug, Default, Deserialize, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize)]
 #[serde(transparent)]
@@ -90,6 +97,59 @@ pub struct PageState {
     pub frame_id: String,
     pub loader_id: String,
     pub document_generation: u64,
+    pub network: PageNetworkState,
+}
+
+/// Per-page Network policy and response-body state shared by CDP adapters.
+///
+/// The host may own the actual transport/cache bytes, but the portable core
+/// owns which sessions are enabled, request headers, cache policy, and the
+/// bounded CDP response-body view.
+#[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+pub struct PageNetworkState {
+    pub enabled_sessions: BTreeSet<SessionId>,
+    pub cache_disabled: bool,
+    pub extra_headers: BTreeMap<String, String>,
+    pub response_bodies: BTreeMap<String, NetworkResponseBody>,
+    response_body_order: BTreeMap<u64, String>,
+    response_body_bytes: usize,
+    next_response_order: u64,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct NetworkResponseBody {
+    pub body: String,
+    pub base64_encoded: bool,
+}
+
+impl PageNetworkState {
+    fn clear_response_bodies(&mut self) {
+        self.response_bodies.clear();
+        self.response_body_order.clear();
+        self.response_body_bytes = 0;
+    }
+
+    fn remove_response_body(&mut self, request_id: &str) {
+        if let Some(body) = self.response_bodies.remove(request_id) {
+            self.response_body_bytes = self.response_body_bytes.saturating_sub(body.body.len());
+        }
+        self.response_body_order.retain(|_, value| value != request_id);
+    }
+
+    fn evict_oldest_response_body(&mut self) {
+        let Some((order, request_id)) = self
+            .response_body_order
+            .iter()
+            .next()
+            .map(|(order, request_id)| (*order, request_id.clone()))
+        else {
+            return;
+        };
+        self.response_body_order.remove(&order);
+        if let Some(body) = self.response_bodies.remove(&request_id) {
+            self.response_body_bytes = self.response_body_bytes.saturating_sub(body.body.len());
+        }
+    }
 }
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
@@ -194,6 +254,132 @@ impl BrowserState {
         self.actions.len()
     }
 
+    pub fn network_state(&self, id: &PageId) -> Option<&PageNetworkState> {
+        self.pages.get(id).map(|page| &page.network)
+    }
+
+    pub fn network_enable(&mut self, page: &PageId, session: SessionId) -> Result<(), CdpFailure> {
+        let page = self.pages.get_mut(page).ok_or(CdpFailure::UnknownPage(*page))?;
+        if page.network.enabled_sessions.len() >= MAX_SESSIONS
+            && !page.network.enabled_sessions.contains(&session)
+        {
+            return Err(CdpFailure::ActionQueueFull);
+        }
+        page.network.enabled_sessions.insert(session);
+        Ok(())
+    }
+
+    pub fn network_disable(
+        &mut self,
+        page: &PageId,
+        session: Option<SessionId>,
+    ) -> Result<(), CdpFailure> {
+        let page = self.pages.get_mut(page).ok_or(CdpFailure::UnknownPage(*page))?;
+        if let Some(session) = session {
+            page.network.enabled_sessions.remove(&session);
+        } else {
+            page.network.enabled_sessions.clear();
+        }
+        page.network.clear_response_bodies();
+        Ok(())
+    }
+
+    pub fn set_cache_disabled(&mut self, page: &PageId, disabled: bool) -> Result<(), CdpFailure> {
+        let page = self.pages.get_mut(page).ok_or(CdpFailure::UnknownPage(*page))?;
+        page.network.cache_disabled = disabled;
+        Ok(())
+    }
+
+    pub fn cache_disabled(&self, page: &PageId) -> Result<bool, CdpFailure> {
+        self.pages
+            .get(page)
+            .map(|page| page.network.cache_disabled)
+            .ok_or(CdpFailure::UnknownPage(*page))
+    }
+
+    pub fn set_extra_headers(
+        &mut self,
+        page: &PageId,
+        headers: BTreeMap<String, String>,
+    ) -> Result<(), CdpFailure> {
+        if headers.len() > MAX_NETWORK_HEADERS {
+            return Err(CdpFailure::invalid_argument("Network headers exceed the entry limit"));
+        }
+        let bytes = headers
+            .iter()
+            .map(|(name, value)| name.len().saturating_add(value.len()))
+            .sum::<usize>();
+        if bytes > MAX_NETWORK_HEADER_BYTES {
+            return Err(CdpFailure::invalid_argument("Network headers exceed the byte limit"));
+        }
+        if headers.keys().any(|name| name.is_empty() || name.len() > MAX_METHOD_BYTES)
+            || headers.values().any(|value| value.len() > MAX_NETWORK_HEADER_BYTES)
+        {
+            return Err(CdpFailure::invalid_argument("Network header name or value is invalid"));
+        }
+        let page = self.pages.get_mut(page).ok_or(CdpFailure::UnknownPage(*page))?;
+        page.network.extra_headers = headers;
+        Ok(())
+    }
+
+    pub fn extra_headers(&self, page: &PageId) -> Result<BTreeMap<String, String>, CdpFailure> {
+        self.pages
+            .get(page)
+            .map(|page| page.network.extra_headers.clone())
+            .ok_or(CdpFailure::UnknownPage(*page))
+    }
+
+    pub fn store_response_body(
+        &mut self,
+        page: &PageId,
+        request_id: &str,
+        body: String,
+        base64_encoded: bool,
+    ) -> Result<(), CdpFailure> {
+        if request_id.is_empty() || request_id.len() > MAX_NETWORK_REQUEST_ID_BYTES {
+            return Err(CdpFailure::invalid_argument("Network requestId is invalid"));
+        }
+        let wire_bytes = body.len();
+        if wire_bytes > MAX_NETWORK_RESPONSE_WIRE_BYTES {
+            return Err(CdpFailure::invalid_argument("Network response body exceeds the byte limit"));
+        }
+        let page = self.pages.get_mut(page).ok_or(CdpFailure::UnknownPage(*page))?;
+        page.network.remove_response_body(request_id);
+        while (page.network.response_bodies.len() >= MAX_NETWORK_RESPONSE_BODIES
+            || page.network.response_body_bytes.saturating_add(wire_bytes) > MAX_NETWORK_RESPONSE_WIRE_BYTES)
+            && !page.network.response_bodies.is_empty()
+        {
+            page.network.evict_oldest_response_body();
+        }
+        let order = page.network.next_response_order;
+        page.network.next_response_order = page
+            .network
+            .next_response_order
+            .checked_add(1)
+            .ok_or(CdpFailure::IdExhausted)?;
+        page.network.response_body_order.insert(order, request_id.to_string());
+        page.network.response_body_bytes = page.network.response_body_bytes.saturating_add(wire_bytes);
+        page.network.response_bodies.insert(
+            request_id.to_string(),
+            NetworkResponseBody { body, base64_encoded },
+        );
+        Ok(())
+    }
+
+    pub fn response_body(&self, page: &PageId, request_id: &str) -> Result<NetworkResponseBody, CdpFailure> {
+        self.pages
+            .get(page)
+            .and_then(|page| page.network.response_bodies.get(request_id))
+            .cloned()
+            .ok_or_else(|| CdpFailure::UnknownPage(*page))
+    }
+
+    pub fn clear_response_bodies(&mut self, page: &PageId) -> Result<(), CdpFailure> {
+        let page = self.pages.get_mut(page).ok_or(CdpFailure::UnknownPage(*page))?;
+        page.network.clear_response_bodies();
+        Ok(())
+    }
+
     /// Update target metadata after a host navigation or document commit.
     /// The identity remains stable while the document generation advances.
     pub fn update_page(
@@ -243,8 +429,7 @@ impl BrowserState {
                 .filter_map(|(session, connection)| (*connection == id).then_some(*session))
                 .collect();
             for session in sessions {
-                self.session_connections.remove(&session);
-                self.sessions.remove(&session);
+                let _ = self.detach(session);
             }
         }
         removed
@@ -269,7 +454,13 @@ impl BrowserState {
 
     pub fn detach(&mut self, id: SessionId) -> Option<PageId> {
         self.session_connections.remove(&id);
-        self.sessions.remove(&id)
+        let page = self.sessions.remove(&id);
+        if let Some(page_id) = page {
+            if let Some(page) = self.pages.get_mut(&page_id) {
+                page.network.enabled_sessions.remove(&id);
+            }
+        }
+        page
     }
 
     pub fn attached_page(&self, id: SessionId) -> Option<PageId> {
@@ -395,6 +586,7 @@ impl CdpEngine for BrowserState {
                 frame_id: format!("page-{id}"),
                 loader_id: format!("loader-{id}-1"),
                 document_generation: self.generation,
+                network: PageNetworkState::default(),
             },
         );
         Ok(id)
