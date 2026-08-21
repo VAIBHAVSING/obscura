@@ -7,6 +7,7 @@ pub mod portable_page;
 pub mod portable_network;
 pub mod portable_emulation;
 pub mod portable_fetch;
+pub mod portable_storage;
 pub mod state;
 
 // `server` is the legacy native TCP/WebSocket transport. Keep it out of the

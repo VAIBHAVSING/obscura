@@ -21,7 +21,7 @@ use obscura_cdp::engine::{
     ContextId, ContextOptions, EngineAction, PageId,
 };
 use obscura_cdp::protocol::{MAX_MESSAGE_BYTES, MAX_METHOD_BYTES, MAX_SESSION_BYTES};
-use obscura_cdp::state::{BrowserState, ConnectionId, SessionId};
+use obscura_cdp::state::{BrowserState, ConnectionId, ContextCookieState, SessionId};
 
 use crate::ObscuraCore;
 use crate::navigation::{MAX_NAVIGATION_HEADERS_BYTES, MAX_NAVIGATION_URL_BYTES};
@@ -1585,7 +1585,66 @@ impl PortableCdp {
         serde_json::to_value(response).ok()
     }
 
+    fn shared_storage_response(&mut self, request: &Request, target_id: &str) -> Option<Value> {
+        if !obscura_cdp::portable_storage::supports(&request.method) {
+            return None;
+        }
+        let id = request.id.as_u64()?;
+        let page_id = *self.shared_pages.get(target_id)?;
+        let now = cookie_clock(&request.params).unwrap_or(0);
+        let existing = self
+            .targets
+            .get(target_id)
+            .and_then(|target| target.core.cdp_all_cookies(now).ok())
+            .and_then(|raw| serde_json::from_str::<Vec<ContextCookieState>>(&raw).ok())
+            .unwrap_or_default();
+        if !existing.is_empty() {
+            let _ = self.shared_state.merge_context_cookies(&page_id, existing, now);
+        }
+        let shared_request = obscura_cdp::protocol::CdpRequest {
+            id,
+            method: request.method.clone(),
+            params: Value::Object(request.params.clone()),
+            session_id: request.session_id.clone(),
+        };
+        let response = obscura_cdp::portable_storage::dispatch(&shared_request, &mut self.shared_state, page_id);
+        if response.error.is_none()
+            && matches!(
+                request.method.as_str(),
+                "Network.setCookies"
+                    | "Storage.setCookies"
+                    | "Network.deleteCookies"
+                    | "Network.clearBrowserCookies"
+                    | "Storage.clearDataForOrigin"
+            )
+        {
+            if let Ok(cookie_json) = self.shared_state.context_cookies_json(&page_id, now) {
+                let context_id = self.targets.get(target_id).map(|target| target.context_id.clone());
+                let targets: Vec<String> = context_id
+                    .as_deref()
+                    .map(|context| {
+                        self.targets
+                            .iter()
+                            .filter(|(_, target)| target.context_id == context)
+                            .map(|(target_id, _)| target_id.clone())
+                            .collect()
+                    })
+                    .unwrap_or_default();
+                for target_id in targets {
+                    if let Some(target) = self.targets.get_mut(&target_id) {
+                        let _ = target.core.cdp_clear_cookies();
+                        let _ = target.core.cdp_import_cookies(&cookie_json, now);
+                    }
+                }
+            }
+        }
+        serde_json::to_value(response).ok()
+    }
+
     fn dispatch_page(&mut self, connection_id: u32, target_id: String, session_id: Option<String>, request: Request) -> Value {
+        if let Some(shared_response) = self.shared_storage_response(&request, &target_id) {
+            return shared_response;
+        }
         if let Some(shared_response) = self.shared_fetch_response(&request, &target_id) {
             return shared_response;
         }
@@ -3077,6 +3136,34 @@ mod tests {
         assert_eq!(json(&cdp.cdp_request(connection, &delete).unwrap())["result"], json!({}));
         let empty = json(&cdp.cdp_request(connection, &get).unwrap());
         assert!(empty["result"]["cookies"].as_array().unwrap().is_empty());
+    }
+
+    #[test]
+    fn portable_storage_cookie_state_is_shared_by_context_not_target() {
+        let mut cdp = PortableCdp::new("").unwrap();
+        let connection = cdp.open_connection().unwrap();
+        let first = json(&cdp.cdp_request(
+            connection,
+            r#"{"id":1,"method":"Target.attachToTarget","params":{"targetId":"page-1"}}"#,
+        ).unwrap());
+        let first_session = first["result"]["sessionId"].as_str().unwrap().to_string();
+        let set = format!(r#"{{"id":2,"sessionId":"{first_session}","method":"Storage.setCookies","params":{{"_obscuraNowSecs":100,"cookies":[{{"name":"ctx","value":"yes","domain":"example.test","path":"/"}}]}}}}"#);
+        assert_eq!(json(&cdp.cdp_request(connection, &set).unwrap())["result"], json!({}));
+        let created = json(&cdp.cdp_request(
+            connection,
+            r#"{"id":3,"method":"Target.createTarget","params":{"url":"https://example.test/other"}}"#,
+        ).unwrap());
+        let second_target = created["result"]["targetId"].as_str().unwrap();
+        let second = json(&cdp.cdp_request(
+            connection,
+            &format!(r#"{{"id":4,"method":"Target.attachToTarget","params":{{"targetId":"{second_target}"}}}}"#),
+        ).unwrap());
+        let second_session = second["result"]["sessionId"].as_str().unwrap();
+        let get = json(&cdp.cdp_request(
+            connection,
+            &format!(r#"{{"id":5,"sessionId":"{second_session}","method":"Network.getAllCookies","params":{{"_obscuraNowSecs":100}}}}"#),
+        ).unwrap());
+        assert_eq!(get["result"]["cookies"][0]["name"], "ctx");
     }
 
     #[test]

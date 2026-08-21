@@ -33,6 +33,8 @@ pub const MAX_FETCH_PATTERNS: usize = 64;
 pub const MAX_FETCH_PATTERN_BYTES: usize = 2048;
 pub const MAX_FETCH_REQUESTS: usize = 256;
 pub const MAX_FETCH_RESOLUTIONS: usize = 256;
+pub const MAX_COOKIE_COUNT: usize = 4096;
+pub const MAX_COOKIE_BYTES: usize = 64 * 1024;
 pub const DEFAULT_VIEWPORT_WIDTH: u32 = 800;
 pub const DEFAULT_VIEWPORT_HEIGHT: u32 = 600;
 pub const MAX_VIEWPORT_DIMENSION: u32 = 4096;
@@ -94,6 +96,21 @@ pub struct ContextState {
     pub id: ContextId,
     pub options: ContextOptions,
     pub generation: u64,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ContextCookieState {
+    pub name: String,
+    pub value: String,
+    pub domain: String,
+    pub path: String,
+    pub secure: bool,
+    pub http_only: bool,
+    pub same_site: String,
+    pub expires: Option<i64>,
+    #[serde(default)]
+    pub host_only: bool,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -206,6 +223,7 @@ pub struct BrowserState {
     pages: BTreeMap<PageId, PageState>,
     display: BTreeMap<PageId, PageDisplayState>,
     fetch_resolutions: BTreeMap<PageId, VecDeque<Value>>,
+    cookies: BTreeMap<ContextId, BTreeMap<(String, String, String), ContextCookieState>>,
     connections: BTreeSet<ConnectionId>,
     sessions: BTreeMap<SessionId, PageId>,
     session_connections: BTreeMap<SessionId, ConnectionId>,
@@ -243,6 +261,7 @@ impl BrowserState {
             pages: BTreeMap::new(),
             display: BTreeMap::new(),
             fetch_resolutions: BTreeMap::new(),
+            cookies: BTreeMap::from([(default_id, BTreeMap::new())]),
             connections: BTreeSet::new(),
             sessions: BTreeMap::new(),
             session_connections: BTreeMap::new(),
@@ -310,6 +329,111 @@ impl BrowserState {
             .get(id)
             .map(|page| page.context_id)
             .ok_or(CdpFailure::UnknownPage(*id))
+    }
+
+    pub fn context_cookies(
+        &self,
+        page: &PageId,
+        now_secs: u64,
+    ) -> Result<Vec<ContextCookieState>, CdpFailure> {
+        let context = self.context_for_page(page)?;
+        Ok(self
+            .cookies
+            .get(&context)
+            .into_iter()
+            .flat_map(|cookies| cookies.values())
+            .filter(|cookie| !cookie_expired(cookie, now_secs))
+            .cloned()
+            .collect())
+    }
+
+    pub fn context_cookies_json(&self, page: &PageId, now_secs: u64) -> Result<String, CdpFailure> {
+        let cookies = self.context_cookies(page, now_secs)?;
+        let value = serde_json::to_string(&cookies)
+            .map_err(|error| CdpFailure::host(format!("cookie serialization failed: {error}")))?;
+        if value.len() > MAX_COOKIE_BYTES {
+            return Err(CdpFailure::invalid_argument("cookie state exceeds the byte limit"));
+        }
+        Ok(value)
+    }
+
+    pub fn replace_context_cookies(
+        &mut self,
+        page: &PageId,
+        cookies: Vec<ContextCookieState>,
+        now_secs: u64,
+    ) -> Result<(), CdpFailure> {
+        if cookies.len() > MAX_COOKIE_COUNT {
+            return Err(CdpFailure::invalid_argument("cookies exceed the 4096-cookie limit"));
+        }
+        let context = self.context_for_page(page)?;
+        let mut next = BTreeMap::new();
+        for cookie in cookies {
+            validate_cookie(&cookie)?;
+            if cookie_expired(&cookie, now_secs) {
+                continue;
+            }
+            if next.len() >= MAX_COOKIE_COUNT {
+                return Err(CdpFailure::invalid_argument("cookies exceed the 4096-cookie limit"));
+            }
+            let key = (cookie.domain.clone(), cookie.name.clone(), cookie.path.clone());
+            next.insert(key, cookie);
+        }
+        self.cookies.insert(context, next);
+        Ok(())
+    }
+
+    pub fn merge_context_cookies(
+        &mut self,
+        page: &PageId,
+        cookies: Vec<ContextCookieState>,
+        now_secs: u64,
+    ) -> Result<(), CdpFailure> {
+        let context = self.context_for_page(page)?;
+        let current = self.cookies.entry(context).or_default();
+        let mut next = current.clone();
+        for cookie in cookies {
+            validate_cookie(&cookie)?;
+            let key = (cookie.domain.clone(), cookie.name.clone(), cookie.path.clone());
+            if cookie_expired(&cookie, now_secs) {
+                next.remove(&key);
+            } else {
+                next.insert(key, cookie);
+            }
+        }
+        if next.len() > MAX_COOKIE_COUNT {
+            return Err(CdpFailure::invalid_argument("cookies exceed the 4096-cookie limit"));
+        }
+        *current = next;
+        Ok(())
+    }
+
+    pub fn delete_context_cookies(
+        &mut self,
+        page: &PageId,
+        name: &str,
+        domain: &str,
+        path: Option<&str>,
+    ) -> Result<(), CdpFailure> {
+        if name.is_empty() || name.len() > MAX_METHOD_BYTES || domain.len() > MAX_METHOD_BYTES {
+            return Err(CdpFailure::invalid_argument("cookie name or domain is invalid"));
+        }
+        let context = self.context_for_page(page)?;
+        if let Some(cookies) = self.cookies.get_mut(&context) {
+            let domain = domain.trim_start_matches('.').to_ascii_lowercase();
+            cookies.retain(|(cookie_domain, cookie_name, cookie_path), _| {
+                !(cookie_name == name
+                    && (domain.is_empty() || cookie_domain == &domain)
+                    && path.is_none_or(|expected| expected == cookie_path))
+            });
+        }
+        Ok(())
+    }
+
+    pub fn clear_context_cookies(&mut self, page: &PageId) -> Result<(), CdpFailure> {
+        let context = self.context_for_page(page)?;
+        self.cookies.entry(context).or_default().clear();
+        Ok(())
     }
 
     pub fn set_device_metrics(
@@ -692,6 +816,7 @@ impl BrowserState {
         self.pages.clear();
         self.display.clear();
         self.fetch_resolutions.clear();
+        self.cookies.clear();
         self.connections.clear();
         self.sessions.clear();
         self.session_connections.clear();
@@ -746,6 +871,28 @@ impl BrowserState {
     }
 }
 
+fn validate_cookie(cookie: &ContextCookieState) -> Result<(), CdpFailure> {
+    if cookie.name.is_empty()
+        || cookie.name.len() > MAX_METHOD_BYTES
+        || cookie.domain.is_empty()
+        || cookie.domain.len() > MAX_METHOD_BYTES
+        || cookie.path.is_empty()
+        || cookie.path.len() > MAX_METHOD_BYTES
+        || !cookie.path.starts_with('/')
+        || cookie.value.len() > MAX_COOKIE_BYTES
+        || cookie.same_site.len() > MAX_METHOD_BYTES
+    {
+        return Err(CdpFailure::invalid_argument("cookie is invalid"));
+    }
+    Ok(())
+}
+
+fn cookie_expired(cookie: &ContextCookieState, now_secs: u64) -> bool {
+    cookie.expires.is_some_and(|expires| {
+        expires < 0 || u64::try_from(expires).map_or(true, |expires| expires <= now_secs)
+    })
+}
+
 impl CdpEngine for BrowserState {
     fn create_context(&mut self, options: ContextOptions) -> Result<ContextId, CdpFailure> {
         self.ensure_open()?;
@@ -762,6 +909,7 @@ impl CdpEngine for BrowserState {
                 generation: self.generation,
             },
         );
+        self.cookies.insert(id, BTreeMap::new());
         Ok(id)
     }
 
@@ -773,6 +921,7 @@ impl CdpEngine for BrowserState {
         if self.contexts.remove(id).is_none() {
             return Err(CdpFailure::UnknownContext(*id));
         }
+        self.cookies.remove(id);
         let pages: Vec<PageId> = self
             .pages
             .values()
