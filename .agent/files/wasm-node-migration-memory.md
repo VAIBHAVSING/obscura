@@ -1040,3 +1040,17 @@ render-enabled WASM **76/76 passed**, native-server CDP check passed, wasm32
 render check passed, and `git diff --check` passed. `cargo-nextest` is not
 installed in this environment, so these are the supported `cargo test`
 fallback results rather than nextest claims.
+
+## Shared CDP page-history checkpoint (2026-08-21)
+
+Source commit: `9fdfed3` (`feat: share portable page history`).
+
+`BrowserState` now owns bounded per-page history entries and reset state.
+`Page.getNavigationHistory` and `Page.resetNavigationHistory` are dispatched
+through the shared portable module, and shared navigation completion appends a
+new entry while preserving exact CDP wire names such as `userTypedURL` and
+`transitionType`. The WASM target mirror remains only for legacy host actions.
+
+Verification: portable CDP **29/29 passed**, WASM **70/70 passed**,
+render-enabled WASM **76/76 passed**, native-server CDP check passed, wasm32
+render check passed, and `git diff --check` passed.
