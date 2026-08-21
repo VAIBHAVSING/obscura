@@ -1457,7 +1457,66 @@ impl PortableCdp {
         serde_json::to_value(response).ok()
     }
 
+    fn shared_emulation_response(&mut self, request: &Request, target_id: &str) -> Option<Value> {
+        if !obscura_cdp::portable_emulation::supports(&request.method) {
+            return None;
+        }
+        let id = request.id.as_u64()?;
+        let page_id = *self.shared_pages.get(target_id)?;
+        let shared_request = obscura_cdp::protocol::CdpRequest {
+            id,
+            method: request.method.clone(),
+            params: Value::Object(request.params.clone()),
+            session_id: request.session_id.clone(),
+        };
+        let response = obscura_cdp::portable_emulation::dispatch(
+            &shared_request,
+            &mut self.shared_state,
+            page_id,
+        );
+        if response.error.is_none() {
+            if let Some(target) = self.targets.get_mut(target_id) {
+                match request.method.as_str() {
+                    "Emulation.setDeviceMetricsOverride" => {
+                        if let (Some(width), Some(height)) = (
+                            request.params.get("width").and_then(Value::as_u64),
+                            request.params.get("height").and_then(Value::as_u64),
+                        ) {
+                            target.viewport = Viewport {
+                                width: u32::try_from(width).unwrap_or(Viewport::default().width),
+                                height: u32::try_from(height).unwrap_or(Viewport::default().height),
+                            };
+                        }
+                    }
+                    "Emulation.clearDeviceMetricsOverride" => {
+                        target.viewport = Viewport::default();
+                    }
+                    "Emulation.setEmulatedMedia" => {
+                        target.emulated_media = request
+                            .params
+                            .get("media")
+                            .and_then(Value::as_str)
+                            .unwrap_or("")
+                            .to_string();
+                    }
+                    "Emulation.setFocusEmulationEnabled" => {
+                        target.focus_emulation = request
+                            .params
+                            .get("enabled")
+                            .and_then(Value::as_bool)
+                            .unwrap_or(false);
+                    }
+                    _ => {}
+                }
+            }
+        }
+        serde_json::to_value(response).ok()
+    }
+
     fn dispatch_page(&mut self, connection_id: u32, target_id: String, session_id: Option<String>, request: Request) -> Value {
+        if let Some(shared_response) = self.shared_emulation_response(&request, &target_id) {
+            return shared_response;
+        }
         if let Some(shared_response) = self.shared_network_response(&request, &target_id) {
             return shared_response;
         }

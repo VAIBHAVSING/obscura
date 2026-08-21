@@ -28,6 +28,9 @@ pub const MAX_NETWORK_RESPONSE_WIRE_BYTES: usize = MAX_NETWORK_RESPONSE_BODY_BYT
 pub const MAX_NETWORK_REQUEST_ID_BYTES: usize = 256;
 pub const MAX_NETWORK_HEADERS: usize = 256;
 pub const MAX_NETWORK_HEADER_BYTES: usize = 64 * 1024;
+pub const DEFAULT_VIEWPORT_WIDTH: u32 = 800;
+pub const DEFAULT_VIEWPORT_HEIGHT: u32 = 600;
+pub const MAX_VIEWPORT_DIMENSION: u32 = 4096;
 
 #[derive(Clone, Copy, Debug, Default, Deserialize, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize)]
 #[serde(transparent)]
@@ -122,6 +125,29 @@ pub struct NetworkResponseBody {
     pub base64_encoded: bool,
 }
 
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+pub struct PageDisplayState {
+    pub width: u32,
+    pub height: u32,
+    pub device_scale_factor: f64,
+    pub mobile: bool,
+    pub emulated_media: String,
+    pub focus_emulation: bool,
+}
+
+impl Default for PageDisplayState {
+    fn default() -> Self {
+        Self {
+            width: DEFAULT_VIEWPORT_WIDTH,
+            height: DEFAULT_VIEWPORT_HEIGHT,
+            device_scale_factor: 1.0,
+            mobile: false,
+            emulated_media: String::new(),
+            focus_emulation: false,
+        }
+    }
+}
+
 impl PageNetworkState {
     fn clear_response_bodies(&mut self) {
         self.response_bodies.clear();
@@ -165,6 +191,7 @@ struct PendingAction {
 pub struct BrowserState {
     contexts: BTreeMap<ContextId, ContextState>,
     pages: BTreeMap<PageId, PageState>,
+    display: BTreeMap<PageId, PageDisplayState>,
     connections: BTreeSet<ConnectionId>,
     sessions: BTreeMap<SessionId, PageId>,
     session_connections: BTreeMap<SessionId, ConnectionId>,
@@ -200,6 +227,7 @@ impl BrowserState {
         Self {
             contexts,
             pages: BTreeMap::new(),
+            display: BTreeMap::new(),
             connections: BTreeSet::new(),
             sessions: BTreeMap::new(),
             session_connections: BTreeMap::new(),
@@ -256,6 +284,59 @@ impl BrowserState {
 
     pub fn network_state(&self, id: &PageId) -> Option<&PageNetworkState> {
         self.pages.get(id).map(|page| &page.network)
+    }
+
+    pub fn display_state(&self, id: &PageId) -> Option<&PageDisplayState> {
+        self.display.get(id)
+    }
+
+    pub fn set_device_metrics(
+        &mut self,
+        page: &PageId,
+        width: u32,
+        height: u32,
+        device_scale_factor: f64,
+        mobile: bool,
+    ) -> Result<(), CdpFailure> {
+        if width == 0
+            || height == 0
+            || width > MAX_VIEWPORT_DIMENSION
+            || height > MAX_VIEWPORT_DIMENSION
+            || !device_scale_factor.is_finite()
+            || !(0.0..=8.0).contains(&device_scale_factor)
+        {
+            return Err(CdpFailure::invalid_argument("device metrics are outside portable limits"));
+        }
+        let display = self.display.get_mut(page).ok_or(CdpFailure::UnknownPage(*page))?;
+        display.width = width;
+        display.height = height;
+        display.device_scale_factor = device_scale_factor;
+        display.mobile = mobile;
+        Ok(())
+    }
+
+    pub fn clear_device_metrics(&mut self, page: &PageId) -> Result<(), CdpFailure> {
+        let display = self.display.get_mut(page).ok_or(CdpFailure::UnknownPage(*page))?;
+        display.width = DEFAULT_VIEWPORT_WIDTH;
+        display.height = DEFAULT_VIEWPORT_HEIGHT;
+        display.device_scale_factor = 1.0;
+        display.mobile = false;
+        Ok(())
+    }
+
+    pub fn set_emulated_media(&mut self, page: &PageId, media: String) -> Result<(), CdpFailure> {
+        if media.len() > MAX_METHOD_BYTES {
+            return Err(CdpFailure::invalid_argument("emulated media exceeds the byte limit"));
+        }
+        let display = self.display.get_mut(page).ok_or(CdpFailure::UnknownPage(*page))?;
+        display.emulated_media = media;
+        Ok(())
+    }
+
+    pub fn set_focus_emulation(&mut self, page: &PageId, enabled: bool) -> Result<(), CdpFailure> {
+        let display = self.display.get_mut(page).ok_or(CdpFailure::UnknownPage(*page))?;
+        display.focus_emulation = enabled;
+        Ok(())
     }
 
     pub fn network_enable(&mut self, page: &PageId, session: SessionId) -> Result<(), CdpFailure> {
@@ -475,6 +556,7 @@ impl BrowserState {
         self.closed = true;
         self.contexts.clear();
         self.pages.clear();
+        self.display.clear();
         self.connections.clear();
         self.sessions.clear();
         self.session_connections.clear();
@@ -519,6 +601,7 @@ impl BrowserState {
         if self.pages.remove(&id).is_none() {
             return Err(CdpFailure::UnknownPage(id));
         }
+        self.display.remove(&id);
         self.sessions.retain(|_, page| *page != id);
         let live_sessions: BTreeSet<SessionId> = self.sessions.keys().copied().collect();
         self.session_connections.retain(|session, _| live_sessions.contains(session));
@@ -589,6 +672,7 @@ impl CdpEngine for BrowserState {
                 network: PageNetworkState::default(),
             },
         );
+        self.display.insert(id, PageDisplayState::default());
         Ok(id)
     }
 
