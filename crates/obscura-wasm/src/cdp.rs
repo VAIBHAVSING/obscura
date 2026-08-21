@@ -1856,9 +1856,15 @@ impl PortableCdp {
                 "insertText",
                 Value::Object(request.params.clone()),
             ),
+            #[cfg(feature = "render")]
+            "Page.captureScreenshot" => self.capture_screenshot(&request, target_id, session),
+            #[cfg(not(feature = "render"))]
             "Page.captureScreenshot" => self.queue_action(connection_id, request.clone(), target_id, "screenshot", json!({
                 "format": request.params.get("format").and_then(Value::as_str).unwrap_or("png"),
             })),
+            #[cfg(feature = "render")]
+            "Page.printToPDF" => self.print_to_pdf(connection_id, &request, target_id, session),
+            #[cfg(not(feature = "render"))]
             "Page.printToPDF" => self.queue_action(connection_id, request.clone(), target_id, "pdf", json!({
                 "landscape": request.params.get("landscape").and_then(Value::as_bool).unwrap_or(false),
             })),
@@ -1909,6 +1915,87 @@ impl PortableCdp {
             "targetId": target_id,
             "payload": payload,
         }}), request.session_id.as_deref())
+    }
+
+    #[cfg(feature = "render")]
+    fn capture_screenshot(&mut self, request: &Request, target_id: String, session: Option<&str>) -> Value {
+        let format = request.params.get("format").and_then(Value::as_str).unwrap_or("png");
+        if format != "png" {
+            return cdp_error_response(&request.id, -32602, "portable WASM screenshots currently support only PNG", session);
+        }
+        let Some(target) = self.targets.get_mut(&target_id) else {
+            return cdp_error_response(&request.id, -32000, "target is not known", session);
+        };
+        let bytes = match target
+            .core
+            .screenshot_png(target.viewport.width, target.viewport.height, 0.0, 0.0)
+        {
+            Ok(bytes) if bytes.len() <= MAX_ACTION_RESULT_BYTES => bytes,
+            Ok(_) => {
+                return cdp_error_response(
+                    &request.id,
+                    -32000,
+                    "portable screenshot exceeds the response limit",
+                    session,
+                )
+            }
+            Err(_) => {
+                return cdp_error_response(&request.id, -32000, "portable screenshot failed", session)
+            }
+        };
+        cdp_result_response(
+            &request.id,
+            json!({"data": BASE64.encode(bytes), "fromSurface": true}),
+            session,
+        )
+    }
+
+    #[cfg(feature = "render")]
+    fn print_to_pdf(
+        &mut self,
+        connection_id: u32,
+        request: &Request,
+        target_id: String,
+        session: Option<&str>,
+    ) -> Value {
+        let Some(target) = self.targets.get_mut(&target_id) else {
+            return cdp_error_response(&request.id, -32000, "target is not known", session);
+        };
+        let mut options_value = Value::Object(request.params.clone());
+        if let Some(object) = options_value.as_object_mut() {
+            // transferMode belongs to the CDP envelope, not the portable PDF
+            // options schema, which intentionally denies unknown fields.
+            object.remove("transferMode");
+        }
+        let options = match serde_json::to_string(&options_value) {
+            Ok(options) => options,
+            Err(_) => return cdp_error_response(&request.id, -32602, "invalid PDF options", session),
+        };
+        let bytes = match target.core.pdf(&options, target.document_handle, target.revision) {
+            Ok(bytes) if bytes.len() <= MAX_ACTION_RESULT_BYTES => bytes,
+            Ok(_) => {
+                return cdp_error_response(
+                    &request.id,
+                    -32000,
+                    "portable PDF exceeds the response limit",
+                    session,
+                )
+            }
+            Err(_) => return cdp_error_response(&request.id, -32000, "portable PDF failed", session),
+        };
+        if request.params.get("transferMode").and_then(Value::as_str) == Some("ReturnAsStream") {
+            let handle = match self.streams.insert(bytes) {
+                Ok(handle) => handle,
+                Err(error) => return cdp_error_response(&request.id, -32000, error, session),
+            };
+            self.stream_connections.insert(handle.clone(), connection_id);
+            return cdp_result_response(
+                &request.id,
+                json!({"data": "", "stream": handle}),
+                session,
+            );
+        }
+        cdp_result_response(&request.id, json!({"data": BASE64.encode(bytes)}), session)
     }
 
     fn shared_engine_action(
@@ -3133,6 +3220,42 @@ mod tests {
         assert_eq!(events.as_array().unwrap().len(), 1);
         assert_eq!(events[0]["method"], "Target.detachedFromTarget");
         assert_eq!(events[0]["params"]["sessionId"], session);
+    }
+
+    #[cfg(feature = "render")]
+    #[test]
+    fn portable_render_commands_complete_inside_wasm() {
+        let mut cdp = PortableCdp::new("<html><body><h1>WASM</h1></body></html>").unwrap();
+        let connection = cdp.open_connection().unwrap();
+        let attached = json(&cdp
+            .cdp_request(
+                connection,
+                r#"{"id":1,"method":"Target.attachToTarget","params":{"targetId":"page-1"}}"#,
+            )
+            .unwrap());
+        let session = attached["result"]["sessionId"].as_str().unwrap().to_string();
+        cdp.poll_cdp_events(connection, 8).unwrap();
+
+        let screenshot = json(&cdp
+            .cdp_request(
+                connection,
+                &format!(r#"{{"id":2,"sessionId":"{session}","method":"Page.captureScreenshot","params":{{"format":"png"}}}}"#),
+            )
+            .unwrap());
+        assert!(screenshot["error"].is_null(), "{screenshot}");
+        let png = BASE64.decode(screenshot["result"]["data"].as_str().unwrap()).unwrap();
+        assert!(png.starts_with(b"\x89PNG\r\n\x1a\n"));
+
+        let pdf = json(&cdp
+            .cdp_request(
+                connection,
+                &format!(r#"{{"id":3,"sessionId":"{session}","method":"Page.printToPDF","params":{{"transferMode":"ReturnAsBase64"}}}}"#),
+            )
+            .unwrap());
+        assert!(pdf["error"].is_null(), "{pdf}");
+        let bytes = BASE64.decode(pdf["result"]["data"].as_str().unwrap()).unwrap();
+        assert!(bytes.starts_with(b"%PDF-"));
+        assert!(bytes.ends_with(b"%%EOF\n"));
     }
 }
 

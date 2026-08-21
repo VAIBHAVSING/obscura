@@ -73,6 +73,30 @@ fn panic_message(operation: &str, payload: Box<dyn Any + Send>) -> String {
     format!("Obscura WASM {operation} panicked: {detail}")
 }
 
+fn js_error_value(message: &str) -> JsValue {
+    #[cfg(target_arch = "wasm32")]
+    {
+        js_sys::Error::new(message).into()
+    }
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        let _ = message;
+        JsValue::NULL
+    }
+}
+
+fn js_syntax_error_value(message: &str) -> JsValue {
+    #[cfg(target_arch = "wasm32")]
+    {
+        js_sys::SyntaxError::new(message).into()
+    }
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        let _ = message;
+        JsValue::NULL
+    }
+}
+
 fn boundary_value<T>(operation: &str, call: impl FnOnce() -> T) -> T {
     match catch_unwind(AssertUnwindSafe(call)) {
         Ok(value) => value,
@@ -86,16 +110,14 @@ fn boundary_result<T>(
     operation: &str,
     call: impl FnOnce() -> Result<T, String>,
 ) -> Result<T, JsValue> {
-    boundary_result_with(operation, call, |error| js_sys::Error::new(&error).into())
+    boundary_result_with(operation, call, |error| js_error_value(&error))
 }
 
 fn boundary_selector_result<T>(
     operation: &str,
     call: impl FnOnce() -> Result<T, String>,
 ) -> Result<T, JsValue> {
-    boundary_result_with(operation, call, |error| {
-        js_sys::SyntaxError::new(&error).into()
-    })
+    boundary_result_with(operation, call, |error| js_syntax_error_value(&error))
 }
 
 fn boundary_result_with<T>(
