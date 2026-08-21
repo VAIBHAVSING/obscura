@@ -1021,3 +1021,22 @@ The migration is not complete: cookies/storage are still owned by the WASM
 page core, DOM/accessibility/input/runtime/navigation remain partly in the
 legacy dispatcher, event subscriptions are not yet in shared CDP state, and
 the final ABI/package and Playwright/Puppeteer acceptance gates remain open.
+
+## Shared CDP context-cookie checkpoint (2026-08-21)
+
+Source commit: `067525c` (`feat: share portable context cookie state`).
+
+This slice adds `portable_storage.rs` and context-owned cookie
+state to `obscura-cdp`. `Network.getAllCookies`, `Storage.getCookies`,
+`Network.setCookies`, `Storage.setCookies`, `Network.deleteCookies`,
+`Network.clearBrowserCookies`, and `Storage.clearDataForOrigin` now have a
+transport-free dispatcher with bounded counts/bytes and expiry filtering. The
+WASM adapter routes these commands through shared context state and mirrors
+mutations into every legacy page core in the context while the remaining
+navigation/document-cookie paths are migrated.
+
+Verification: portable CDP **29/29 passed**, WASM **70/70 passed**,
+render-enabled WASM **76/76 passed**, native-server CDP check passed, wasm32
+render check passed, and `git diff --check` passed. `cargo-nextest` is not
+installed in this environment, so these are the supported `cargo test`
+fallback results rather than nextest claims.
