@@ -8,6 +8,75 @@
 use serde_json::Value;
 
 use crate::engine::{CdpFailure, EngineAction, PageId};
+use crate::protocol::CdpRequest;
+use crate::state::BrowserState;
+
+/// A validated request-to-host-action record. The host executes the action;
+/// the portable CDP layer owns this command-to-payload mapping.
+#[derive(Clone, Debug, PartialEq)]
+pub struct HostActionRequest {
+    pub kind: String,
+    pub payload: Value,
+}
+
+/// Build a host action request for commands whose work must cross into the
+/// JavaScript/network host. `None` means the command belongs to another
+/// portable domain or is not part of this action slice.
+pub fn from_request(
+    request: &CdpRequest,
+    state: &BrowserState,
+    page: PageId,
+) -> Option<Result<HostActionRequest, CdpFailure>> {
+    let page_state = match state.page(&page) {
+        Some(page_state) => page_state,
+        None => return Some(Err(CdpFailure::UnknownPage(page))),
+    };
+    let payload = match request.method.as_str() {
+        "Page.setDocumentContent" => serde_json::json!({
+            "html": request.params.get("html").and_then(Value::as_str).unwrap_or(""),
+        }),
+        "Page.navigate" => serde_json::json!({
+            "url": request.params.get("url").and_then(Value::as_str).unwrap_or("about:blank"),
+            "method": request.params.get("referrer").and_then(Value::as_str).unwrap_or("GET"),
+            "extraHTTPHeaders": state.extra_headers(&page).unwrap_or_default(),
+        }),
+        "Page.reload" => serde_json::json!({
+            "url": page_state.url,
+            "extraHTTPHeaders": state.extra_headers(&page).unwrap_or_default(),
+        }),
+        "Runtime.evaluate" => serde_json::json!({
+            "expression": request.params.get("expression").and_then(Value::as_str).unwrap_or(""),
+            "returnByValue": request.params.get("returnByValue").and_then(Value::as_bool).unwrap_or(false),
+        }),
+        "Runtime.callFunctionOn" => request.params.clone(),
+        "Runtime.releaseObject" | "Runtime.releaseObjectGroup" => request.params.clone(),
+        "Runtime.getProperties" => request.params.clone(),
+        "Runtime.getIsolateId" => Value::Object(serde_json::Map::new()),
+        "Input.dispatchMouseEvent" | "Input.dispatchKeyEvent" | "Input.insertText" => {
+            request.params.clone()
+        }
+        _ => return None,
+    };
+    let kind = match request.method.as_str() {
+        "Page.setDocumentContent" => "setDocumentContent",
+        "Page.navigate" => "navigate",
+        "Page.reload" => "reload",
+        "Runtime.evaluate" => "evaluate",
+        "Runtime.callFunctionOn" => "callFunctionOn",
+        "Runtime.releaseObject" => "releaseObject",
+        "Runtime.releaseObjectGroup" => "releaseObjectGroup",
+        "Runtime.getProperties" => "getProperties",
+        "Runtime.getIsolateId" => "getIsolateId",
+        "Input.dispatchMouseEvent" => "dispatchMouseEvent",
+        "Input.dispatchKeyEvent" => "dispatchKeyEvent",
+        "Input.insertText" => "insertText",
+        _ => unreachable!("payload match and action kind match must stay aligned"),
+    };
+    Some(Ok(HostActionRequest {
+        kind: kind.to_string(),
+        payload,
+    }))
+}
 
 /// Build the target-neutral action requested by a portable CDP command.
 pub fn from_kind(page: PageId, kind: &str, payload: &Value) -> Result<EngineAction, CdpFailure> {
@@ -63,6 +132,7 @@ pub fn from_kind(page: PageId, kind: &str, payload: &Value) -> Result<EngineActi
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::engine::CdpEngine;
 
     #[test]
     fn maps_runtime_navigation_input_and_capture_actions() {
@@ -91,5 +161,29 @@ mod tests {
         assert!(
             matches!(error, CdpFailure::Unsupported(message) if message.contains("domGetDocument"))
         );
+    }
+
+    #[test]
+    fn shapes_navigation_and_runtime_requests_from_shared_page_state() {
+        let mut state = BrowserState::new();
+        let page = state
+            .create_page(&state.default_context(), "https://example.test/")
+            .unwrap();
+        state
+            .set_extra_headers(
+                &page,
+                std::collections::BTreeMap::from([("x-test".into(), "yes".into())]),
+            )
+            .unwrap();
+        let request = CdpRequest {
+            id: 1,
+            method: "Page.reload".into(),
+            params: Value::Object(serde_json::Map::new()),
+            session_id: None,
+        };
+        let action = from_request(&request, &state, page).unwrap().unwrap();
+        assert_eq!(action.kind, "reload");
+        assert_eq!(action.payload["url"], "https://example.test/");
+        assert_eq!(action.payload["extraHTTPHeaders"]["x-test"], "yes");
     }
 }

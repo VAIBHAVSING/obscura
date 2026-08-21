@@ -7,8 +7,24 @@
 //! and must be handled by the adapter's action/runtime path.
 
 use crate::engine::PageId;
-use crate::protocol::{CdpRequest, CdpResponse};
+use crate::protocol::{CdpEvent, CdpRequest, CdpResponse};
 use crate::state::{BrowserState, SessionId};
+
+/// A shared page dispatch result can include protocol events that must be
+/// queued by the host connection adapter.
+pub struct PageDispatch {
+    pub response: CdpResponse,
+    pub events: Vec<CdpEvent>,
+}
+
+impl PageDispatch {
+    fn response(response: CdpResponse) -> Self {
+        Self {
+            response,
+            events: Vec::new(),
+        }
+    }
+}
 
 /// Whether the shared Browser/Target dispatcher owns this command.
 pub fn supports_browser(method: &str) -> bool {
@@ -27,6 +43,8 @@ pub fn supports_page(method: &str) -> bool {
         || crate::portable_emulation::supports(method)
         || crate::portable_network::supports(method)
         || crate::portable_page::supports(method)
+        || crate::portable_dom::supports(method)
+        || crate::portable_runtime::supports(method)
 }
 
 /// Dispatch one state-only page command through the shared domain modules.
@@ -40,24 +58,68 @@ pub fn dispatch_page(
     page_id: PageId,
     session_id: Option<SessionId>,
 ) -> Option<CdpResponse> {
+    dispatch_page_impl(request, state, page_id, session_id, None).map(|output| output.response)
+}
+
+/// Dispatch one page command with a portable DOM backend. This is the cutover
+/// entry point for DOM wire semantics; all other state-only domains share the
+/// same path as [`dispatch_page`].
+pub fn dispatch_page_with_dom<B: crate::portable_dom::DomBackend>(
+    request: &CdpRequest,
+    state: &mut BrowserState,
+    page_id: PageId,
+    session_id: Option<SessionId>,
+    backend: &mut B,
+) -> Option<PageDispatch> {
+    dispatch_page_impl(request, state, page_id, session_id, Some(backend))
+}
+
+fn dispatch_page_impl(
+    request: &CdpRequest,
+    state: &mut BrowserState,
+    page_id: PageId,
+    session_id: Option<SessionId>,
+    mut backend: Option<&mut dyn crate::portable_dom::DomBackend>,
+) -> Option<PageDispatch> {
     if crate::portable_storage::supports(&request.method) {
-        return Some(crate::portable_storage::dispatch(request, state, page_id));
+        return Some(PageDispatch::response(crate::portable_storage::dispatch(
+            request, state, page_id,
+        )));
     }
     if crate::portable_fetch::supports(&request.method) {
-        return Some(crate::portable_fetch::dispatch(
+        return Some(PageDispatch::response(crate::portable_fetch::dispatch(
             request, state, page_id, session_id,
-        ));
+        )));
     }
     if crate::portable_emulation::supports(&request.method) {
-        return Some(crate::portable_emulation::dispatch(request, state, page_id));
+        return Some(PageDispatch::response(crate::portable_emulation::dispatch(
+            request, state, page_id,
+        )));
     }
     if crate::portable_network::supports(&request.method) {
-        return Some(crate::portable_network::dispatch(
+        return Some(PageDispatch::response(crate::portable_network::dispatch(
             request, state, page_id, session_id,
-        ));
+        )));
     }
     if crate::portable_page::supports(&request.method) {
-        return Some(crate::portable_page::dispatch(request, state, page_id));
+        return Some(PageDispatch::response(crate::portable_page::dispatch(
+            request, state, page_id,
+        )));
+    }
+    if crate::portable_dom::supports(&request.method) {
+        let backend = backend.as_deref_mut()?;
+        let output = crate::portable_dom::dispatch(request, state, page_id, backend)?;
+        return Some(PageDispatch {
+            response: output.response,
+            events: output.events,
+        });
+    }
+    if crate::portable_runtime::supports(&request.method) {
+        let output = crate::portable_runtime::dispatch(request, state, page_id)?;
+        return Some(PageDispatch {
+            response: output.response,
+            events: output.events,
+        });
     }
     None
 }

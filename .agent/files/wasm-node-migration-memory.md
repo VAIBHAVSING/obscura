@@ -1098,3 +1098,29 @@ Verification: portable `obscura-cdp` **33/33 passed**, `obscura-wasm`
 checkpoint. The remaining migration still includes portable DOM/runtime
 backend contracts, shared event ownership, legacy target-map removal, and
 final package/client acceptance gates.
+
+## Shared portable DOM and Runtime checkpoint (2026-08-21)
+
+The portable CDP crate now owns `portable_dom.rs` and `portable_runtime.rs`.
+DOM command validation and wire shapes for `DOM.enable`, `DOM.disable`,
+`DOM.getDocument`, selector queries, outer HTML, attributes, node description,
+and child-node events are implemented against a small `DomBackend` contract.
+Runtime enable/disable and the execution-context-created event are likewise
+derived from shared page metadata. The WASM adapter supplies only
+`ObscuraCore` DOM operations through `CoreDomBackend`; the legacy DOM and
+Runtime lifecycle match arms were removed. Request shaping for navigation,
+reload, evaluation, remote-object operations, and Input commands is also now
+owned by `portable_action::from_request`.
+
+Verification for this working checkpoint:
+
+- Portable `obscura-cdp`: **37/37 passed**.
+- `obscura-wasm`: **70/70 passed** without render.
+- DOM request/response/event behavior remains covered by the existing WASM
+  DOM test and new portable DOM/runtime unit tests.
+- Render and wasm32 checks are still required before this checkpoint is
+  committed.
+
+Remaining C3 work includes DOMSnapshot/Accessibility, render wire handlers,
+shared event/session ownership, navigation completion/lifecycle cutover,
+legacy target-map removal, ABI/package finalization, and real client gates.

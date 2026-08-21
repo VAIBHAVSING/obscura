@@ -1410,7 +1410,12 @@ impl PortableCdp {
     /// portable crate owns the protocol result and canonical state, while the
     /// WASM adapter keeps its ObscuraCore fields coherent for DOM/actions that
     /// have not migrated yet.
-    fn shared_portable_page_response(&mut self, request: &Request, target_id: &str) -> Option<Value> {
+    fn shared_portable_page_response(
+        &mut self,
+        connection_id: u32,
+        request: &Request,
+        target_id: &str,
+    ) -> Option<Value> {
         if !obscura_cdp::portable_dispatch::supports_page(&request.method) {
             return None;
         }
@@ -1438,12 +1443,23 @@ impl PortableCdp {
             params: Value::Object(request.params.clone()),
             session_id: request.session_id.clone(),
         };
-        let response = obscura_cdp::portable_dispatch::dispatch_page(
-            &shared_request,
-            &mut self.shared_state,
-            page_id,
-            shared_session,
-        )?;
+        let (response, events) = {
+            let target = self.targets.get_mut(target_id)?;
+            let mut backend = CoreDomBackend { core: &mut target.core };
+            let output = obscura_cdp::portable_dispatch::dispatch_page_with_dom(
+                &shared_request,
+                &mut self.shared_state,
+                page_id,
+                shared_session,
+                &mut backend,
+            )?;
+            (output.response, output.events)
+        };
+        for event in events {
+            if let Some(connection) = self.connections.get_mut(&connection_id) {
+                queue_event(connection, &event.method, event.params, event.session_id.as_deref());
+            }
+        }
         if response.error.is_none() {
             if obscura_cdp::portable_network::supports(&request.method) {
                 if let Some(target) = self.targets.get_mut(target_id) {
@@ -1575,22 +1591,41 @@ impl PortableCdp {
     }
 
     fn dispatch_page(&mut self, connection_id: u32, target_id: String, session_id: Option<String>, request: Request) -> Value {
-        if let Some(shared_response) = self.shared_portable_page_response(&request, &target_id) {
+        if let Some(shared_response) = self.shared_portable_page_response(connection_id, &request, &target_id) {
             return shared_response;
+        }
+        if let (Some(id), Some(page_id)) = (request.id.as_u64(), self.shared_pages.get(&target_id).copied()) {
+            let shared_request = obscura_cdp::protocol::CdpRequest {
+                id,
+                method: request.method.clone(),
+                params: Value::Object(request.params.clone()),
+                session_id: request.session_id.clone(),
+            };
+            if let Some(action) = obscura_cdp::portable_action::from_request(
+                &shared_request,
+                &self.shared_state,
+                page_id,
+            ) {
+                return match action {
+                    Ok(action) => self.queue_action(
+                        connection_id,
+                        request.clone(),
+                        target_id,
+                        &action.kind,
+                        action.payload,
+                    ),
+                    Err(error) => cdp_error_response(
+                        &request.id,
+                        -32000,
+                        error.to_string(),
+                        request.session_id.as_deref(),
+                    ),
+                };
+            }
         }
         let session = session_id.as_deref();
         match request.method.as_str() {
-            "Runtime.enable" => {
-                if let Some(connection) = self.connections.get_mut(&connection_id) {
-                    let frame_id = self.targets.get(&target_id).map(|target| target.frame_id.clone()).unwrap_or_default();
-                    let url = self.targets.get(&target_id).map(|target| target.url.clone()).unwrap_or_default();
-                    queue_event(connection, "Runtime.executionContextCreated", json!({
-                        "context": {"id": 1, "origin": url, "name": "", "uniqueId": format!("{target_id}:default"), "auxData": {"isDefault": true, "type": "default", "frameId": frame_id}}
-                    }), session);
-                }
-                cdp_result_response(&request.id, json!({}), session)
-            }
-            "Page.enable" | "Page.disable" | "DOM.enable" | "DOM.disable" | "Runtime.disable" => {
+            "Page.enable" | "Page.disable" => {
                 cdp_result_response(&request.id, json!({}), session)
             }
             "Fetch.enable" => {
@@ -1855,121 +1890,6 @@ impl PortableCdp {
                 }), session)
             }
             "Page.resetNavigationHistory" => cdp_result_response(&request.id, json!({}), session),
-            "DOM.getDocument" => {
-                let Some(target) = self.targets.get_mut(&target_id) else {
-                    return cdp_error_response(&request.id, -32000, "target is not known", session);
-                };
-                let depth = request.params.get("depth").and_then(Value::as_i64).unwrap_or(1);
-                let max_depth = if depth < 0 { 64 } else { usize::try_from(depth).unwrap_or(1).min(64) };
-                let document_handle = target.document_handle;
-                let document_url = target.url.clone();
-                let root = match describe_node(&mut target.core, document_handle, max_depth, 0) {
-                    Ok(mut root) => {
-                        if let Value::Object(ref mut object) = root {
-                            object.insert("documentURL".to_string(), Value::String(document_url.clone()));
-                            object.insert("baseURL".to_string(), Value::String(document_url));
-                        }
-                        root
-                    }
-                    Err(error) => return cdp_error_response(&request.id, -32000, error, session),
-                };
-                cdp_result_response(&request.id, json!({"root": root}), session)
-            }
-            "DOM.querySelector" => {
-                let Some(target) = self.targets.get_mut(&target_id) else {
-                    return cdp_error_response(&request.id, -32000, "target is not known", session);
-                };
-                let selector = request.params.get("selector").and_then(Value::as_str).unwrap_or("");
-                let root = request.params.get("nodeId").and_then(Value::as_u64).unwrap_or(u64::from(target.document_handle));
-                let result = if root == u64::from(target.document_handle) {
-                    target.core.dom_op("query_selector", selector, "")
-                } else {
-                    target.core.dom_op("query_selector_scoped", &root.to_string(), selector)
-                };
-                let handle = match result {
-                    Ok(value) => value.parse::<u32>().unwrap_or(0),
-                    Err(_) => return cdp_error_response(&request.id, -32000, "DOM selector failed", session),
-                };
-                cdp_result_response(&request.id, json!({"nodeId": if handle == u32::MAX { 0 } else { handle }}), session)
-            }
-            "DOM.querySelectorAll" => {
-                let Some(target) = self.targets.get_mut(&target_id) else {
-                    return cdp_error_response(&request.id, -32000, "target is not known", session);
-                };
-                let selector = request.params.get("selector").and_then(Value::as_str).unwrap_or("");
-                let root = request.params.get("nodeId").and_then(Value::as_u64).unwrap_or(u64::from(target.document_handle));
-                let result = if root == u64::from(target.document_handle) {
-                    target.core.dom_op("query_selector_all", selector, "")
-                } else {
-                    target.core.dom_op("query_selector_all_scoped", &root.to_string(), selector)
-                };
-                let node_ids = match result {
-                    Ok(value) => serde_json::from_str::<Vec<u32>>(&value).unwrap_or_default(),
-                    Err(_) => return cdp_error_response(&request.id, -32000, "DOM selector failed", session),
-                };
-                cdp_result_response(&request.id, json!({"nodeIds": node_ids}), session)
-            }
-            "DOM.getOuterHTML" => {
-                let Some(target) = self.targets.get_mut(&target_id) else {
-                    return cdp_error_response(&request.id, -32000, "target is not known", session);
-                };
-                let node_id = request.params.get("nodeId").and_then(Value::as_u64).unwrap_or(0);
-                let raw = match target.core.dom_op("outer_html", &node_id.to_string(), "") {
-                    Ok(value) => value,
-                    Err(_) => return cdp_error_response(&request.id, -32000, "DOM node is not known", session),
-                };
-                let html = serde_json::from_str::<String>(&raw).unwrap_or(raw);
-                cdp_result_response(&request.id, json!({"outerHTML": html}), session)
-            }
-            "DOM.getAttributes" => {
-                let Some(target) = self.targets.get_mut(&target_id) else {
-                    return cdp_error_response(&request.id, -32000, "target is not known", session);
-                };
-                let node_id = request.params.get("nodeId").and_then(Value::as_u64).unwrap_or(0);
-                let names = match target.core.dom_op("attribute_names", &node_id.to_string(), "") {
-                    Ok(value) => serde_json::from_str::<Vec<String>>(&value).unwrap_or_default(),
-                    Err(_) => return cdp_error_response(&request.id, -32000, "DOM node is not known", session),
-                };
-                let mut attributes = Vec::with_capacity(names.len().saturating_mul(2));
-                for name in names {
-                    let value = target
-                        .core
-                        .dom_op("get_attribute", &node_id.to_string(), &name)
-                        .ok()
-                        .and_then(|raw| serde_json::from_str::<Option<String>>(&raw).ok().flatten())
-                        .unwrap_or_default();
-                    attributes.push(Value::String(name));
-                    attributes.push(Value::String(value));
-                }
-                cdp_result_response(&request.id, json!({"attributes": attributes}), session)
-            }
-            "DOM.describeNode" => {
-                let Some(target) = self.targets.get_mut(&target_id) else {
-                    return cdp_error_response(&request.id, -32000, "target is not known", session);
-                };
-                let node_id = request.params.get("nodeId").and_then(Value::as_u64).unwrap_or(u64::from(target.document_handle));
-                let depth = request.params.get("depth").and_then(Value::as_i64).unwrap_or(1);
-                let max_depth = if depth < 0 { 64 } else { usize::try_from(depth).unwrap_or(1).min(64) };
-                let node = match describe_node(&mut target.core, u32::try_from(node_id).unwrap_or(0), max_depth, 0) {
-                    Ok(node) => node,
-                    Err(error) => return cdp_error_response(&request.id, -32000, error, session),
-                };
-                cdp_result_response(&request.id, json!({"node": node}), session)
-            }
-            "DOM.requestChildNodes" => {
-                let Some(target) = self.targets.get_mut(&target_id) else {
-                    return cdp_error_response(&request.id, -32000, "target is not known", session);
-                };
-                let node_id = request.params.get("nodeId").and_then(Value::as_u64).unwrap_or(0);
-                let children = match describe_children(&mut target.core, u32::try_from(node_id).unwrap_or(0), 1, 0) {
-                    Ok(children) => children,
-                    Err(error) => return cdp_error_response(&request.id, -32000, error, session),
-                };
-                if let Some(connection) = self.connections.get_mut(&connection_id) {
-                    queue_event(connection, "DOM.setChildNodes", json!({"parentId": node_id, "nodes": children}), session);
-                }
-                cdp_result_response(&request.id, json!({}), session)
-            }
             "IO.read" => {
                 let Some(handle) = request.params.get("handle").and_then(Value::as_str) else {
                     return cdp_error_response(&request.id, -32602, "handle is required", session);
@@ -2021,79 +1941,6 @@ impl PortableCdp {
                 }
                 cdp_result_response(&request.id, json!({}), session)
             }
-            "Page.setDocumentContent" => self.queue_action(connection_id, request.clone(), target_id, "setDocumentContent", json!({
-                "html": request.params.get("html").and_then(Value::as_str).unwrap_or(""),
-            })),
-            "Page.navigate" => self.queue_action(connection_id, request.clone(), target_id.clone(), "navigate", json!({
-                "url": request.params.get("url").and_then(Value::as_str).unwrap_or("about:blank"),
-                "method": request.params.get("referrer").and_then(Value::as_str).unwrap_or("GET"),
-                "extraHTTPHeaders": self.targets.get(&target_id).map(|target| target.extra_headers.clone()).unwrap_or_default(),
-            })),
-            "Page.reload" => {
-                let url = self.targets.get(&target_id).map(|target| target.url.clone()).unwrap_or_else(|| "about:blank".to_string());
-                let extra_headers = self.targets.get(&target_id).map(|target| target.extra_headers.clone()).unwrap_or_default();
-                self.queue_action(connection_id, request.clone(), target_id, "reload", json!({"url": url, "extraHTTPHeaders": extra_headers}))
-            }
-            "Runtime.evaluate" => self.queue_action(connection_id, request.clone(), target_id, "evaluate", json!({
-                "expression": request.params.get("expression").and_then(Value::as_str).unwrap_or(""),
-                "returnByValue": request.params.get("returnByValue").and_then(Value::as_bool).unwrap_or(false),
-            })),
-            "Runtime.callFunctionOn" => self.queue_action(
-                connection_id,
-                request.clone(),
-                target_id,
-                "callFunctionOn",
-                Value::Object(request.params.clone()),
-            ),
-            "Runtime.releaseObject" => self.queue_action(
-                connection_id,
-                request.clone(),
-                target_id,
-                "releaseObject",
-                Value::Object(request.params.clone()),
-            ),
-            "Runtime.releaseObjectGroup" => self.queue_action(
-                connection_id,
-                request.clone(),
-                target_id,
-                "releaseObjectGroup",
-                Value::Object(request.params.clone()),
-            ),
-            "Runtime.getProperties" => self.queue_action(
-                connection_id,
-                request.clone(),
-                target_id,
-                "getProperties",
-                Value::Object(request.params.clone()),
-            ),
-            "Runtime.getIsolateId" => self.queue_action(
-                connection_id,
-                request.clone(),
-                target_id,
-                "getIsolateId",
-                Value::Object(request.params.clone()),
-            ),
-            "Input.dispatchMouseEvent" => self.queue_action(
-                connection_id,
-                request.clone(),
-                target_id,
-                "dispatchMouseEvent",
-                Value::Object(request.params.clone()),
-            ),
-            "Input.dispatchKeyEvent" => self.queue_action(
-                connection_id,
-                request.clone(),
-                target_id,
-                "dispatchKeyEvent",
-                Value::Object(request.params.clone()),
-            ),
-            "Input.insertText" => self.queue_action(
-                connection_id,
-                request.clone(),
-                target_id,
-                "insertText",
-                Value::Object(request.params.clone()),
-            ),
             #[cfg(feature = "render")]
             "Page.captureScreenshot" => self.capture_screenshot(&request, target_id, session),
             #[cfg(not(feature = "render"))]
@@ -2555,6 +2402,77 @@ fn layout_metrics(target: &Target) -> Value {
         },
         "contentSize": {"x": 0, "y": 0, "width": width, "height": height},
     })
+}
+
+/// Adapter for the transport-free DOM dispatcher. The CDP crate owns wire
+/// validation and response/event shapes; this thin backend exposes only the
+/// existing portable DOM operations and keeps no protocol state.
+struct CoreDomBackend<'a> {
+    core: &'a mut ObscuraCore,
+}
+
+impl obscura_cdp::portable_dom::DomBackend for CoreDomBackend<'_> {
+    fn document_handle(&self) -> u32 {
+        self.core.document_handle()
+    }
+
+    fn query_selector(&mut self, root: u32, selector: &str) -> Result<u32, String> {
+        let raw = if root == self.core.document_handle() {
+            self.core.dom_op("query_selector", selector, "")
+        } else {
+            self.core.dom_op("query_selector_scoped", &root.to_string(), selector)
+        };
+        let handle = raw.map_err(|_| "DOM selector failed".to_string())?.parse::<u32>().map_err(|_| "DOM selector failed".to_string())?;
+        Ok(if handle == u32::MAX { 0 } else { handle })
+    }
+
+    fn query_selector_all(&mut self, root: u32, selector: &str) -> Result<Vec<u32>, String> {
+        let raw = if root == self.core.document_handle() {
+            self.core.dom_op("query_selector_all", selector, "")
+        } else {
+            self.core.dom_op("query_selector_all_scoped", &root.to_string(), selector)
+        };
+        serde_json::from_str(raw.map_err(|_| "DOM selector failed".to_string())?.as_str())
+            .map_err(|_| "DOM selector failed".to_string())
+    }
+
+    fn outer_html(&mut self, node_id: u32) -> Result<String, String> {
+        let raw = self
+            .core
+            .dom_op("outer_html", &node_id.to_string(), "")
+            .map_err(|_| "DOM node is not known".to_string())?;
+        Ok(serde_json::from_str::<String>(&raw).unwrap_or(raw))
+    }
+
+    fn attributes(&mut self, node_id: u32) -> Result<Vec<(String, String)>, String> {
+        let raw = self
+            .core
+            .dom_op("attribute_names", &node_id.to_string(), "")
+            .map_err(|_| "DOM node is not known".to_string())?;
+        let names = serde_json::from_str::<Vec<String>>(&raw)
+            .map_err(|_| "DOM attributes are invalid".to_string())?;
+        names
+            .into_iter()
+            .map(|name| {
+                let value = self
+                    .core
+                    .dom_op("get_attribute", &node_id.to_string(), &name)
+                    .map_err(|_| "DOM attribute is not known".to_string())
+                    .ok()
+                    .and_then(|raw| serde_json::from_str::<Option<String>>(&raw).ok().flatten())
+                    .unwrap_or_default();
+                Ok((name, value))
+            })
+            .collect()
+    }
+
+    fn describe_node(&mut self, node_id: u32, depth: usize) -> Result<Value, String> {
+        describe_node(self.core, node_id, depth, 0)
+    }
+
+    fn describe_children(&mut self, node_id: u32, depth: usize) -> Result<Vec<Value>, String> {
+        describe_children(self.core, node_id, depth, 0)
+    }
 }
 
 fn bounded_js_string(value: &str, maximum: usize, label: &str) -> Result<(), String> {
