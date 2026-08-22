@@ -1305,3 +1305,40 @@ Verification for this checkpoint:
 Remaining C3 work is navigation lifecycle/action payload ownership, reduction
 of legacy target/session metadata, raw ABI hardening/real-artifact coverage,
 Node package and Playwright integration, and real concurrency gates.
+
+## Shared context/session/network state cutover checkpoint (2026-08-22)
+
+The portable adapter now treats `BrowserState` as the source of truth for
+durable browser contexts, live sessions, Network enablement, and Fetch
+patterns. Duplicate `PortableCdp` context sets, connection/session target maps,
+per-target network-enabled session sets, and per-target Fetch pattern maps were
+removed. Session ownership, attachment, network events, and interception now
+query the shared state directly. Target close and browser-context disposal keep
+the existing detached-event ordering by capturing shared sessions before the
+shared dispatcher removes pages.
+
+`BrowserState` exposes a bounded versioned context snapshot (`schemaVersion: 1`)
+containing only context options and cookies. Pages, sessions, action queues,
+events, and target identities are intentionally not persisted. The raw WASM
+surface exports `contextExport` and `contextImport`; imports validate the schema,
+cookie limits, and byte limit before allocating a fresh context identity.
+
+Verification for this checkpoint:
+
+- portable `obscura-cdp`: **46/46 passed** with
+  `--no-default-features --features portable`.
+- `obscura-wasm`: **73/73 passed** without render and **79/79 passed** with
+  render.
+- wasm32 render check passed.
+- native-server CDP check passed.
+- `git diff --check` passed.
+- Real release wasm-bindgen artifact (`obscura_wasm_bg.wasm`, SHA-256
+  `78d41d8cefc183ddcd65581dc60bbb204038c487324eba56419c391d6dd000d4`) passed
+  a Node smoke covering context export/import, multi-context target creation,
+  CDP attach, action drain/completion, and browser/connection teardown.
+
+Remaining C3 work is navigation lifecycle/action payload ownership, reduction
+of remaining target metadata, raw ABI hardening, a thin Node transport and
+Playwright/Puppeteer integration, and real concurrency/resource gates. The
+companion `obscura-benchmark` obstacle course is still unavailable in this
+workspace.

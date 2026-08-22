@@ -17,6 +17,8 @@ use crate::engine::{
 use crate::protocol::{CdpEvent, MAX_METHOD_BYTES};
 
 pub const MAX_CONTEXTS: usize = 256;
+pub const CONTEXT_SNAPSHOT_VERSION: u32 = 1;
+pub const MAX_CONTEXT_SNAPSHOT_BYTES: usize = MAX_STORAGE_STATE_BYTES;
 pub const MAX_PAGES: usize = 4096;
 pub const MAX_CONNECTIONS: usize = 512;
 pub const MAX_SESSIONS: usize = 8192;
@@ -114,6 +116,17 @@ pub struct ContextCookieState {
     pub expires: Option<i64>,
     #[serde(default)]
     pub host_only: bool,
+}
+
+/// Versioned, opaque state that may be persisted by a host and imported into
+/// a fresh browser. Live pages, sessions, actions, event queues, and target
+/// identities are deliberately absent and are never durable.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct ContextSnapshot {
+    pub schema_version: u32,
+    pub options: ContextOptions,
+    pub cookies: Vec<ContextCookieState>,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -323,6 +336,58 @@ impl BrowserState {
 
     pub fn context(&self, id: &ContextId) -> Option<&ContextState> {
         self.contexts.get(id)
+    }
+
+    /// Export only portable browser-context state. The caller owns durable
+    /// storage; this method owns the schema, validation, and byte limit.
+    pub fn export_context(&self, id: &ContextId) -> Result<Vec<u8>, CdpFailure> {
+        let context = self
+            .contexts
+            .get(id)
+            .ok_or(CdpFailure::UnknownContext(*id))?;
+        let cookies = self
+            .cookies
+            .get(id)
+            .into_iter()
+            .flat_map(|cookies| cookies.values().cloned())
+            .collect();
+        let snapshot = ContextSnapshot {
+            schema_version: CONTEXT_SNAPSHOT_VERSION,
+            options: context.options.clone(),
+            cookies,
+        };
+        let bytes = serde_json::to_vec(&snapshot)
+            .map_err(|error| CdpFailure::host(format!("context snapshot serialization failed: {error}")))?;
+        if bytes.len() > MAX_CONTEXT_SNAPSHOT_BYTES {
+            return Err(CdpFailure::invalid_argument("context snapshot exceeds the byte limit"));
+        }
+        Ok(bytes)
+    }
+
+    /// Import a host-provided context snapshot and allocate a fresh monotonic
+    /// context identity. Validation happens before allocation so malformed
+    /// state cannot leave a partially-created context behind.
+    pub fn import_context(&mut self, bytes: &[u8]) -> Result<ContextId, CdpFailure> {
+        if bytes.len() > MAX_CONTEXT_SNAPSHOT_BYTES {
+            return Err(CdpFailure::invalid_argument("context snapshot exceeds the byte limit"));
+        }
+        let snapshot: ContextSnapshot = serde_json::from_slice(bytes)
+            .map_err(|error| CdpFailure::invalid_argument(format!("invalid context snapshot: {error}")))?;
+        if snapshot.schema_version != CONTEXT_SNAPSHOT_VERSION {
+            return Err(CdpFailure::invalid_argument("unsupported context snapshot schema"));
+        }
+        if snapshot.cookies.len() > MAX_COOKIE_COUNT {
+            return Err(CdpFailure::invalid_argument("context snapshot has too many cookies"));
+        }
+        let mut cookies = BTreeMap::new();
+        for cookie in snapshot.cookies {
+            validate_cookie(&cookie)?;
+            let key = (cookie.domain.clone(), cookie.name.clone(), cookie.path.clone());
+            cookies.insert(key, cookie);
+        }
+        let id = self.create_context(snapshot.options)?;
+        self.cookies.insert(id, cookies);
+        Ok(id)
     }
 
     pub fn page(&self, id: &PageId) -> Option<&PageState> {
@@ -942,6 +1007,32 @@ impl BrowserState {
         self.sessions.get(&id).copied()
     }
 
+    pub fn session_connection(&self, id: SessionId) -> Option<ConnectionId> {
+        self.session_connections.get(&id).copied()
+    }
+
+    pub fn sessions_for_connection(&self, connection: ConnectionId) -> Vec<(SessionId, PageId)> {
+        self.session_connections
+            .iter()
+            .filter_map(|(session, owner)| {
+                (*owner == connection)
+                    .then(|| self.sessions.get(session).copied().map(|page| (*session, page)))
+                    .flatten()
+            })
+            .collect()
+    }
+
+    pub fn sessions_for_page(&self, page: PageId) -> Vec<(SessionId, ConnectionId)> {
+        self.sessions
+            .iter()
+            .filter_map(|(session, target)| {
+                (*target == page)
+                    .then(|| self.session_connections.get(session).copied().map(|connection| (*session, connection)))
+                    .flatten()
+            })
+            .collect()
+    }
+
     pub fn page_is_attached(&self, id: PageId) -> bool {
         self.sessions.values().any(|page| *page == id)
     }
@@ -1234,6 +1325,66 @@ mod tests {
         assert!(state.is_closed());
         assert_eq!(state.open_connection(), Err(CdpFailure::Closed));
         assert_eq!(state.create_context(ContextOptions::default()), Err(CdpFailure::Closed));
+    }
+
+    #[test]
+    fn context_snapshots_round_trip_only_durable_context_state() {
+        let mut state = BrowserState::new();
+        let page = state.create_page(&state.default_context(), "https://example.test/").unwrap();
+        state
+            .merge_context_cookies(
+                &page,
+                vec![ContextCookieState {
+                    name: "sid".to_string(),
+                    value: "abc".to_string(),
+                    domain: "example.test".to_string(),
+                    path: "/".to_string(),
+                    secure: true,
+                    http_only: true,
+                    same_site: "Lax".to_string(),
+                    expires: None,
+                    host_only: false,
+                }],
+                0,
+            )
+            .unwrap();
+        let snapshot = state.export_context(&state.default_context()).unwrap();
+        let value: Value = serde_json::from_slice(&snapshot).unwrap();
+        assert_eq!(value["schemaVersion"], CONTEXT_SNAPSHOT_VERSION);
+        assert_eq!(value["cookies"][0]["name"], "sid");
+        assert!(value.get("pages").is_none());
+        assert!(value.get("sessions").is_none());
+
+        let imported = state.import_context(&snapshot).unwrap();
+        assert!(imported > state.default_context());
+        assert_eq!(state.context(&imported).unwrap().id, imported);
+        assert_eq!(state.pages().count(), 1);
+        let imported_page = state.create_page(&imported, "https://example.test/").unwrap();
+        assert_eq!(state.context_cookies(&imported_page, 0).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn context_snapshots_reject_wrong_schema_and_unknown_fields() {
+        let mut state = BrowserState::new();
+        let wrong = serde_json::json!({
+            "schemaVersion": CONTEXT_SNAPSHOT_VERSION + 1,
+            "options": {},
+            "cookies": []
+        });
+        assert!(matches!(
+            state.import_context(&serde_json::to_vec(&wrong).unwrap()),
+            Err(CdpFailure::InvalidArgument(_))
+        ));
+        let unknown = serde_json::json!({
+            "schemaVersion": CONTEXT_SNAPSHOT_VERSION,
+            "options": {},
+            "cookies": [],
+            "pages": []
+        });
+        assert!(matches!(
+            state.import_context(&serde_json::to_vec(&unknown).unwrap()),
+            Err(CdpFailure::InvalidArgument(_))
+        ));
     }
 
     #[test]

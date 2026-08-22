@@ -2217,6 +2217,19 @@ pub fn connection_close(browser_id: u32, connection_id: u32) -> Result<(), JsVal
     with_raw_browser(browser_id, |browser| browser.close_connection(connection_id))
 }
 
+#[wasm_bindgen(js_name = contextExport)]
+pub fn context_export(browser_id: u32, context_id: u32) -> Result<Vec<u8>, JsValue> {
+    with_raw_browser(browser_id, |browser| browser.export_context(context_id))
+}
+
+#[wasm_bindgen(js_name = contextImport)]
+pub fn context_import(browser_id: u32, snapshot: &[u8]) -> Result<u32, JsValue> {
+    if snapshot.len() > obscura_cdp::state::MAX_CONTEXT_SNAPSHOT_BYTES {
+        return Err(js_sys::RangeError::new("context snapshot exceeds the byte limit").into());
+    }
+    with_raw_browser(browser_id, |browser| browser.import_context(snapshot))
+}
+
 /// Ingest one unframed UTF-8 CDP request and return exactly one length-
 /// prefixed response frame. Batched host work is exposed through the drain
 /// functions below, keeping request and execution traffic independent.
@@ -2411,7 +2424,23 @@ mod tests {
     fn raw_cdp_registry_frames_actions_events_and_completions() {
         assert_eq!(cdp_raw_abi_version(), 2);
         let browser = browser_create(br#"{"html":"<main>portable</main>"}"#).unwrap();
+        let snapshot = context_export(browser, 1).unwrap();
+        let imported_context = context_import(browser, &snapshot).unwrap();
+        assert_eq!(imported_context, 2);
         let connection = connection_open(browser).unwrap();
+
+        let created = raw_values(
+            &cdp_ingest(
+                browser,
+                connection,
+                format!(
+                    r#"{{"id":0,"method":"Target.createTarget","params":{{"browserContextId":"context-{imported_context}","url":"about:blank"}}}}"#
+                )
+                .as_bytes(),
+            )
+            .unwrap(),
+        );
+        assert_eq!(created[0]["result"]["targetId"], "page-2");
 
         let attached = raw_values(
             &cdp_ingest(
