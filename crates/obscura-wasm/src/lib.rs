@@ -1,7 +1,6 @@
 use std::any::Any;
-use std::collections::HashMap;
-#[cfg(feature = "render")]
-use std::collections::BTreeMap;
+use std::cell::{Cell, RefCell};
+use std::collections::{BTreeMap, HashMap};
 use std::panic::{catch_unwind, AssertUnwindSafe};
 
 use obscura_dom::{
@@ -33,12 +32,116 @@ const MAX_DOM_ARGUMENT_BYTES: usize = MAX_HTML_INPUT_BYTES;
 const MAX_DOM_BATCH_BYTES: usize = 8 * 1024 * 1024;
 const MAX_DOM_BATCH_OPS: usize = 1024;
 const MAX_DOCUMENT_METADATA_BYTES: usize = 64 * 1024;
+const RAW_CDP_ABI_VERSION: u32 = 2;
+const MAX_RAW_BROWSERS: usize = 4096;
+const RAW_FRAME_HEADER_BYTES: usize = 4;
+const MAX_RAW_FRAMES: usize = obscura_cdp::protocol::MAX_OUTPUT_FRAMES;
+const MAX_RAW_BYTES: usize = obscura_cdp::protocol::MAX_OUTPUT_BYTES;
 #[cfg(feature = "render")]
 const MAX_RENDER_RESOURCE_BYTES: usize = 16 * 1024 * 1024;
 #[cfg(feature = "render")]
 const MAX_RENDER_RESOURCE_REQUESTS_PER_PAGE: usize = 32;
 #[cfg(feature = "render")]
 const MAX_PDF_OPTIONS_BYTES: usize = 64 * 1024;
+
+thread_local! {
+    static RAW_BROWSERS: RefCell<BTreeMap<u32, cdp::PortableCdp>> = RefCell::new(BTreeMap::new());
+    static RAW_NEXT_BROWSER_ID: Cell<u32> = const { Cell::new(1) };
+}
+
+fn raw_frame_limit(requested: u32) -> usize {
+    if requested == 0 {
+        MAX_RAW_BYTES
+    } else {
+        usize::try_from(requested).unwrap_or(MAX_RAW_BYTES).min(MAX_RAW_BYTES)
+    }
+}
+
+fn encode_raw_frames(frames: &[Vec<u8>], max_bytes: usize) -> Result<Vec<u8>, JsValue> {
+    if frames.len() > MAX_RAW_FRAMES {
+        return Err(js_sys::RangeError::new("raw CDP output exceeds the frame limit").into());
+    }
+    let mut output = Vec::new();
+    for frame in frames {
+        if frame.len() > obscura_cdp::protocol::MAX_MESSAGE_BYTES {
+            return Err(js_sys::RangeError::new("raw CDP frame exceeds the message limit").into());
+        }
+        let frame_len = u32::try_from(frame.len())
+            .map_err(|_| js_sys::RangeError::new("raw CDP frame length exceeds u32"))?;
+        let next_len = output
+            .len()
+            .checked_add(RAW_FRAME_HEADER_BYTES)
+            .and_then(|value| value.checked_add(frame.len()))
+            .ok_or_else(|| js_sys::RangeError::new("raw CDP output size overflow"))?;
+        if next_len > max_bytes || next_len > MAX_RAW_BYTES {
+            return Err(js_sys::RangeError::new("raw CDP output exceeds the byte limit").into());
+        }
+        output.extend_from_slice(&frame_len.to_le_bytes());
+        output.extend_from_slice(frame);
+    }
+    Ok(output)
+}
+
+fn decode_raw_frames(bytes: &[u8]) -> Result<Vec<&[u8]>, JsValue> {
+    if bytes.len() > MAX_RAW_BYTES {
+        return Err(js_sys::RangeError::new("raw CDP input exceeds the byte limit").into());
+    }
+    let mut frames = Vec::new();
+    let mut offset = 0usize;
+    while offset < bytes.len() {
+        if frames.len() == MAX_RAW_FRAMES || bytes.len() - offset < RAW_FRAME_HEADER_BYTES {
+            return Err(js_syntax_error_value("raw CDP frame envelope is truncated"));
+        }
+        let frame_len = u32::from_le_bytes(
+            bytes[offset..offset + RAW_FRAME_HEADER_BYTES]
+                .try_into()
+                .expect("raw frame header is four bytes"),
+        ) as usize;
+        offset += RAW_FRAME_HEADER_BYTES;
+        if frame_len > obscura_cdp::protocol::MAX_MESSAGE_BYTES {
+            return Err(js_sys::RangeError::new("raw CDP frame exceeds the message limit").into());
+        }
+        let end = offset
+            .checked_add(frame_len)
+            .ok_or_else(|| js_sys::RangeError::new("raw CDP frame size overflow"))?;
+        if end > bytes.len() {
+            return Err(js_syntax_error_value("raw CDP frame envelope is truncated"));
+        }
+        frames.push(&bytes[offset..end]);
+        offset = end;
+    }
+    Ok(frames)
+}
+
+fn raw_browser_html(config: &[u8]) -> Result<String, JsValue> {
+    if config.len() > MAX_HTML_INPUT_BYTES {
+        return Err(js_sys::RangeError::new("raw browser configuration exceeds the HTML limit").into());
+    }
+    if config.is_empty() {
+        return Ok(String::new());
+    }
+    if let Ok(value) = serde_json::from_slice::<serde_json::Value>(config) {
+        if value.is_object() {
+            return value
+                .get("html")
+                .and_then(serde_json::Value::as_str)
+                .map(str::to_owned)
+                .ok_or_else(|| js_syntax_error_value("raw browser configuration requires an html string"));
+        }
+    }
+    String::from_utf8(config.to_vec())
+        .map_err(|_| js_syntax_error_value("raw browser HTML must be valid UTF-8"))
+}
+
+fn with_raw_browser<T>(browser_id: u32, call: impl FnOnce(&mut cdp::PortableCdp) -> Result<T, JsValue>) -> Result<T, JsValue> {
+    RAW_BROWSERS.with(|browsers| {
+        let mut browsers = browsers.borrow_mut();
+        let browser = browsers
+            .get_mut(&browser_id)
+            .ok_or_else(|| js_error_value("unknown raw browser"))?;
+        call(browser)
+    })
+}
 
 fn require_max_bytes(value: &str, maximum: usize, label: &str) -> Result<(), JsValue> {
     if value.len() > maximum {
@@ -2063,6 +2166,154 @@ pub fn version() -> String {
     boundary_value("version", || env!("CARGO_PKG_VERSION").to_string())
 }
 
+/// Allocate one independent portable browser instance in this WASM worker.
+/// The input is either UTF-8 HTML or a JSON object containing an `html` field.
+/// No native sockets, files, or V8 handles are created by this registry.
+#[wasm_bindgen(js_name = browserCreate)]
+pub fn browser_create(config: &[u8]) -> Result<u32, JsValue> {
+    let capacity = RAW_BROWSERS.with(|browsers| browsers.borrow().len() < MAX_RAW_BROWSERS);
+    if !capacity {
+        return Err(js_sys::RangeError::new("raw browser registry is full").into());
+    }
+    let html = raw_browser_html(config)?;
+    let browser = cdp::PortableCdp::new(&html)?;
+    RAW_BROWSERS.with(|browsers| {
+        let mut browsers = browsers.borrow_mut();
+        let id = RAW_NEXT_BROWSER_ID.with(|next| {
+            let id = next.get();
+            if id == 0 {
+                return None;
+            }
+            let next_id = id.checked_add(1)?;
+            next.set(next_id);
+            Some(id)
+        });
+        let Some(id) = id else {
+            return Err(js_sys::RangeError::new("raw browser ID space is exhausted").into());
+        };
+        browsers.insert(id, browser);
+        Ok(id)
+    })
+}
+
+#[wasm_bindgen(js_name = browserClose)]
+pub fn browser_close(browser_id: u32) -> Result<(), JsValue> {
+    RAW_BROWSERS.with(|browsers| {
+        browsers
+            .borrow_mut()
+            .remove(&browser_id)
+            .map(|_| ())
+            .ok_or_else(|| js_error_value("unknown raw browser"))
+    })
+}
+
+#[wasm_bindgen(js_name = connectionOpen)]
+pub fn connection_open(browser_id: u32) -> Result<u32, JsValue> {
+    with_raw_browser(browser_id, |browser| browser.open_connection())
+}
+
+#[wasm_bindgen(js_name = connectionClose)]
+pub fn connection_close(browser_id: u32, connection_id: u32) -> Result<(), JsValue> {
+    with_raw_browser(browser_id, |browser| browser.close_connection(connection_id))
+}
+
+/// Ingest one unframed UTF-8 CDP request and return exactly one length-
+/// prefixed response frame. Batched host work is exposed through the drain
+/// functions below, keeping request and execution traffic independent.
+#[wasm_bindgen(js_name = cdpIngest)]
+pub fn cdp_ingest(browser_id: u32, connection_id: u32, request: &[u8]) -> Result<Vec<u8>, JsValue> {
+    let response = with_raw_browser(browser_id, |browser| {
+        browser.raw_cdp_request(connection_id, request)
+    })?;
+    encode_raw_frames(&[response], MAX_RAW_BYTES)
+}
+
+#[wasm_bindgen(js_name = cdpDrainEvents)]
+pub fn cdp_drain_events(
+    browser_id: u32,
+    connection_id: u32,
+    max_events: u32,
+    max_bytes: u32,
+) -> Result<Vec<u8>, JsValue> {
+    let max_items = usize::try_from(max_events)
+        .unwrap_or(MAX_RAW_FRAMES)
+        .min(MAX_RAW_FRAMES);
+    let limit = raw_frame_limit(max_bytes);
+    let frames = with_raw_browser(browser_id, |browser| {
+        browser.drain_raw_events(connection_id, max_items, limit)
+    })?;
+    encode_raw_frames(&frames, limit)
+}
+
+#[wasm_bindgen(js_name = cdpDrainActions)]
+pub fn cdp_drain_actions(
+    browser_id: u32,
+    max_actions: u32,
+    max_bytes: u32,
+) -> Result<Vec<u8>, JsValue> {
+    let max_items = usize::try_from(max_actions)
+        .unwrap_or(MAX_RAW_FRAMES)
+        .min(MAX_RAW_FRAMES);
+    let limit = raw_frame_limit(max_bytes);
+    let frames = with_raw_browser(browser_id, |browser| {
+        browser.drain_raw_actions(max_items, limit)
+    })?;
+    encode_raw_frames(&frames, limit)
+}
+
+/// Complete a batch of actions. Each input frame is a JSON object containing
+/// `actionId`, `generation`, and a JSON `result`; each output frame is the CDP
+/// response for that action.
+#[wasm_bindgen(js_name = cdpCompleteActions)]
+pub fn cdp_complete_actions(
+    browser_id: u32,
+    completions: &[u8],
+    max_bytes: u32,
+) -> Result<Vec<u8>, JsValue> {
+    let frames = decode_raw_frames(completions)?;
+    let mut decoded = Vec::with_capacity(frames.len());
+    for frame in frames {
+        let value: serde_json::Value = serde_json::from_slice(frame)
+            .map_err(|error| js_syntax_error_value(&format!("invalid raw CDP completion: {error}")))?;
+        let object = value
+            .as_object()
+            .ok_or_else(|| js_syntax_error_value("raw CDP completion must be an object"))?;
+        let action_id = object
+            .get("actionId")
+            .and_then(serde_json::Value::as_u64)
+            .and_then(|id| u32::try_from(id).ok())
+            .ok_or_else(|| js_syntax_error_value("raw CDP completion actionId must be a u32"))?;
+        let generation = object
+            .get("generation")
+            .and_then(serde_json::Value::as_u64)
+            .ok_or_else(|| js_syntax_error_value("raw CDP completion generation is required"))?;
+        let result = object
+            .get("result")
+            .ok_or_else(|| js_syntax_error_value("raw CDP completion result is required"))?;
+        let result = serde_json::to_vec(result)
+            .map_err(|error| js_error_value(&format!("raw CDP completion serialization failed: {error}")))?;
+        decoded.push((action_id, generation, result));
+    }
+
+    let limit = raw_frame_limit(max_bytes);
+    let responses = with_raw_browser(browser_id, |browser| {
+        decoded
+            .iter()
+            .map(|(action_id, generation, result)| {
+                browser.raw_complete_action(*action_id, *generation, result)
+            })
+            .collect::<Result<Vec<_>, _>>()
+    })?;
+    encode_raw_frames(&responses, limit)
+}
+
+/// Version of the length-prefixed raw CDP ABI. The legacy string ABI remains
+/// at `cdpAbiVersion` 1 for existing hosts.
+#[wasm_bindgen(js_name = cdpRawAbiVersion)]
+pub fn cdp_raw_abi_version() -> u32 {
+    RAW_CDP_ABI_VERSION
+}
+
 /// Monotonic version for the JavaScript/WASM ownership and serialization ABI.
 #[wasm_bindgen]
 pub fn abi_version() -> u32 {
@@ -2138,6 +2389,14 @@ pub fn probe() -> String {
 mod tests {
     use super::*;
 
+    fn raw_values(bytes: &[u8]) -> Vec<serde_json::Value> {
+        decode_raw_frames(bytes)
+            .unwrap()
+            .into_iter()
+            .map(|frame| serde_json::from_slice(frame).unwrap())
+            .collect()
+    }
+
     fn op(core: &mut ObscuraCore, cmd: &str, arg1: &str, arg2: &str) -> String {
         core.dom_op_inner(cmd, arg1, arg2).unwrap()
     }
@@ -2146,6 +2405,63 @@ mod tests {
         let value = op(core, "query_selector", selector, "");
         assert_ne!(value, "-1", "selector {selector:?} did not match");
         value
+    }
+
+    #[test]
+    fn raw_cdp_registry_frames_actions_events_and_completions() {
+        assert_eq!(cdp_raw_abi_version(), 2);
+        let browser = browser_create(br#"{"html":"<main>portable</main>"}"#).unwrap();
+        let connection = connection_open(browser).unwrap();
+
+        let attached = raw_values(
+            &cdp_ingest(
+                browser,
+                connection,
+                br#"{"id":1,"method":"Target.attachToTarget","params":{"targetId":"page-1","flatten":true}}"#,
+            )
+            .unwrap(),
+        );
+        assert_eq!(attached.len(), 1);
+        let session = attached[0]["result"]["sessionId"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        assert!(attached[0]["result"].get("obscuraAction").is_none());
+
+        let events = raw_values(&cdp_drain_events(browser, connection, 8, 0).unwrap());
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0]["method"], "Target.attachedToTarget");
+
+        let evaluate = format!(
+            r#"{{"id":9,"sessionId":"{session}","method":"Runtime.evaluate","params":{{"expression":"6*7","returnByValue":true}}}}"#
+        );
+        let response = raw_values(&cdp_ingest(browser, connection, evaluate.as_bytes()).unwrap());
+        assert_eq!(response[0]["id"], 9);
+        assert!(response[0]["result"].get("obscuraAction").is_none());
+
+        let actions = raw_values(&cdp_drain_actions(browser, 8, 0).unwrap());
+        assert_eq!(actions.len(), 1);
+        assert_eq!(actions[0]["kind"], "evaluate");
+        assert_eq!(actions[0]["targetId"], "page-1");
+        assert_eq!(actions[0]["requestId"], 9);
+        let action_id = actions[0]["actionId"].as_u64().unwrap() as u32;
+        let generation = actions[0]["generation"].as_u64().unwrap();
+        let completion = serde_json::to_vec(&serde_json::json!({
+            "actionId": action_id,
+            "generation": generation,
+            "result": {"result": {"type": "number", "value": 42}}
+        }))
+        .unwrap();
+        let completion_batch = encode_raw_frames(&[completion], MAX_RAW_BYTES).unwrap();
+        let completed = raw_values(
+            &cdp_complete_actions(browser, &completion_batch, 0).unwrap(),
+        );
+        assert_eq!(completed[0]["id"], 9);
+        assert_eq!(completed[0]["result"]["result"]["value"], 42);
+
+        assert!(cdp_complete_actions(browser, &[1, 0, 0], 0).is_err());
+        connection_close(browser, connection).unwrap();
+        browser_close(browser).unwrap();
     }
 
     #[test]

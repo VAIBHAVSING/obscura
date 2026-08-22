@@ -276,6 +276,8 @@ pub struct PortableCdp {
     next_loader_id: u32,
     io: obscura_cdp::portable_io::IoState,
     fetch_resolutions: VecDeque<Value>,
+    raw_abi_mode: bool,
+    raw_actions: VecDeque<obscura_cdp::action::HostAction>,
 }
 
 #[wasm_bindgen]
@@ -331,6 +333,8 @@ impl PortableCdp {
             next_loader_id: 0,
             io: obscura_cdp::portable_io::IoState::with_limits(128, MAX_STREAM_BYTES),
             fetch_resolutions: VecDeque::new(),
+            raw_abi_mode: false,
+            raw_actions: VecDeque::new(),
         })
     }
 
@@ -696,6 +700,7 @@ impl PortableCdp {
     pub fn cdp_status(&self) -> String {
         json!({
             "cdpAbiVersion": CDP_ABI_VERSION,
+            "cdpRawAbiVersion": crate::RAW_CDP_ABI_VERSION,
             "targets": self.targets.len(),
             "connections": self.connections.len(),
             "pendingActions": self.action_queue.pending_len(),
@@ -715,6 +720,129 @@ impl PortableCdp {
 }
 
 impl PortableCdp {
+    /// Process one request for the bounded byte ABI. Host-backed responses do
+    /// not carry an inline `obscuraAction`; the action is delivered by
+    /// `drain_raw_actions` so request, event, and action channels stay
+    /// independently framed.
+    pub(crate) fn raw_cdp_request(
+        &mut self,
+        connection_id: u32,
+        message: &[u8],
+    ) -> Result<Vec<u8>, JsValue> {
+        if message.len() > MAX_MESSAGE_BYTES {
+            return Err(js_range_error(&format!(
+                "CDP message exceeds the {MAX_MESSAGE_BYTES}-byte limit"
+            )));
+        }
+        let message = std::str::from_utf8(message)
+            .map_err(|_| js_error("CDP message must be valid UTF-8 JSON"))?;
+        self.raw_abi_mode = true;
+        let result = self.cdp_request(connection_id, message);
+        self.raw_abi_mode = false;
+        let text = result?;
+        let mut response: Value = serde_json::from_str(&text)
+            .map_err(|error| js_error(&format!("CDP response serialization failed: {error}")))?;
+        if let Some(result) = response.get_mut("result").and_then(Value::as_object_mut) {
+            result.remove("obscuraAction");
+        }
+        let bytes = serde_json::to_vec(&response)
+            .map_err(|error| js_error(&format!("CDP response serialization failed: {error}")))?;
+        if bytes.len() > MAX_MESSAGE_BYTES {
+            return Err(js_range_error(&format!(
+                "CDP response exceeds the {MAX_MESSAGE_BYTES}-byte limit"
+            )));
+        }
+        Ok(bytes)
+    }
+
+    pub(crate) fn drain_raw_actions(
+        &mut self,
+        max_items: usize,
+        max_bytes: usize,
+    ) -> Result<Vec<Vec<u8>>, JsValue> {
+        let max_items = max_items.min(obscura_cdp::protocol::MAX_OUTPUT_FRAMES);
+        let mut frames = Vec::new();
+        let mut bytes = 0usize;
+        while frames.len() < max_items {
+            let Some(action) = self.raw_actions.front() else {
+                break;
+            };
+            let metadata = self
+                .actions
+                .get(&action.action_id)
+                .ok_or_else(|| js_error("raw CDP action metadata is stale"))?;
+            let frame = serde_json::to_vec(&json!({
+                "actionId": action.action_id,
+                "generation": action.generation,
+                "kind": action.kind,
+                "targetId": metadata.target_id,
+                "requestId": metadata.request_id,
+                "sessionId": metadata.session_id,
+                "payload": action.payload,
+            }))
+            .map_err(|error| js_error(&format!("CDP action serialization failed: {error}")))?;
+            let next = bytes
+                .checked_add(4)
+                .and_then(|value| value.checked_add(frame.len()))
+                .ok_or_else(|| js_range_error("CDP action output size overflow"))?;
+            if next > max_bytes {
+                if frames.is_empty() {
+                    return Err(js_range_error("CDP action output exceeds the requested byte limit"));
+                }
+                break;
+            }
+            let _ = self.raw_actions.pop_front();
+            bytes = next;
+            frames.push(frame);
+        }
+        Ok(frames)
+    }
+
+    pub(crate) fn drain_raw_events(
+        &mut self,
+        connection_id: u32,
+        max_items: usize,
+        max_bytes: usize,
+    ) -> Result<Vec<Vec<u8>>, JsValue> {
+        if !self.connections.contains_key(&connection_id) {
+            return Err(js_error("unknown CDP connection"));
+        }
+        let max_items = max_items.min(obscura_cdp::protocol::MAX_OUTPUT_FRAMES);
+        if max_items == 0 {
+            return Ok(Vec::new());
+        }
+        // Leave room for one four-byte prefix per possible frame. The shared
+        // queue then removes only complete events that fit the raw envelope.
+        let payload_limit = max_bytes.saturating_sub(4usize.saturating_mul(max_items));
+        let events = self.shared_state.drain_events(
+            ConnectionId::new(u64::from(connection_id)),
+            max_items,
+            payload_limit,
+        );
+        events
+            .into_iter()
+            .map(|event| {
+                serde_json::to_vec(&event)
+                    .map_err(|error| js_error(&format!("CDP event serialization failed: {error}")))
+            })
+            .collect()
+    }
+
+    pub(crate) fn raw_complete_action(
+        &mut self,
+        action_id: u32,
+        generation: u64,
+        result: &[u8],
+    ) -> Result<Vec<u8>, JsValue> {
+        if generation != self.action_queue.generation() {
+            return Err(js_error("stale CDP action generation"));
+        }
+        let result = std::str::from_utf8(result)
+            .map_err(|_| js_error("CDP action result must be valid UTF-8 JSON"))?;
+        let response = self.complete_action(action_id, result)?;
+        Ok(response.into_bytes())
+    }
+
     fn record_network_metadata(&mut self, target_id: &str, metadata: &Value) -> Result<(), JsValue> {
         let Some(events) = metadata.as_array() else {
             return Err(js_error("portable network metadata must be an array"));
@@ -1963,7 +2091,7 @@ impl PortableCdp {
         // shared queue's pending ownership, but remove its ready copy so the
         // host cannot accidentally execute the same action twice by polling
         // both legacy and shared paths.
-        let _ = self.action_queue.drain(1);
+        let drained = self.action_queue.drain(1);
         let shared_action_id = match self.shared_state.start_action(shared_action) {
             Ok(id) => id,
             Err(error) => {
@@ -1971,6 +2099,9 @@ impl PortableCdp {
                 return cdp_error_response(&request.id, -32000, error.to_string(), request.session_id.as_deref());
             }
         };
+        if self.raw_abi_mode {
+            self.raw_actions.extend(drained);
+        }
         debug_assert_eq!(shared_action_id.get(), u64::from(action_id));
         self.actions.insert(action_id, Action {
             connection_id,
@@ -2267,6 +2398,7 @@ impl PortableCdp {
         for id in ids {
             self.actions.remove(&id);
             let _ = self.action_queue.cancel(id);
+            self.raw_actions.retain(|action| action.action_id != id);
             let shared_id = EngineActionId::new(u64::from(id));
             let _ = self.shared_state.complete_action(
                 shared_id,

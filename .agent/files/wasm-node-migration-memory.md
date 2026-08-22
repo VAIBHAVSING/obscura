@@ -1270,3 +1270,38 @@ Verification for this checkpoint:
 Remaining C3 work is navigation lifecycle/action payload ownership, reduction
 of the legacy target/session metadata, raw-byte ABI/package finalization, and
 real Playwright/Puppeteer/concurrency gates.
+## Bounded raw CDP WASM ABI checkpoint (2026-08-22)
+
+The WASM crate now exposes a transport-only raw byte surface around the shared
+portable CDP state. `browserCreate`/`browserClose` keep up to 4096 independent
+`PortableCdp` instances in a thread-local registry; `connectionOpen` and
+`connectionClose` scope host connections to one instance. `cdpIngest` accepts
+one bounded UTF-8 CDP request and returns one little-endian u32 length-prefixed
+response frame. `cdpDrainEvents` and `cdpDrainActions` return independently
+framed batches, with complete-frame byte limits and a 512-frame cap. Action
+frames carry camelCase `actionId`, `generation`, `kind`, `targetId`,
+`requestId`, `sessionId`, and `payload`; the completion batch validates the
+echoed generation before calling the existing CDP completion path. Raw
+responses remove the legacy inline `obscuraAction`
+field, so host execution and response traffic cannot be accidentally consumed
+twice. `cdpRawAbiVersion` is 2; the existing string `cdpAbiVersion` remains 1.
+
+The registry is deliberately Node-independent and does not add V8, sockets,
+filesystem access, or a JS package. Navigation/network/render host actions,
+context persistence, and the Node/Playwright adapter still remain follow-up
+work. The frame envelope is a bounded ABI slice, not a claim that the entire
+browser has no host services.
+
+Verification for this checkpoint:
+
+- `obscura-cdp`: **44/44 passed** with
+  `--no-default-features --features portable`.
+- `obscura-wasm`: raw registry/action/event/completion test passed; render
+  suite **79/79 passed**.
+- wasm32 render check passed.
+- native-server CDP check passed.
+- `git diff --check` passed.
+
+Remaining C3 work is navigation lifecycle/action payload ownership, reduction
+of legacy target/session metadata, raw ABI hardening/real-artifact coverage,
+Node package and Playwright integration, and real concurrency gates.
