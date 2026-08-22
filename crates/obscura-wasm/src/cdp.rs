@@ -33,7 +33,6 @@ const MAX_ACTION_RESULT_BYTES: usize = 16 * 1024 * 1024;
 const MAX_STREAM_BYTES: usize = 12 * 1024 * 1024;
 const MAX_STREAM_CHUNK_BYTES: usize = 1 * 1024 * 1024;
 const MAX_RESPONSE_BODY_BYTES: usize = 4 * 1024 * 1024;
-const MAX_RESPONSE_BODIES: usize = 128;
 const MAX_FETCH_PATTERNS: usize = 64;
 const MAX_FETCH_PATTERN_BYTES: usize = 2048;
 const MAX_FETCH_REQUESTS: usize = 256;
@@ -191,11 +190,6 @@ struct Action {
     kind: String,
 }
 
-struct ResponseBody {
-    body: String,
-    base64_encoded: bool,
-}
-
 struct PausedFetch {
     request_id: String,
     url: String,
@@ -213,34 +207,15 @@ struct FetchPattern {
     request_stage: String,
 }
 
-#[derive(Clone, Copy)]
-struct Viewport {
-    width: u32,
-    height: u32,
-}
-
-impl Default for Viewport {
-    fn default() -> Self {
-        Self { width: 800, height: 600 }
-    }
-}
-
 struct Target {
     id: String,
-    context_id: String,
     frame_id: String,
     loader_id: String,
     url: String,
     title: String,
     document_handle: u32,
     revision: u32,
-    viewport: Viewport,
-    emulated_media: String,
-    focus_emulation: bool,
-    cache_disabled: bool,
-    extra_headers: BTreeMap<String, String>,
     paused_fetches: BTreeMap<String, PausedFetch>,
-    response_bodies: BTreeMap<String, ResponseBody>,
     core: ObscuraCore,
 }
 
@@ -292,20 +267,13 @@ impl PortableCdp {
             "page-1".to_string(),
             Target {
                 id: "page-1".to_string(),
-                context_id: "default".to_string(),
                 frame_id: "page-1".to_string(),
                 loader_id: "loader-blank-page-1".to_string(),
                 url: "about:blank".to_string(),
                 title: String::new(),
                 document_handle,
                 revision,
-                viewport: Viewport::default(),
-                emulated_media: String::new(),
-                focus_emulation: false,
-                cache_disabled: false,
-                extra_headers: BTreeMap::new(),
                 paused_fetches: BTreeMap::new(),
-                response_bodies: BTreeMap::new(),
                 core,
             },
         );
@@ -630,10 +598,9 @@ impl PortableCdp {
         self.shared_state
             .clear_response_bodies(&page_id)
             .map_err(|error| js_error(&format!("portable cache target is not known: {error}")))?;
-        let Some(target) = self.targets.get_mut(target_id) else {
+        if !self.targets.contains_key(target_id) {
             return Err(js_error("portable cache target is not known"));
-        };
-        target.response_bodies.clear();
+        }
         Ok(())
     }
 
@@ -687,7 +654,12 @@ impl PortableCdp {
             "streamChunkBytes": MAX_STREAM_CHUNK_BYTES,
             "streams": self.io.len(),
             "responseBodyBytes": MAX_RESPONSE_BODY_BYTES,
-            "responseBodies": self.targets.values().map(|target| target.response_bodies.len()).sum::<usize>(),
+            "responseBodies": self
+                .shared_state
+                .pages()
+                .filter_map(|page| self.shared_state.network_state(&page.id))
+                .map(|network| network.response_bodies.len())
+                .sum::<usize>(),
             "fetchPatternLimit": MAX_FETCH_PATTERNS,
             "fetchPausedRequestLimit": MAX_FETCH_REQUESTS,
             "fetchResolutionQueue": self.fetch_resolutions.len() + self.shared_state.fetch_resolution_count(),
@@ -848,7 +820,7 @@ impl PortableCdp {
         let shared_page = shared_page_id(target_id);
         let mut shared_bodies = Vec::new();
         let mut pending_events: Vec<(u32, String, &'static str, Value)> = Vec::new();
-        let Some(target) = self.targets.get_mut(target_id) else {
+        let Some(target) = self.targets.get(target_id) else {
             return Err(js_error("portable network target is not known"));
         };
         for event in events {
@@ -876,17 +848,7 @@ impl PortableCdp {
                     return Err(js_range_error("portable network response body exceeds the 4MiB limit"));
                 }
             }
-            if target.response_bodies.len() >= MAX_RESPONSE_BODIES && !target.response_bodies.contains_key(request_id) {
-                let oldest = target.response_bodies.keys().next().cloned();
-                if let Some(oldest) = oldest {
-                    target.response_bodies.remove(&oldest);
-                }
-            }
             if let Some(body_base64) = body_base64 {
-                target.response_bodies.insert(request_id.to_string(), ResponseBody {
-                    body: body_base64.to_string(),
-                    base64_encoded: true,
-                });
                 shared_bodies.push((request_id.to_string(), body_base64.to_string(), true));
             }
 
@@ -1030,29 +992,6 @@ impl PortableCdp {
             .and_then(Value::as_str)
             .unwrap_or(&target.frame_id)
             .to_string();
-        if request_stage == "Response" {
-            if let Some(body_base64) = metadata.get("responseBodyBase64").and_then(Value::as_str) {
-                bounded(body_base64, MAX_ACTION_RESULT_BYTES, "Fetch response body")?;
-                let body = BASE64
-                    .decode(body_base64)
-                    .map_err(|_| js_error("Fetch response body is not valid base64"))?;
-                if body.len() > MAX_RESPONSE_BODY_BYTES {
-                    return Err(js_range_error("Fetch response body exceeds the 4MiB limit"));
-                }
-                if target.response_bodies.len() >= MAX_RESPONSE_BODIES
-                    && !target.response_bodies.contains_key(request_id)
-                {
-                    let oldest = target.response_bodies.keys().next().cloned();
-                    if let Some(oldest) = oldest {
-                        target.response_bodies.remove(&oldest);
-                    }
-                }
-                target.response_bodies.insert(request_id.to_string(), ResponseBody {
-                    body: body_base64.to_string(),
-                    base64_encoded: true,
-                });
-            }
-        }
         let matching_sessions: Vec<(u32, String)> = shared_page
             .iter()
             .copied()
@@ -1355,7 +1294,11 @@ impl PortableCdp {
                 let doomed: Vec<String> = self
                     .targets
                     .values()
-                    .filter(|target| target.context_id == id)
+                    .filter(|target| {
+                        shared_page_id(&target.id)
+                            .and_then(|page| self.shared_state.context_for_page(&page).ok())
+                            == Some(shared_id)
+                    })
                     .map(|target| target.id.clone())
                     .collect();
                 if let Err(error) = self.shared_state.dispose_context(&shared_id) {
@@ -1485,7 +1428,11 @@ impl PortableCdp {
                 .map(|context| {
                     self.targets
                         .values()
-                        .filter(|target| shared_context_id(&target.context_id) == Some(context))
+                        .filter(|target| {
+                            shared_page_id(&target.id)
+                                .and_then(|page| self.shared_state.context_for_page(&page).ok())
+                                == Some(context)
+                        })
                         .filter_map(|target| shared_page_id(&target.id).map(|page| (target.id.clone(), page)))
                         .flat_map(|(target_id, page)| {
                             self.shared_state
@@ -1519,7 +1466,11 @@ impl PortableCdp {
                         .map(|id| {
                             self.targets
                                 .values()
-                                .filter(|target| target.context_id == id)
+                                .filter(|target| {
+                                    shared_page_id(&target.id)
+                                        .and_then(|page| self.shared_state.context_for_page(&page).ok())
+                                        == shared_context_id(id)
+                                })
                                 .map(|target| target.id.clone())
                                 .collect()
                         })
@@ -1639,8 +1590,16 @@ impl PortableCdp {
             params: Value::Object(request.params.clone()),
             session_id: request.session_id.clone(),
         };
+        let page_id = shared_page_id(target_id)?;
+        let display = self.shared_state.display_state(&page_id)?.clone();
         let target = self.targets.get_mut(target_id)?;
-        let mut backend = CoreRenderBackend { target };
+        let mut backend = CoreRenderBackend {
+            core: &mut target.core,
+            width: display.width,
+            height: display.height,
+            document_handle: target.document_handle,
+            revision: target.revision,
+        };
         let response = obscura_cdp::portable_dispatch::dispatch_render(
             &shared_request,
             &mut backend,
@@ -1704,66 +1663,6 @@ impl PortableCdp {
             self.queue_event(connection_id, &event.method, event.params, event.session_id.as_deref());
         }
         if response.error.is_none() {
-            if obscura_cdp::portable_network::supports(&request.method) {
-                if let Some(target) = self.targets.get_mut(target_id) {
-                    match request.method.as_str() {
-                        "Network.disable" => {
-                            target.response_bodies.clear();
-                        }
-                        "Network.setCacheDisabled" => {
-                            target.cache_disabled = request
-                                .params
-                                .get("cacheDisabled")
-                                .and_then(Value::as_bool)
-                                .unwrap_or(false);
-                        }
-                        "Network.setExtraHTTPHeaders" => {
-                            if let Some(headers) = request.params.get("headers").and_then(Value::as_object) {
-                                target.extra_headers = headers
-                                    .iter()
-                                    .filter_map(|(name, value)| value.as_str().map(|value| (name.clone(), value.to_string())))
-                                    .collect();
-                            }
-                        }
-                        "Network.clearBrowserCache" => target.response_bodies.clear(),
-                        _ => {}
-                    }
-                }
-            }
-            if obscura_cdp::portable_emulation::supports(&request.method) {
-                if let Some(target) = self.targets.get_mut(target_id) {
-                    match request.method.as_str() {
-                        "Emulation.setDeviceMetricsOverride" => {
-                            if let (Some(width), Some(height)) = (
-                                request.params.get("width").and_then(Value::as_u64),
-                                request.params.get("height").and_then(Value::as_u64),
-                            ) {
-                                target.viewport = Viewport {
-                                    width: u32::try_from(width).unwrap_or(Viewport::default().width),
-                                    height: u32::try_from(height).unwrap_or(Viewport::default().height),
-                                };
-                            }
-                        }
-                        "Emulation.clearDeviceMetricsOverride" => target.viewport = Viewport::default(),
-                        "Emulation.setEmulatedMedia" => {
-                            target.emulated_media = request
-                                .params
-                                .get("media")
-                                .and_then(Value::as_str)
-                                .unwrap_or("")
-                                .to_string();
-                        }
-                        "Emulation.setFocusEmulationEnabled" => {
-                            target.focus_emulation = request
-                                .params
-                                .get("enabled")
-                                .and_then(Value::as_bool)
-                                .unwrap_or(false);
-                        }
-                        _ => {}
-                    }
-                }
-            }
             if obscura_cdp::portable_fetch::supports(&request.method) {
                 if let Some(target) = self.targets.get_mut(target_id) {
                     match request.method.as_str() {
@@ -1788,13 +1687,16 @@ impl PortableCdp {
                 )
             {
                 if let Ok(cookie_json) = self.shared_state.context_cookies_json(&page_id, now) {
-                    let context_id = self.targets.get(target_id).map(|target| target.context_id.clone());
+                    let context_id = self.shared_state.context_for_page(&page_id).ok();
                     let targets: Vec<String> = context_id
-                        .as_deref()
                         .map(|context| {
                             self.targets
                                 .iter()
-                                .filter(|(_, target)| target.context_id == context)
+                                .filter(|(target_id, _)| {
+                                    shared_page_id(target_id)
+                                        .and_then(|page| self.shared_state.context_for_page(&page).ok())
+                                        == Some(context)
+                                })
                                 .map(|(target_id, _)| target_id.clone())
                                 .collect()
                         })
@@ -1924,13 +1826,13 @@ impl PortableCdp {
                 let Some(request_id) = request.params.get("requestId").and_then(Value::as_str) else {
                     return cdp_error_response(&request.id, -32602, "requestId is required", session);
                 };
-                let Some(target) = self.targets.get(&target_id) else {
+                let Some(page) = shared_page_id(&target_id) else {
                     return cdp_error_response(&request.id, -32000, "target is not known", session);
                 };
-                let Some(body) = target.response_bodies.get(request_id) else {
-                    return cdp_error_response(&request.id, -32000, "No response body found for requestId", session);
-                };
-                cdp_result_response(&request.id, json!({"body": body.body, "base64Encoded": body.base64_encoded}), session)
+                match self.shared_state.response_body(&page, request_id) {
+                    Ok(body) => cdp_result_response(&request.id, json!({"body": body.body, "base64Encoded": body.base64_encoded}), session),
+                    Err(_) => cdp_error_response(&request.id, -32000, "No response body found for requestId", session),
+                }
             }
             "Network.enable" => {
                 let Some(session_id) = session else {
@@ -1955,19 +1857,16 @@ impl PortableCdp {
                 if let Err(error) = self.shared_state.network_disable(&page, shared_session) {
                     return cdp_error_response(&request.id, -32000, error.to_string(), session);
                 }
-                if let Some(target) = self.targets.get_mut(&target_id) {
-                    target.response_bodies.clear();
-                }
                 cdp_result_response(&request.id, json!({}), session)
             }
             "Page.getLayoutMetrics" => {
-                let Some(target) = self.targets.get(&target_id) else {
+                let Some(page) = shared_page_id(&target_id) else {
                     return cdp_error_response(&request.id, -32000, "target is not known", session);
                 };
-                cdp_result_response(&request.id, layout_metrics(target), session)
+                cdp_result_response(&request.id, layout_metrics(&self.shared_state, page), session)
             }
             "Emulation.setDeviceMetricsOverride" => {
-                let Some(target) = self.targets.get_mut(&target_id) else {
+                let Some(page) = shared_page_id(&target_id) else {
                     return cdp_error_response(&request.id, -32000, "target is not known", session);
                 };
                 let width = match request.params.get("width").and_then(Value::as_u64) {
@@ -1988,32 +1887,41 @@ impl PortableCdp {
                 if !device_scale_factor.is_finite() || !(0.0..=8.0).contains(&device_scale_factor) {
                     return cdp_error_response(&request.id, -32602, "deviceScaleFactor must be between 0 and 8", session);
                 }
-                target.viewport = Viewport { width, height };
+                if let Err(error) = self.shared_state.set_device_metrics(&page, width, height, device_scale_factor, false) {
+                    return cdp_error_response(&request.id, -32602, error.to_string(), session);
+                }
                 cdp_result_response(&request.id, json!({}), session)
             }
             "Emulation.clearDeviceMetricsOverride" => {
-                let Some(target) = self.targets.get_mut(&target_id) else {
+                let Some(page) = shared_page_id(&target_id) else {
                     return cdp_error_response(&request.id, -32000, "target is not known", session);
                 };
-                target.viewport = Viewport::default();
+                if let Err(error) = self.shared_state.clear_device_metrics(&page) {
+                    return cdp_error_response(&request.id, -32000, error.to_string(), session);
+                }
                 cdp_result_response(&request.id, json!({}), session)
             }
             "Emulation.setEmulatedMedia" => {
-                let Some(target) = self.targets.get_mut(&target_id) else {
+                let Some(page) = shared_page_id(&target_id) else {
                     return cdp_error_response(&request.id, -32000, "target is not known", session);
                 };
                 let media = request.params.get("media").and_then(Value::as_str).unwrap_or("");
                 if media.len() > 256 {
                     return cdp_error_response(&request.id, -32602, "media exceeds the 256-byte limit", session);
                 }
-                target.emulated_media = media.to_string();
+                if let Err(error) = self.shared_state.set_emulated_media(&page, media.to_string()) {
+                    return cdp_error_response(&request.id, -32602, error.to_string(), session);
+                }
                 cdp_result_response(&request.id, json!({}), session)
             }
             "Emulation.setFocusEmulationEnabled" => {
-                let Some(target) = self.targets.get_mut(&target_id) else {
+                let Some(page) = shared_page_id(&target_id) else {
                     return cdp_error_response(&request.id, -32000, "target is not known", session);
                 };
-                target.focus_emulation = request.params.get("enabled").and_then(Value::as_bool).unwrap_or(false);
+                let enabled = request.params.get("enabled").and_then(Value::as_bool).unwrap_or(false);
+                if let Err(error) = self.shared_state.set_focus_emulation(&page, enabled) {
+                    return cdp_error_response(&request.id, -32000, error.to_string(), session);
+                }
                 cdp_result_response(&request.id, json!({}), session)
             }
             "Network.setExtraHTTPHeaders" => {
@@ -2021,10 +1929,12 @@ impl PortableCdp {
                     Ok(headers) => headers,
                     Err(error) => return cdp_error_response(&request.id, -32602, error, session),
                 };
-                let Some(target) = self.targets.get_mut(&target_id) else {
+                let Some(page) = shared_page_id(&target_id) else {
                     return cdp_error_response(&request.id, -32000, "target is not known", session);
                 };
-                target.extra_headers = headers;
+                if let Err(error) = self.shared_state.set_extra_headers(&page, headers) {
+                    return cdp_error_response(&request.id, -32602, error.to_string(), session);
+                }
                 cdp_result_response(&request.id, json!({}), session)
             }
             "Network.getAllCookies" | "Storage.getCookies" => {
@@ -2081,15 +1991,20 @@ impl PortableCdp {
                 cdp_result_response(&request.id, json!({}), session)
             }
             "Network.setCacheDisabled" => {
-                let Some(target) = self.targets.get_mut(&target_id) else {
+                let Some(page) = shared_page_id(&target_id) else {
                     return cdp_error_response(&request.id, -32000, "target is not known", session);
                 };
-                target.cache_disabled = request.params.get("cacheDisabled").and_then(Value::as_bool).unwrap_or(false);
+                let disabled = request.params.get("cacheDisabled").and_then(Value::as_bool).unwrap_or(false);
+                if let Err(error) = self.shared_state.set_cache_disabled(&page, disabled) {
+                    return cdp_error_response(&request.id, -32000, error.to_string(), session);
+                }
                 cdp_result_response(&request.id, json!({}), session)
             }
             "Network.clearBrowserCache" => {
-                if let Some(target) = self.targets.get_mut(&target_id) {
-                    target.response_bodies.clear();
+                if let Some(page) = shared_page_id(&target_id) {
+                    if let Err(error) = self.shared_state.clear_response_bodies(&page) {
+                        return cdp_error_response(&request.id, -32000, error.to_string(), session);
+                    }
                 }
                 cdp_result_response(&request.id, json!({}), session)
             }
@@ -2100,13 +2015,13 @@ impl PortableCdp {
                 if request_id.len() > MAX_METHOD_BYTES {
                     return cdp_error_response(&request.id, -32602, "requestId exceeds the 256-byte limit", session);
                 }
-                let Some(target) = self.targets.get(&target_id) else {
+                let Some(page) = shared_page_id(&target_id) else {
                     return cdp_error_response(&request.id, -32000, "target is not known", session);
                 };
-                let Some(body) = target.response_bodies.get(request_id) else {
-                    return cdp_error_response(&request.id, -32000, "No response body found for requestId", session);
-                };
-                cdp_result_response(&request.id, json!({"body": body.body, "base64Encoded": body.base64_encoded}), session)
+                match self.shared_state.response_body(&page, request_id) {
+                    Ok(body) => cdp_result_response(&request.id, json!({"body": body.body, "base64Encoded": body.base64_encoded}), session),
+                    Err(_) => cdp_error_response(&request.id, -32000, "No response body found for requestId", session),
+                }
             }
             "Page.getFrameTree" => {
                 let Some(target) = self.targets.get(&target_id) else {
@@ -2235,20 +2150,13 @@ impl PortableCdp {
         self.next_loader_id = self.next_loader_id.saturating_add(1);
         self.targets.insert(target_id.clone(), Target {
             id: target_id.clone(),
-            context_id: context_id.to_string(),
             frame_id: target_id.clone(),
             loader_id,
             url: url.to_string(),
             title: String::new(),
             document_handle: core.document_handle(),
             revision: core.page_revision(),
-            viewport: Viewport::default(),
-            emulated_media: String::new(),
-            focus_emulation: false,
-            cache_disabled: false,
-            extra_headers: BTreeMap::new(),
             paused_fetches: BTreeMap::new(),
-            response_bodies: BTreeMap::new(),
             core,
         });
         self.announce_target_created(&target_id);
@@ -2475,16 +2383,26 @@ impl PortableCdp {
     }
 
     fn target_info(&self, target: &Target) -> Value {
+        let page = shared_page_id(&target.id);
+        let page_state = page.and_then(|page| self.shared_state.page(&page));
         json!({
             "targetId": target.id,
             "type": "page",
-            "title": target.title,
-            "url": target.url,
-            "attached": shared_page_id(&target.id)
+            "title": page_state.map(|page| page.title.as_str()).unwrap_or(""),
+            "url": page_state.map(|page| page.url.as_str()).unwrap_or("about:blank"),
+            "attached": page
                 .is_some_and(|page| self.shared_state.page_is_attached(page)),
             "openerId": Value::Null,
             "canAccessOpener": false,
-            "browserContextId": target.context_id,
+            "browserContextId": page_state
+                .map(|page| {
+                    if page.context_id == self.shared_state.default_context() {
+                        "default".to_string()
+                    } else {
+                        format!("context-{}", page.context_id.get())
+                    }
+                })
+                .unwrap_or_else(|| "default".to_string()),
         })
     }
 
@@ -2504,9 +2422,10 @@ impl PortableCdp {
     }
 }
 
-fn layout_metrics(target: &Target) -> Value {
-    let width = target.viewport.width;
-    let height = target.viewport.height;
+fn layout_metrics(state: &BrowserState, page_id: PageId) -> Value {
+    let display = state.display_state(&page_id).cloned().unwrap_or_default();
+    let width = display.width;
+    let height = display.height;
     json!({
         "layoutViewport": {"pageX": 0, "pageY": 0, "clientWidth": width, "clientHeight": height},
         "visualViewport": {
@@ -2604,23 +2523,25 @@ impl obscura_cdp::portable_dom::DomBackend for CoreDomBackend<'_> {
 
 #[cfg(feature = "render")]
 struct CoreRenderBackend<'a> {
-    target: &'a mut Target,
+    core: &'a mut ObscuraCore,
+    width: u32,
+    height: u32,
+    document_handle: u32,
+    revision: u32,
 }
 
 #[cfg(feature = "render")]
 impl obscura_cdp::portable_render::RenderBackend for CoreRenderBackend<'_> {
     fn capture_screenshot(&mut self, _format: &str) -> Result<Vec<u8>, String> {
-        self.target
-            .core
-            .screenshot_png(self.target.viewport.width, self.target.viewport.height, 0.0, 0.0)
+        self.core
+            .screenshot_png(self.width, self.height, 0.0, 0.0)
             .map_err(|_| "portable screenshot failed".to_string())
     }
 
     fn print_to_pdf(&mut self, options: &Value) -> Result<Vec<u8>, String> {
         let options = serde_json::to_string(options).map_err(|_| "invalid PDF options".to_string())?;
-        self.target
-            .core
-            .pdf(&options, self.target.document_handle, self.target.revision)
+        self.core
+            .pdf(&options, self.document_handle, self.revision)
             .map_err(|_| "portable PDF failed".to_string())
     }
 }
@@ -4048,7 +3969,11 @@ impl CdpEngine for PortableCdp {
         let doomed: Vec<String> = self
             .targets
             .values()
-            .filter(|target| target.context_id == wire_id)
+            .filter(|target| {
+                shared_page_id(&target.id)
+                    .and_then(|page| self.shared_state.context_for_page(&page).ok())
+                    == Some(*id)
+            })
             .map(|target| target.id.clone())
             .collect();
         self.shared_state.dispose_context(id)?;
@@ -4087,16 +4012,15 @@ impl CdpEngine for PortableCdp {
     fn page_snapshot(&self, page: &PageId) -> Result<obscura_cdp::engine::PageSnapshot, CdpFailure> {
         let wire_page = format!("page-{}", page.get());
         let target = self.targets.get(&wire_page).ok_or(CdpFailure::UnknownPage(*page))?;
-        let context_id = shared_context_id(&target.context_id)
-            .ok_or_else(|| CdpFailure::UnknownContext(ContextId::new(0)))?;
+        let page_state = self.shared_state.page(page).ok_or(CdpFailure::UnknownPage(*page))?;
         Ok(obscura_cdp::engine::PageSnapshot {
             page_id: *page,
-            context_id,
-            url: target.url.clone(),
-            title: target.title.clone(),
-            frame_id: target.frame_id.clone(),
-            loader_id: target.loader_id.clone(),
-            document_generation: u64::from(target.revision),
+            context_id: page_state.context_id,
+            url: page_state.url.clone(),
+            title: page_state.title.clone(),
+            frame_id: page_state.frame_id.clone(),
+            loader_id: page_state.loader_id.clone(),
+            document_generation: page_state.document_generation,
         })
     }
 

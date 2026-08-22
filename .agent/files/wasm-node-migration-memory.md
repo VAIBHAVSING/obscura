@@ -1391,3 +1391,22 @@ has browser-level target/context bookkeeping and a compatibility routing table,
 the WASM `PortableCdp` migration scaffolding remains in the crate, and
 Playwright/Puppeteer/concurrency/resource gates plus the missing companion
 obstacle course remain outstanding.
+
+## Shared page Network/display ownership checkpoint (2026-08-22)
+
+`crates/obscura-wasm/src/cdp.rs` no longer stores a second per-target copy of
+response bodies, cache/header policy, viewport metrics, emulated media, or
+focus emulation. Those bounded values now live only in `obscura_cdp::state::BrowserState`;
+fallback command paths and render/layout adapters read and update that state
+directly. Network and Fetch response bodies therefore have one bounded
+eviction queue per page instead of duplicated `PortableCdp::Target` and
+`BrowserState::PageNetworkState` buffers. This is a memory/resource fix and
+also removes a source-of-truth split; it does not yet make Node share one
+Worker across package targets.
+
+Verification:
+
+- `cargo test --offline -p obscura-wasm --no-default-features --quiet`: **73/73**.
+- `cargo test --offline -p obscura-wasm --features render --quiet`: **79/79**.
+- `cargo check --offline -p obscura-wasm --features render --target wasm32-unknown-unknown --quiet` passed.
+- `git diff --check` passed.
