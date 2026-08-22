@@ -63,6 +63,8 @@ pub fn supports_page(method: &str) -> bool {
         || crate::portable_network::supports(method)
         || crate::portable_page::supports(method)
         || crate::portable_dom::supports(method)
+        || crate::portable_domsnapshot::supports(method)
+        || crate::portable_accessibility::supports(method)
         || crate::portable_runtime::supports(method)
 }
 
@@ -132,6 +134,18 @@ fn dispatch_page_impl(
             response: output.response,
             events: output.events,
         });
+    }
+    if crate::portable_domsnapshot::supports(&request.method) {
+        let backend = backend.as_deref_mut()?;
+        return Some(PageDispatch::response(crate::portable_domsnapshot::dispatch(
+            request, state, page_id, backend,
+        )?));
+    }
+    if crate::portable_accessibility::supports(&request.method) {
+        let backend = backend.as_deref_mut()?;
+        return Some(PageDispatch::response(crate::portable_accessibility::dispatch(
+            request, state, page_id, backend,
+        )?));
     }
     if crate::portable_runtime::supports(&request.method) {
         let output = crate::portable_runtime::dispatch(request, state, page_id)?;

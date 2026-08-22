@@ -2403,6 +2403,14 @@ impl obscura_cdp::portable_dom::DomBackend for CoreDomBackend<'_> {
     fn describe_children(&mut self, node_id: u32, depth: usize) -> Result<Vec<Value>, String> {
         describe_children(self.core, node_id, depth, 0)
     }
+
+    fn capture_snapshot(&mut self, url: &str, title: &str, _params: &Value) -> Result<Value, String> {
+        build_core_dom_snapshot(self.core, url, title)
+    }
+
+    fn full_accessibility_tree(&mut self, _params: &Value) -> Result<Vec<Value>, String> {
+        build_core_accessibility_tree(self.core)
+    }
 }
 
 #[cfg(feature = "render")]
@@ -2718,6 +2726,406 @@ fn describe_node(
     Ok(node)
 }
 
+const MAX_PORTABLE_TREE_NODES: usize = 20_000;
+fn core_child_ids(core: &mut ObscuraCore, node_id: u32) -> Result<Vec<u32>, String> {
+    let raw = core
+        .dom_op("child_nodes", &node_id.to_string(), "")
+        .map_err(|_| "DOM node is not known".to_string())?;
+    serde_json::from_str(&raw).map_err(|_| "DOM child node response is invalid".to_string())
+}
+
+fn core_node_description(core: &mut ObscuraCore, node_id: u32) -> Result<Value, String> {
+    describe_node(core, node_id, 0, 0)
+}
+
+fn core_node_type(node: &Value) -> u32 {
+    node.get("nodeType").and_then(Value::as_u64).and_then(|value| u32::try_from(value).ok()).unwrap_or(0)
+}
+
+fn core_node_name(node: &Value) -> &str {
+    node.get("nodeName").and_then(Value::as_str).unwrap_or("")
+}
+
+fn core_node_value(node: &Value) -> &str {
+    node.get("nodeValue").and_then(Value::as_str).unwrap_or("")
+}
+
+fn core_node_attributes(node: &Value) -> Vec<(String, String)> {
+    node.get("attributes")
+        .and_then(Value::as_array)
+        .map(|values| {
+            values
+                .chunks(2)
+                .filter_map(|pair| match pair {
+                    [name, value] => Some((name.as_str()?.to_string(), value.as_str()?.to_string())),
+                    _ => None,
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+fn core_attribute(node: &Value, name: &str) -> Option<String> {
+    core_node_attributes(node)
+        .into_iter()
+        .find(|(candidate, _)| candidate.eq_ignore_ascii_case(name))
+        .map(|(_, value)| value)
+}
+
+struct SnapshotInterner {
+    map: HashMap<String, i64>,
+    values: Vec<String>,
+}
+
+impl SnapshotInterner {
+    fn new() -> Self {
+        let mut interner = Self { map: HashMap::new(), values: Vec::new() };
+        interner.intern("");
+        interner
+    }
+
+    fn intern(&mut self, value: &str) -> i64 {
+        if let Some(index) = self.map.get(value) {
+            return *index;
+        }
+        let index = i64::try_from(self.values.len()).unwrap_or(i64::MAX);
+        self.values.push(value.to_string());
+        self.map.insert(value.to_string(), index);
+        index
+    }
+}
+
+fn build_core_dom_snapshot(core: &mut ObscuraCore, url: &str, title: &str) -> Result<Value, String> {
+    let document = core.document_handle();
+    let mut order = Vec::new();
+    let mut parents = Vec::new();
+    let mut stack = vec![(document, -1_i64)];
+    while let Some((node_id, parent)) = stack.pop() {
+        if order.len() >= MAX_PORTABLE_TREE_NODES {
+            break;
+        }
+        let index = i64::try_from(order.len()).unwrap_or(i64::MAX);
+        order.push(node_id);
+        parents.push(parent);
+        let children = core_child_ids(core, node_id)?;
+        for child in children.into_iter().rev() {
+            stack.push((child, index));
+        }
+    }
+
+    let mut strings = SnapshotInterner::new();
+    let document_url = strings.intern(url);
+    let document_title = strings.intern(title);
+    let mut node_type = Vec::with_capacity(order.len());
+    let mut node_name = Vec::with_capacity(order.len());
+    let mut node_value = Vec::with_capacity(order.len());
+    let mut backend_ids = Vec::with_capacity(order.len());
+    let mut attributes = Vec::with_capacity(order.len());
+    let mut clickable = Vec::new();
+    let mut layout_node_index = Vec::with_capacity(order.len());
+    let mut bounds = Vec::with_capacity(order.len());
+    let mut styles = Vec::with_capacity(order.len());
+    let mut paint_orders = Vec::with_capacity(order.len());
+    let mut client_rects = Vec::with_capacity(order.len());
+    let mut layout_text = Vec::with_capacity(order.len());
+
+    for (index, node_id) in order.iter().copied().enumerate() {
+        let node = core_node_description(core, node_id)?;
+        let kind = core_node_type(&node);
+        let name = core_node_name(&node).to_string();
+        let value = core_node_value(&node).to_string();
+        let attrs = core_node_attributes(&node);
+        let tag = if kind == 1 { name.to_ascii_lowercase() } else { String::new() };
+        node_type.push(i64::from(kind));
+        node_name.push(strings.intern(&name));
+        node_value.push(strings.intern(&value));
+        backend_ids.push(i64::from(node_id));
+        let flat_attributes: Vec<Value> = attrs
+            .iter()
+            .flat_map(|(name, value)| [json!(strings.intern(name)), json!(strings.intern(value))])
+            .collect();
+        attributes.push(Value::Array(flat_attributes));
+
+        let interactive = matches!(
+            tag.as_str(),
+            "a" | "button" | "input" | "select" | "textarea" | "summary" | "details" | "option" | "label"
+        ) || attrs.iter().any(|(name, _)| name.eq_ignore_ascii_case("onclick"));
+        if interactive {
+            clickable.push(i64::try_from(index).unwrap_or(i64::MAX));
+        }
+        let hidden = matches!(
+            tag.as_str(),
+            "head" | "meta" | "title" | "script" | "style" | "link" | "noscript" | "base"
+        );
+        let display = if kind == 1 && hidden { "none" } else { "block" };
+        let cursor = if interactive { "pointer" } else { "auto" };
+        let style_values = [
+            display,
+            "visible",
+            "1",
+            "visible",
+            "visible",
+            "visible",
+            cursor,
+            "auto",
+            "static",
+            "rgba(0, 0, 0, 0)",
+        ];
+        styles.push(Value::Array(style_values.iter().map(|value| json!(strings.intern(value))).collect()));
+        layout_node_index.push(i64::try_from(index).unwrap_or(i64::MAX));
+        let y = (index as f64) * 18.0;
+        bounds.push(json!([0.0, y, 1280.0, 18.0]));
+        client_rects.push(json!([0.0, y, 1280.0, 18.0]));
+        paint_orders.push(i64::try_from(index).unwrap_or(i64::MAX));
+        layout_text.push(-1);
+    }
+
+    Ok(json!({
+        "documents": [{
+            "documentURL": document_url,
+            "title": document_title,
+            "baseURL": document_url,
+            "contentLanguage": 0,
+            "encodingName": 0,
+            "publicId": 0,
+            "systemId": 0,
+            "frameId": 0,
+            "nodes": {
+                "parentIndex": parents,
+                "nodeType": node_type,
+                "nodeName": node_name,
+                "nodeValue": node_value,
+                "backendNodeId": backend_ids,
+                "attributes": attributes,
+                "isClickable": {"index": clickable},
+            },
+            "layout": {
+                "nodeIndex": layout_node_index,
+                "styles": styles,
+                "bounds": bounds,
+                "text": layout_text,
+                "paintOrders": paint_orders,
+                "clientRects": client_rects,
+            },
+            "textBoxes": {"layoutIndex": [], "bounds": [], "start": [], "length": []},
+            "scrollOffsetX": 0.0,
+            "scrollOffsetY": 0.0,
+            "contentWidth": 1280,
+            "contentHeight": i64::try_from(order.len()).unwrap_or(i64::MAX).saturating_mul(18),
+        }],
+        "strings": strings.values,
+    }))
+}
+
+fn ax_role(node: &Value) -> &'static str {
+    let kind = core_node_type(node);
+    if kind == 9 {
+        return "RootWebArea";
+    }
+    if kind == 3 {
+        return "StaticText";
+    }
+    if kind != 1 {
+        return "";
+    }
+    if let Some(role) = core_attribute(node, "role") {
+        return match role.as_str() {
+            "button" | "link" | "heading" | "textbox" | "searchbox" | "checkbox" | "radio"
+            | "listbox" | "combobox" | "list" | "listitem" | "navigation" | "banner"
+            | "main" | "complementary" | "contentinfo" | "form" | "table" | "row"
+            | "cell" | "gridcell" | "img" | "dialog" | "alert" | "tab" | "tablist"
+            | "tabpanel" | "menu" | "menuitem" | "toolbar" | "separator" | "presentation" | "none" => {
+                match role.as_str() {
+                    "none" | "presentation" => "presentation",
+                    "img" => "image",
+                    "gridcell" => "cell",
+                    "button" => "button",
+                    "link" => "link",
+                    "heading" => "heading",
+                    "textbox" => "textbox",
+                    "searchbox" => "searchbox",
+                    "checkbox" => "checkbox",
+                    "radio" => "radio",
+                    "listbox" => "listbox",
+                    "combobox" => "combobox",
+                    "list" => "list",
+                    "listitem" => "listitem",
+                    "navigation" => "navigation",
+                    "banner" => "banner",
+                    "main" => "main",
+                    "complementary" => "complementary",
+                    "contentinfo" => "contentinfo",
+                    "form" => "form",
+                    "table" => "table",
+                    "row" => "row",
+                    "cell" => "cell",
+                    "dialog" => "dialog",
+                    "alert" => "alert",
+                    "tab" => "tab",
+                    "tablist" => "tablist",
+                    "tabpanel" => "tabpanel",
+                    "menu" => "menu",
+                    "menuitem" => "menuitem",
+                    "toolbar" => "toolbar",
+                    "separator" => "separator",
+                    _ => "generic",
+                }
+            }
+            _ => "generic",
+        };
+    }
+    let tag = core_node_name(node).to_ascii_lowercase();
+    match tag.as_str() {
+        "a" if core_attribute(node, "href").is_some() => "link",
+        "button" | "summary" => "button",
+        "input" => match core_attribute(node, "type").as_deref().unwrap_or("text") {
+            "submit" | "reset" | "button" | "image" => "button",
+            "checkbox" => "checkbox",
+            "radio" => "radio",
+            "range" => "slider",
+            "number" => "spinbutton",
+            "search" => "searchbox",
+            _ => "textbox",
+        },
+        "textarea" => "textbox",
+        "select" => "combobox",
+        "h1" | "h2" | "h3" | "h4" | "h5" | "h6" => "heading",
+        "img" | "svg" => "image",
+        "ul" | "ol" | "menu" => "list",
+        "li" => "listitem",
+        "table" => "table",
+        "tr" => "row",
+        "td" | "th" => "cell",
+        "nav" => "navigation",
+        "header" => "banner",
+        "main" => "main",
+        "footer" => "contentinfo",
+        "form" => "form",
+        "dialog" => "dialog",
+        "hr" => "separator",
+        "label" => "LabelText",
+        "article" => "article",
+        "aside" => "complementary",
+        "section" => "region",
+        "figure" => "figure",
+        "figcaption" => "StaticText",
+        _ => "generic",
+    }
+}
+
+fn ax_name(node: &Value) -> Option<String> {
+    for attr in ["aria-label", "alt", "title", "placeholder"] {
+        if let Some(value) = core_attribute(node, attr) {
+            if !value.is_empty() {
+                return Some(value);
+            }
+        }
+    }
+    let value = core_node_value(node).trim();
+    (!value.is_empty()).then_some(value.to_string())
+}
+
+fn ax_properties(node: &Value) -> Vec<Value> {
+    let tag = core_node_name(node).to_ascii_lowercase();
+    let attrs = core_node_attributes(node);
+    let has = |name: &str| attrs.iter().any(|(candidate, _)| candidate.eq_ignore_ascii_case(name));
+    let mut properties = Vec::new();
+    if matches!(tag.as_str(), "a" | "button" | "input" | "select" | "textarea" | "details" | "summary") || has("tabindex") || has("contenteditable") {
+        properties.push(json!({"name": "focusable", "value": {"type": "boolean", "value": true}}));
+    }
+    if matches!(tag.as_str(), "input" | "textarea") || attrs.iter().any(|(name, value)| name.eq_ignore_ascii_case("contenteditable") && value != "false") {
+        properties.push(json!({"name": "editable", "value": {"type": "boolean", "value": true}}));
+    }
+    if has("checked") {
+        properties.push(json!({"name": "checked", "value": {"type": "boolean", "value": true}}));
+    }
+    if has("disabled") {
+        properties.push(json!({"name": "disabled", "value": {"type": "boolean", "value": true}}));
+    }
+    if let Some(level) = tag.strip_prefix('h').and_then(|value| value.parse::<u32>().ok()).filter(|level| (1..=6).contains(level)) {
+        properties.push(json!({"name": "level", "value": {"type": "integer", "value": level}}));
+    }
+    if has("required") || has("aria-required") {
+        properties.push(json!({"name": "required", "value": {"type": "boolean", "value": true}}));
+    }
+    if tag == "textarea" {
+        properties.push(json!({"name": "multiline", "value": {"type": "boolean", "value": true}}));
+    }
+    properties
+}
+
+fn build_core_accessibility_tree(core: &mut ObscuraCore) -> Result<Vec<Value>, String> {
+    let document = core.document_handle();
+    let mut order = Vec::new();
+    let mut children_by_parent: BTreeMap<u32, Vec<u32>> = BTreeMap::new();
+    let mut stack = vec![document];
+    while let Some(node_id) = stack.pop() {
+        if order.len() >= MAX_PORTABLE_TREE_NODES {
+            break;
+        }
+        order.push(node_id);
+        let children = core_child_ids(core, node_id)?;
+        children_by_parent.insert(node_id, children.clone());
+        stack.extend(children.into_iter().rev());
+    }
+
+    let mut descriptions = BTreeMap::new();
+    for node_id in &order {
+        descriptions.insert(*node_id, core_node_description(core, *node_id)?);
+    }
+    let mut ax_ids = BTreeMap::new();
+    for node_id in &order {
+        if !ax_role(descriptions.get(node_id).expect("description was collected")).is_empty() {
+            let ax_id = ax_ids.len() + 1;
+            ax_ids.insert(*node_id, ax_id.to_string());
+        }
+    }
+
+    let mut nodes = Vec::new();
+    for node_id in order {
+        let description = descriptions.get(&node_id).expect("description was collected");
+        let role = ax_role(description);
+        let Some(ax_id) = ax_ids.get(&node_id) else { continue; };
+        let mut node = json!({
+            "nodeId": ax_id,
+            "ignored": false,
+            "role": {"type": "role", "value": role},
+            "backendDOMNodeId": node_id,
+        });
+        let parent = children_by_parent
+            .iter()
+            .find_map(|(parent, children)| children.contains(&node_id).then_some(*parent))
+            .and_then(|parent| ax_ids.get(&parent).cloned());
+        if let Some(parent) = parent {
+            node["parentId"] = json!(parent);
+        }
+        if let Some(name) = ax_name(description) {
+            node["name"] = json!({"type": "string", "value": name});
+        }
+        let tag = core_node_name(description).to_ascii_lowercase();
+        if matches!(tag.as_str(), "input" | "textarea" | "select") {
+            if let Some(value) = core_attribute(description, "value") {
+                node["value"] = json!({"type": "string", "value": value});
+            }
+        }
+        let properties = ax_properties(description);
+        if !properties.is_empty() {
+            node["properties"] = Value::Array(properties);
+        }
+        let child_ids: Vec<String> = children_by_parent
+            .get(&node_id)
+            .into_iter()
+            .flat_map(|children| children.iter())
+            .filter_map(|child| ax_ids.get(child).cloned())
+            .collect();
+        if !child_ids.is_empty() {
+            node["childIds"] = json!(child_ids);
+        }
+        nodes.push(node);
+    }
+    Ok(nodes)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2833,6 +3241,36 @@ mod tests {
         let events = json(&cdp.poll_cdp_events(connection, 8).unwrap());
         assert_eq!(events[0]["method"], "DOM.setChildNodes");
         assert_eq!(events[0]["params"]["parentId"], node_id);
+    }
+
+    #[test]
+    fn portable_snapshot_and_accessibility_commands_use_the_wasm_dom_backend() {
+        let mut cdp = PortableCdp::new(
+            "<!doctype html><html><body><button id=go>Go</button><input aria-label=Name value=V></body></html>",
+        )
+        .unwrap();
+        let connection = cdp.open_connection().unwrap();
+        let attached = json(&cdp.cdp_request(
+            connection,
+            r#"{"id":1,"method":"Target.attachToTarget","params":{"targetId":"page-1"}}"#,
+        ).unwrap());
+        let session = attached["result"]["sessionId"].as_str().unwrap();
+        cdp.poll_cdp_events(connection, 8).unwrap();
+
+        let snapshot = json(&cdp.cdp_request(
+            connection,
+            &format!(r#"{{"id":2,"sessionId":"{session}","method":"DOMSnapshot.captureSnapshot","params":{{"computedStyles":[]}}}}"#),
+        ).unwrap());
+        assert!(snapshot["result"]["documents"][0]["nodes"]["backendNodeId"].as_array().unwrap().len() >= 4);
+        assert_eq!(snapshot["result"]["documents"][0]["layout"]["styles"][0].as_array().unwrap().len(), 10);
+
+        let accessibility = json(&cdp.cdp_request(
+            connection,
+            &format!(r#"{{"id":3,"sessionId":"{session}","method":"Accessibility.getFullAXTree"}}"#),
+        ).unwrap());
+        let nodes = accessibility["result"]["nodes"].as_array().unwrap();
+        assert!(nodes.iter().any(|node| node["role"]["value"] == "button"));
+        assert!(nodes.iter().any(|node| node["name"]["value"] == "Name"));
     }
 
     #[test]

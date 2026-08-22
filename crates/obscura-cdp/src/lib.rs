@@ -1,6 +1,8 @@
 pub mod action;
 pub mod portable_action;
 pub mod portable_dom;
+pub mod portable_domsnapshot;
+pub mod portable_accessibility;
 pub mod portable_runtime;
 pub mod portable_io;
 pub mod portable_render;

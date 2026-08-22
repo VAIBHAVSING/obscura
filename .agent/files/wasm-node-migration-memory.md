@@ -1183,3 +1183,28 @@ numeric-to-wire identity maps. Remaining C3 work is DOMSnapshot/Accessibility,
 shared session identity cutover, navigation lifecycle completion, legacy target
 state removal, ABI/package finalization, and real Playwright/Puppeteer/
 concurrency gates.
+
+## Shared DOMSnapshot and Accessibility checkpoint (2026-08-22)
+
+The portable CDP dispatcher now owns `DOMSnapshot.enable/disable`,
+`DOMSnapshot.captureSnapshot`, `Accessibility.enable/disable`, and
+`Accessibility.getFullAXTree` routing. `DomBackend` exposes backend-only hooks
+for the payloads, and the WASM `CoreDomBackend` builds both responses from the
+live DOM handles. Snapshot backend IDs match the WASM DOM node IDs, bounded
+tree walks retain deterministic parent/index ordering, synthetic layout fields
+retain the existing browser-use-compatible shape, and AX roles/names,
+properties, parent IDs, and child IDs are emitted from the same tree.
+
+Verification for this checkpoint:
+
+- Portable `obscura-cdp`: **44/44 passed** with
+  `--no-default-features --features portable`.
+- `obscura-wasm`: **71/71 passed** without render and **77/77 passed** with
+  render, including a live snapshot/AX command test.
+- wasm32 render check passed.
+- native-server CDP check passed.
+- `git diff --check` passed.
+
+Remaining C3 work is shared session identity cutover, navigation lifecycle
+completion, legacy target-state removal, ABI/package finalization, and real
+Playwright/Puppeteer/concurrency gates.

@@ -21,6 +21,19 @@ pub trait DomBackend {
     fn attributes(&mut self, node_id: u32) -> Result<Vec<(String, String)>, String>;
     fn describe_node(&mut self, node_id: u32, depth: usize) -> Result<Value, String>;
     fn describe_children(&mut self, node_id: u32, depth: usize) -> Result<Vec<Value>, String>;
+
+    /// Build the layout-free DOMSnapshot payload for this page. The tree
+    /// backend owns node inspection; the portable CDP layer owns command
+    /// routing and response semantics.
+    fn capture_snapshot(&mut self, _url: &str, _title: &str, _params: &Value) -> Result<Value, String> {
+        Err("DOMSnapshot is not available for this backend".to_string())
+    }
+
+    /// Build the full Accessibility AXNode array for this page. As with the
+    /// snapshot, only the tree backend knows how to inspect host DOM nodes.
+    fn full_accessibility_tree(&mut self, _params: &Value) -> Result<Vec<Value>, String> {
+        Err("Accessibility is not available for this backend".to_string())
+    }
 }
 
 /// A DOM response plus events which must be delivered before the response's
