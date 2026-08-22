@@ -1208,3 +1208,25 @@ Verification for this checkpoint:
 Remaining C3 work is shared session identity cutover, navigation lifecycle
 completion, legacy target-state removal, ABI/package finalization, and real
 Playwright/Puppeteer/concurrency gates.
+
+## Shared identity-map removal checkpoint (2026-08-22)
+
+The WASM adapter no longer keeps duplicate `shared_connections`,
+`shared_sessions`, `shared_contexts`, or `shared_pages` maps. Wire IDs are
+validated and converted directly to the monotonic `BrowserState` identities:
+`page-N` to `PageId(N)`, `context-N`/`default` to `ContextId(N)` and the
+numeric suffix of `{target}-session-N` to `SessionId(N)`. Connection and stream
+ownership uses the same numeric `ConnectionId` on both sides. The adapter still
+keeps its wire-facing target/session metadata and host action records, but no
+second identity source of truth remains.
+
+Verification for this checkpoint:
+
+- `obscura-wasm`: **71/71 passed** without render and **78/78 passed** with
+  render, including a multi-context/page CdpEngine identity round-trip test.
+- wasm32 render check passed.
+- `git diff --check` passed.
+
+Remaining C3 work is navigation lifecycle/action completion, reduction of the
+legacy target/session metadata, raw-byte ABI/package finalization, and real
+Playwright/Puppeteer/concurrency gates.
