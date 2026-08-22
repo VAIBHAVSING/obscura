@@ -97,6 +97,24 @@ const IMPORT_COOKIES_NAMES = ["importCookies", "import_cookies"];
 const DELETE_COOKIES_NAMES = ["deleteCookies", "delete_cookies"];
 const CDP_CONSTRUCTOR_NAMES = ["PortableCdp"];
 const CDP_ABI_VERSION_NAME = "cdpAbiVersion";
+const RAW_CDP_ABI_VERSION_NAME = "cdpRawAbiVersion";
+const RAW_CDP_BROWSER_CREATE_NAMES = ["browserCreate"];
+const RAW_CDP_BROWSER_CLOSE_NAMES = ["browserClose"];
+const RAW_CDP_CONNECTION_OPEN_NAMES = ["connectionOpen"];
+const RAW_CDP_CONNECTION_CLOSE_NAMES = ["connectionClose"];
+const RAW_CDP_CONTEXT_EXPORT_NAMES = ["contextExport"];
+const RAW_CDP_CONTEXT_IMPORT_NAMES = ["contextImport"];
+const RAW_CDP_INGEST_NAMES = ["cdpIngest"];
+const RAW_CDP_DRAIN_EVENTS_NAMES = ["cdpDrainEvents"];
+const RAW_CDP_DRAIN_ACTIONS_NAMES = ["cdpDrainActions"];
+const RAW_CDP_COMPLETE_ACTIONS_NAMES = ["cdpCompleteActions"];
+const RAW_CDP_OPEN_STREAM_NAMES = ["cdpOpenStream"];
+const RAW_CDP_RECORD_NETWORK_NAMES = ["cdpRecordNetwork"];
+const RAW_CDP_INTERCEPT_FETCH_NAMES = ["cdpInterceptFetch"];
+const RAW_CDP_DRAIN_FETCH_RESOLUTIONS_NAMES = ["cdpDrainFetchResolutions"];
+const RAW_CDP_CACHE_DISABLED_NAMES = ["cdpCacheDisabled"];
+const RAW_CDP_CLEAR_RESPONSE_CACHE_NAMES = ["cdpClearResponseCache"];
+const RAW_CDP_CANCEL_FETCH_NAMES = ["cdpCancelFetch"];
 const REQUIRED_CORE_ABI_VERSION = 1;
 const REQUIRED_DOM_OP_ABI_VERSION = 1;
 const REQUIRED_DOM_BATCH_ABI_VERSION = 1;
@@ -428,6 +446,8 @@ let portablePlatformOp;
 let bridgeTaskHost;
 let bridgeTaskLastStatus = null;
 let portableCdpCore = null;
+let portableCdpRawBrowserId = null;
+let portableCdpRawApiCache;
 let bootstrapRuntime;
 let nextBootstrapFetchId = 1;
 const bootstrapFetches = new Map();
@@ -488,6 +508,64 @@ function decodeJsonText(value) {
   } catch {
     return value;
   }
+}
+
+const RAW_CDP_FRAME_HEADER_BYTES = 4;
+const RAW_CDP_MAX_FRAMES = 512;
+const RAW_CDP_MAX_BYTES = 8 * 1024 * 1024;
+const RAW_CDP_MAX_MESSAGE_BYTES = 8 * 1024 * 1024;
+
+function rawCdpBytes(value, label = "raw CDP bytes") {
+  if (value instanceof Uint8Array) return value;
+  if (value instanceof ArrayBuffer) return new Uint8Array(value);
+  if (ArrayBuffer.isView(value)) return new Uint8Array(value.buffer, value.byteOffset, value.byteLength);
+  throw portableCdpError(`${label} must be a Uint8Array`);
+}
+
+function rawCdpFrameBytes(value, label = "raw CDP frame batch") {
+  const bytes = rawCdpBytes(value, label);
+  if (bytes.byteLength > RAW_CDP_MAX_BYTES) throw new RangeError(`${label} exceeds ${RAW_CDP_MAX_BYTES} bytes`);
+  const frames = [];
+  let offset = 0;
+  while (offset < bytes.byteLength) {
+    if (frames.length >= RAW_CDP_MAX_FRAMES || bytes.byteLength - offset < RAW_CDP_FRAME_HEADER_BYTES) {
+      throw new SyntaxError(`${label} has a truncated frame envelope`);
+    }
+    const length = new DataView(bytes.buffer, bytes.byteOffset + offset, RAW_CDP_FRAME_HEADER_BYTES).getUint32(0, true);
+    offset += RAW_CDP_FRAME_HEADER_BYTES;
+    if (length > RAW_CDP_MAX_MESSAGE_BYTES || offset + length > bytes.byteLength) {
+      throw new SyntaxError(`${label} has an invalid frame length`);
+    }
+    frames.push(bytes.subarray(offset, offset + length));
+    offset += length;
+  }
+  return frames;
+}
+
+function rawCdpJsonFrame(value, label = "raw CDP JSON") {
+  const text = typeof value === "string" ? value : JSON.stringify(value);
+  const bytes = new TextEncoder().encode(text);
+  if (bytes.byteLength > RAW_CDP_MAX_MESSAGE_BYTES) throw new RangeError(`${label} exceeds ${RAW_CDP_MAX_MESSAGE_BYTES} bytes`);
+  const frame = new Uint8Array(RAW_CDP_FRAME_HEADER_BYTES + bytes.byteLength);
+  new DataView(frame.buffer).setUint32(0, bytes.byteLength, true);
+  frame.set(bytes, RAW_CDP_FRAME_HEADER_BYTES);
+  return frame;
+}
+
+function rawCdpDecodeJsonFrame(value, label = "raw CDP response") {
+  const frames = rawCdpFrameBytes(value, label);
+  if (frames.length !== 1) throw new SyntaxError(`${label} must contain exactly one frame`);
+  return JSON.parse(new TextDecoder().decode(frames[0]));
+}
+
+function rawCdpDecodeJsonFrames(value, label = "raw CDP frame batch") {
+  return rawCdpFrameBytes(value, label).map((frame) => JSON.parse(new TextDecoder().decode(frame)));
+}
+
+function rawCdpJsonBytes(value, label = "raw CDP JSON") {
+  const bytes = new TextEncoder().encode(typeof value === "string" ? value : JSON.stringify(value));
+  if (bytes.byteLength > RAW_CDP_MAX_MESSAGE_BYTES) throw new RangeError(`${label} exceeds ${RAW_CDP_MAX_MESSAGE_BYTES} bytes`);
+  return bytes;
 }
 
 function moduleResult(value) {
@@ -1252,6 +1330,100 @@ function portableCdpError(message) {
   return error;
 }
 
+function portableCdpRawApi() {
+  if (!target || typeof target !== "object") return null;
+  if (portableCdpRawApiCache !== undefined) return portableCdpRawApiCache;
+  const required = [
+    RAW_CDP_BROWSER_CREATE_NAMES,
+    RAW_CDP_BROWSER_CLOSE_NAMES,
+    RAW_CDP_CONNECTION_OPEN_NAMES,
+    RAW_CDP_CONNECTION_CLOSE_NAMES,
+    RAW_CDP_INGEST_NAMES,
+    RAW_CDP_DRAIN_EVENTS_NAMES,
+    RAW_CDP_DRAIN_ACTIONS_NAMES,
+    RAW_CDP_COMPLETE_ACTIONS_NAMES,
+    RAW_CDP_OPEN_STREAM_NAMES,
+    RAW_CDP_RECORD_NETWORK_NAMES,
+    RAW_CDP_INTERCEPT_FETCH_NAMES,
+    RAW_CDP_DRAIN_FETCH_RESOLUTIONS_NAMES,
+    RAW_CDP_CACHE_DISABLED_NAMES,
+    RAW_CDP_CLEAR_RESPONSE_CACHE_NAMES,
+    RAW_CDP_CANCEL_FETCH_NAMES,
+  ];
+  if (!member(target, [RAW_CDP_ABI_VERSION_NAME]) || required.some((names) => !member(target, names))) {
+    portableCdpRawApiCache = null;
+    return portableCdpRawApiCache;
+  }
+  portableCdpRawApiCache = {
+    version: member(target, [RAW_CDP_ABI_VERSION_NAME]),
+    browserCreate: member(target, RAW_CDP_BROWSER_CREATE_NAMES),
+    browserClose: member(target, RAW_CDP_BROWSER_CLOSE_NAMES),
+    connectionOpen: member(target, RAW_CDP_CONNECTION_OPEN_NAMES),
+    connectionClose: member(target, RAW_CDP_CONNECTION_CLOSE_NAMES),
+    contextExport: member(target, RAW_CDP_CONTEXT_EXPORT_NAMES),
+    contextImport: member(target, RAW_CDP_CONTEXT_IMPORT_NAMES),
+    ingest: member(target, RAW_CDP_INGEST_NAMES),
+    drainEvents: member(target, RAW_CDP_DRAIN_EVENTS_NAMES),
+    drainActions: member(target, RAW_CDP_DRAIN_ACTIONS_NAMES),
+    completeActions: member(target, RAW_CDP_COMPLETE_ACTIONS_NAMES),
+    openStream: member(target, RAW_CDP_OPEN_STREAM_NAMES),
+    recordNetwork: member(target, RAW_CDP_RECORD_NETWORK_NAMES),
+    interceptFetch: member(target, RAW_CDP_INTERCEPT_FETCH_NAMES),
+    drainFetchResolutions: member(target, RAW_CDP_DRAIN_FETCH_RESOLUTIONS_NAMES),
+    cacheDisabled: member(target, RAW_CDP_CACHE_DISABLED_NAMES),
+    clearResponseCache: member(target, RAW_CDP_CLEAR_RESPONSE_CACHE_NAMES),
+    cancelFetch: member(target, RAW_CDP_CANCEL_FETCH_NAMES),
+  };
+  return portableCdpRawApiCache;
+}
+
+function portableCdpRawAbiVersion() {
+  const api = portableCdpRawApi();
+  if (!api) return null;
+  try { return Number(api.version.fn()); } catch { return null; }
+}
+
+function portableCdpRawEnsureBrowser(html = "") {
+  const api = portableCdpRawApi();
+  if (!api) throw portableCdpError("WASM module does not expose the raw CDP ABI");
+  if (portableCdpRawBrowserId !== null) return { api, browserId: portableCdpRawBrowserId };
+  const config = rawCdpJsonBytes({ html: requireBoundedString(html, MAX_HTML_INPUT_BYTES, "CDP HTML input") });
+  try {
+    portableCdpRawBrowserId = requireUnsignedU32(api.browserCreate.fn(config), "raw browser ID");
+  } catch (error) {
+    throw portableCdpError(`raw CDP browser construction failed: ${error?.message ?? String(error)}`);
+  }
+  return { api, browserId: portableCdpRawBrowserId };
+}
+
+function portableCdpRawCloseBrowser() {
+  const api = portableCdpRawApi();
+  const browserId = portableCdpRawBrowserId;
+  portableCdpRawBrowserId = null;
+  if (!api || browserId === null) return;
+  try { api.browserClose.fn(browserId); } catch {}
+}
+
+function portableCdpRawRequest(connectionId, message, html = "") {
+  const { api, browserId } = portableCdpRawEnsureBrowser(html);
+  const request = rawCdpJsonBytes(message, "CDP message");
+  const response = rawCdpDecodeJsonFrame(api.ingest.fn(browserId, connectionId, request));
+  const actions = rawCdpDecodeJsonFrames(api.drainActions.fn(browserId, RAW_CDP_MAX_FRAMES, RAW_CDP_MAX_BYTES));
+  drainPortableFetchResolutions();
+  return { response, actions };
+}
+
+function portableCdpRawRecordNetwork(metadata) {
+  const api = portableCdpRawApi();
+  if (!api?.recordNetwork || portableCdpRawBrowserId === null) return false;
+  api.recordNetwork.fn(
+    portableCdpRawBrowserId,
+    "page-1",
+    rawCdpJsonBytes(metadata, "CDP network metadata"),
+  );
+  return true;
+}
+
 function portableCdpInstance(html = "") {
   if (portableCdpCore) return portableCdpCore;
   const constructor = member(target, CDP_CONSTRUCTOR_NAMES);
@@ -1265,6 +1437,31 @@ function portableCdpInstance(html = "") {
 }
 
 function drainPortableFetchResolutions() {
+  const rawApi = portableCdpRawApi();
+  if (rawApi?.drainFetchResolutions && portableCdpRawBrowserId !== null) {
+    try {
+      const resolutions = JSON.parse(new TextDecoder().decode(
+        rawApi.drainFetchResolutions.fn(portableCdpRawBrowserId),
+      ));
+      if (Array.isArray(resolutions)) {
+        let applied = 0;
+        for (const resolution of resolutions) {
+          if (!resolution || typeof resolution !== "object" || typeof resolution.requestId !== "string") continue;
+          const record = [...bootstrapFetches.values()].find((candidate) => candidate.requestId === resolution.requestId)
+            ?? portableFetchWaiters.get(resolution.requestId);
+          if (!record || typeof record.interceptionResolve !== "function") continue;
+          const resolve = record.interceptionResolve;
+          record.interceptionResolve = null;
+          record.interceptionReject = null;
+          if (portableFetchWaiters.get(resolution.requestId) === record) portableFetchWaiters.delete(resolution.requestId);
+          resolve(resolution);
+          applied += 1;
+        }
+        return applied;
+      }
+    } catch {}
+    return 0;
+  }
   const drainer = member(portableCdpCore, ["drainFetchResolutions", "drain_fetch_resolutions"]);
   if (!drainer) return 0;
   let resolutions;
@@ -1291,6 +1488,20 @@ function drainPortableFetchResolutions() {
 }
 
 function portableCdpInterceptFetch(metadata) {
+  const rawApi = portableCdpRawApi();
+  if (rawApi?.interceptFetch && portableCdpRawBrowserId !== null) {
+    try {
+      const result = JSON.parse(new TextDecoder().decode(rawApi.interceptFetch.fn(
+        portableCdpRawBrowserId,
+        "page-1",
+        rawCdpJsonBytes(metadata, "Fetch request metadata"),
+      )));
+      return result && typeof result === "object" ? result : { paused: false };
+    } catch (error) {
+      if (error?.code === "ERR_OBSCURA_CDP_ABI") throw error;
+      return { paused: false };
+    }
+  }
   const interceptor = member(portableCdpCore, ["interceptFetchRequest", "intercept_fetch_request"]);
   if (!interceptor) return { paused: false };
   try {
@@ -1304,6 +1515,10 @@ function portableCdpInterceptFetch(metadata) {
 }
 
 function portableCdpCacheDisabled() {
+  const rawApi = portableCdpRawApi();
+  if (rawApi?.cacheDisabled && portableCdpRawBrowserId !== null) {
+    try { return Boolean(rawApi.cacheDisabled.fn(portableCdpRawBrowserId, "page-1")); } catch { return null; }
+  }
   const getter = member(portableCdpCore, ["cacheDisabled", "cache_disabled"]);
   if (!getter) return null;
   try { return Boolean(getter.fn("page-1")); } catch { return null; }
@@ -1312,6 +1527,11 @@ function portableCdpCacheDisabled() {
 function portableCdpClearHttpCache() {
   portableHttpCache.clear();
   portableHttpCacheBytes = 0;
+  const rawApi = portableCdpRawApi();
+  if (rawApi?.clearResponseCache && portableCdpRawBrowserId !== null) {
+    try { rawApi.clearResponseCache.fn(portableCdpRawBrowserId, "page-1"); } catch {}
+    return;
+  }
   const clearer = member(portableCdpCore, ["clearResponseCache", "clear_response_cache"]);
   if (clearer) {
     try { clearer.fn("page-1"); } catch {}
@@ -1394,6 +1614,7 @@ function portableCdpOperation(payload = {}) {
   }
   if (operation === "reset") {
     portableCdpCore = null;
+    portableCdpRawCloseBrowser();
     return { reset: true };
   }
   const core = portableCdpInstance(payload.html ?? "");
@@ -1447,6 +1668,88 @@ function portableCdpOperation(payload = {}) {
   }
   if (operation === "status") return decodeJsonText(core.cdpStatus());
   throw new TypeError(`Unknown portable CDP operation ${JSON.stringify(operation)}`);
+}
+
+function portableCdpRawOperation(payload = {}) {
+  const operation = payload.operation;
+  const api = portableCdpRawApi();
+  if (operation === "abi") return portableCdpRawAbiVersion();
+  if (!api) throw portableCdpError("WASM module does not expose the raw CDP ABI");
+  if (operation === "open") {
+    const { browserId } = portableCdpRawEnsureBrowser(payload.html ?? "");
+    return requireUnsignedU32(api.connectionOpen.fn(browserId), "CDP connection ID");
+  }
+  if (operation === "close") {
+    if (portableCdpRawBrowserId === null) return {};
+    api.connectionClose.fn(
+      portableCdpRawBrowserId,
+      requireUnsignedU32(payload.connectionId, "CDP connection ID"),
+    );
+    return {};
+  }
+  if (operation === "request") {
+    const connectionId = requireUnsignedU32(payload.connectionId, "CDP connection ID");
+    requireBoundedString(payload.message, MAX_PLATFORM_REQUEST_BYTES, "CDP message");
+    const routed = portableCdpRawRequest(connectionId, payload.message, payload.html ?? "");
+    try {
+      const request = JSON.parse(payload.message);
+      if (request?.method === "Network.clearBrowserCache" ||
+          (request?.method === "Network.setCacheDisabled" && request?.params?.cacheDisabled === true)) {
+        portableCdpClearHttpCache();
+      }
+    } catch {}
+    return routed;
+  }
+  if (operation === "poll") {
+    if (portableCdpRawBrowserId === null) return [];
+    const connectionId = requireUnsignedU32(payload.connectionId, "CDP connection ID");
+    const maxItems = payload.maxItems ?? 64;
+    if (!Number.isSafeInteger(maxItems) || maxItems < 0 || maxItems > RAW_CDP_MAX_FRAMES) {
+      throw new RangeError(`CDP event count must be between 0 and ${RAW_CDP_MAX_FRAMES}`);
+    }
+    return rawCdpDecodeJsonFrames(api.drainEvents.fn(
+      portableCdpRawBrowserId,
+      connectionId,
+      maxItems,
+      RAW_CDP_MAX_BYTES,
+    ));
+  }
+  if (operation === "complete") {
+    if (portableCdpRawBrowserId === null) throw portableCdpError("raw CDP browser is not open");
+    const actionId = requireUnsignedU32(payload.actionId, "CDP action ID");
+    if (!Number.isSafeInteger(payload.generation) || payload.generation < 0) {
+      throw new TypeError("CDP action generation must be a non-negative safe integer");
+    }
+    requireBoundedString(payload.result, MAX_PLATFORM_RESPONSE_BYTES, "CDP action result");
+    const completion = rawCdpJsonFrame({
+      actionId,
+      generation: payload.generation,
+      result: JSON.parse(payload.result),
+    });
+    const responses = rawCdpDecodeJsonFrames(api.completeActions.fn(
+      portableCdpRawBrowserId,
+      completion,
+      RAW_CDP_MAX_BYTES,
+    ));
+    return responses[0] ?? null;
+  }
+  if (operation === "openStream") {
+    if (portableCdpRawBrowserId === null || !api.openStream) return null;
+    const connectionId = requireUnsignedU32(payload.connectionId, "CDP connection ID");
+    requireBoundedString(payload.data, MAX_PLATFORM_RESPONSE_BYTES, "CDP stream data");
+    return api.openStream.fn(portableCdpRawBrowserId, connectionId, payload.data);
+  }
+  if (operation === "recordNetwork") {
+    if (portableCdpRawBrowserId === null || !api.recordNetwork) return { recorded: false, available: false, count: 0 };
+    if (bootstrapNetworkEvents.length === 0) return { recorded: true, available: true, count: 0 };
+    const count = bootstrapNetworkEvents.length;
+    portableCdpRawRecordNetwork(bootstrapNetworkEvents);
+    bootstrapNetworkEvents.length = 0;
+    bootstrapNetworkEventBytes = 0;
+    return { recorded: true, available: true, count };
+  }
+  if (operation === "status") return { cdpRawAbiVersion: portableCdpRawAbiVersion(), browser: portableCdpRawBrowserId };
+  throw new TypeError(`Unknown raw portable CDP operation ${JSON.stringify(operation)}`);
 }
 
 async function requireStatefulBridgeCompatibility(api) {
@@ -1905,6 +2208,7 @@ function resetBridgeRealmAfterNavigation() {
 
 function cancelBootstrapFetches(cdpCore = portableCdpCore) {
   const cancel = member(cdpCore, ["cancelFetchRequest", "cancel_fetch_request"]);
+  const rawApi = portableCdpRawApi();
   const records = [...bootstrapFetches.values(), ...portableFetchWaiters.values()];
   const seen = new Set();
   for (const { controller, requestId, interceptionResolve } of records) {
@@ -1916,6 +2220,9 @@ function cancelBootstrapFetches(cdpCore = portableCdpCore) {
     }
     if (cancel && typeof requestId === "string") {
       try { cancel.fn("page-1", requestId); } catch {}
+    }
+    if (rawApi?.cancelFetch && portableCdpRawBrowserId !== null && typeof requestId === "string") {
+      try { rawApi.cancelFetch.fn(portableCdpRawBrowserId, "page-1", requestId); } catch {}
     }
   }
   bootstrapFetches.clear();
@@ -4296,6 +4603,11 @@ async function shutdown() {
   } catch (error) {
     errors.push(error);
   }
+  try {
+    portableCdpRawCloseBrowser();
+  } catch (error) {
+    errors.push(error);
+  }
   hostContext = null;
   bridgeRealmKind = null;
   if (errors.length > 0) throw new AggregateError(errors, "Harness shutdown cleanup failed");
@@ -4363,6 +4675,8 @@ async function dispatch(operation, payload) {
       return await bootstrapEvaluate(payload);
     case "portableCdp":
       return portableCdpOperation(payload);
+    case "portableCdpRaw":
+      return portableCdpRawOperation(payload);
     case "bridgeStatus":
       return await bridgeStatus();
     case "allCookies":
@@ -4467,7 +4781,7 @@ try {
     // await would deadlock the request. The operation itself is synchronous
     // with respect to the WASM core, while page/DOM/realm operations remain
     // ordered through the main queue.
-    const reentrantPortableOperation = message?.operation === "portableCdp" &&
+    const reentrantPortableOperation = ["portableCdp", "portableCdpRaw"].includes(message?.operation) &&
       ["request", "poll", "recordNetwork"].includes(message?.payload?.operation);
     if (reentrantPortableOperation) {
       void handleMessage(message);

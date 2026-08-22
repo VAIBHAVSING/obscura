@@ -2230,6 +2230,53 @@ pub fn context_import(browser_id: u32, snapshot: &[u8]) -> Result<u32, JsValue> 
     with_raw_browser(browser_id, |browser| browser.import_context(snapshot))
 }
 
+/// Host-side stream ingress for IO.read/IO.close. The raw CDP request path
+/// remains JSON-free for transport callers; this typed helper is used only
+/// when a Node host has already fetched a response body or PDF payload.
+#[wasm_bindgen(js_name = cdpOpenStream)]
+pub fn cdp_open_stream(browser_id: u32, connection_id: u32, data_base64: &str) -> Result<String, JsValue> {
+    with_raw_browser(browser_id, |browser| browser.open_stream(connection_id, data_base64))
+}
+
+/// Ingest host-owned network metadata without recreating a CDP dispatcher in
+/// JavaScript. The metadata is JSON bytes so the host can forward its bounded
+/// record without an intermediate object graph at the ABI boundary.
+#[wasm_bindgen(js_name = cdpRecordNetwork)]
+pub fn cdp_record_network(browser_id: u32, target_id: &str, metadata: &[u8]) -> Result<(), JsValue> {
+    let metadata = std::str::from_utf8(metadata)
+        .map_err(|_| js_syntax_error_value("CDP network metadata must be valid UTF-8 JSON"))?;
+    with_raw_browser(browser_id, |browser| browser.record_network_metadata_json(target_id, metadata))
+}
+
+#[wasm_bindgen(js_name = cdpInterceptFetch)]
+pub fn cdp_intercept_fetch(browser_id: u32, target_id: &str, metadata: &[u8]) -> Result<Vec<u8>, JsValue> {
+    let metadata = std::str::from_utf8(metadata)
+        .map_err(|_| js_syntax_error_value("Fetch metadata must be valid UTF-8 JSON"))?;
+    let result = with_raw_browser(browser_id, |browser| browser.intercept_fetch_request_json(target_id, metadata))?;
+    bounded_return(result, "Fetch interception result").map(String::into_bytes)
+}
+
+#[wasm_bindgen(js_name = cdpDrainFetchResolutions)]
+pub fn cdp_drain_fetch_resolutions(browser_id: u32) -> Result<Vec<u8>, JsValue> {
+    let result = with_raw_browser(browser_id, |browser| browser.drain_fetch_resolutions_json())?;
+    bounded_return(result, "Fetch resolution batch").map(String::into_bytes)
+}
+
+#[wasm_bindgen(js_name = cdpCacheDisabled)]
+pub fn cdp_cache_disabled(browser_id: u32, target_id: &str) -> Result<bool, JsValue> {
+    with_raw_browser(browser_id, |browser| browser.cache_disabled_json(target_id))
+}
+
+#[wasm_bindgen(js_name = cdpClearResponseCache)]
+pub fn cdp_clear_response_cache(browser_id: u32, target_id: &str) -> Result<(), JsValue> {
+    with_raw_browser(browser_id, |browser| browser.clear_response_cache(target_id))
+}
+
+#[wasm_bindgen(js_name = cdpCancelFetch)]
+pub fn cdp_cancel_fetch(browser_id: u32, target_id: &str, request_id: &str) -> Result<(), JsValue> {
+    with_raw_browser(browser_id, |browser| browser.cancel_fetch_request_json(target_id, request_id))
+}
+
 /// Ingest one unframed UTF-8 CDP request and return exactly one length-
 /// prefixed response frame. Batched host work is exposed through the drain
 /// functions below, keeping request and execution traffic independent.

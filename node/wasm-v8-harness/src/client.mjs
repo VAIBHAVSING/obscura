@@ -742,6 +742,60 @@ export class WasmV8Worker {
     return this.request("portableCdp", { operation: "recordNetwork" }, options.requestTimeoutMs);
   }
 
+  portableCdpRawAbiVersion(options = {}) {
+    return this.request("portableCdpRaw", { operation: "abi" }, options.requestTimeoutMs);
+  }
+
+  portableCdpRawOpen(options = {}) {
+    return this.request("portableCdpRaw", { operation: "open", html: options.html }, options.requestTimeoutMs);
+  }
+
+  portableCdpRawRequest(connectionId, message, options = {}) {
+    if (!Number.isSafeInteger(connectionId) || connectionId < 0 || connectionId > 0xffff_ffff) {
+      return Promise.reject(new TypeError("CDP connection ID must be an unsigned 32-bit integer"));
+    }
+    if (typeof message !== "string") return Promise.reject(new TypeError("CDP message must be a string"));
+    return this.request("portableCdpRaw", { operation: "request", connectionId, message }, options.requestTimeoutMs);
+  }
+
+  portableCdpRawComplete(actionId, generation, result, options = {}) {
+    if (!Number.isSafeInteger(actionId) || actionId < 0 || actionId > 0xffff_ffff) {
+      return Promise.reject(new TypeError("CDP action ID must be an unsigned 32-bit integer"));
+    }
+    if (!Number.isSafeInteger(generation) || generation < 0) {
+      return Promise.reject(new TypeError("CDP action generation must be a non-negative safe integer"));
+    }
+    if (typeof result !== "string") return Promise.reject(new TypeError("CDP action result must be a string"));
+    return this.request(
+      "portableCdpRaw",
+      { operation: "complete", actionId, generation, result },
+      options.requestTimeoutMs,
+    );
+  }
+
+  portableCdpRawPoll(connectionId, maxItems = 64, options = {}) {
+    if (!Number.isSafeInteger(connectionId) || connectionId < 0 || connectionId > 0xffff_ffff) {
+      return Promise.reject(new TypeError("CDP connection ID must be an unsigned 32-bit integer"));
+    }
+    return this.request("portableCdpRaw", { operation: "poll", connectionId, maxItems }, options.requestTimeoutMs);
+  }
+
+  portableCdpRawClose(connectionId, options = {}) {
+    return this.request("portableCdpRaw", { operation: "close", connectionId }, options.requestTimeoutMs);
+  }
+
+  portableCdpRawOpenStream(connectionId, data, options = {}) {
+    if (!Number.isSafeInteger(connectionId) || connectionId < 0 || connectionId > 0xffff_ffff) {
+      return Promise.reject(new TypeError("CDP connection ID must be an unsigned 32-bit integer"));
+    }
+    if (typeof data !== "string") return Promise.reject(new TypeError("CDP stream data must be base64 text"));
+    return this.request("portableCdpRaw", { operation: "openStream", connectionId, data }, options.requestTimeoutMs);
+  }
+
+  portableCdpRawRecordNetwork(options = {}) {
+    return this.request("portableCdpRaw", { operation: "recordNetwork" }, options.requestTimeoutMs);
+  }
+
   allCookies(options = {}) {
     return this.request("allCookies", undefined, options.requestTimeoutMs);
   }

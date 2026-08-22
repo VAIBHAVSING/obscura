@@ -1342,3 +1342,48 @@ of remaining target metadata, raw ABI hardening, a thin Node transport and
 Playwright/Puppeteer integration, and real concurrency/resource gates. The
 companion `obscura-benchmark` obstacle course is still unavailable in this
 workspace.
+
+## Raw ABI Node transport cutover checkpoint (2026-08-22)
+
+The Node Worker now prefers the bounded `cdpRawAbiVersion: 2` surface when the
+WASM module exports the complete host-helper set. It creates one raw WASM
+browser per persistent Worker, reuses that browser across CDP connections, and
+never constructs the legacy `PortableCdp` object in raw mode. Requests, event
+frames, action frames, and batched completions cross the Worker/WASM boundary
+as bounded `Uint8Array` envelopes; the Worker decodes only the short-lived
+records needed to route a host action or deliver an event. A cached export table
+avoids rebinding functions on each command. Modules without the complete raw
+helper ABI retain the legacy path for compatibility.
+
+The raw host-helper ABI now includes stream ingress, network metadata, Fetch
+interception/resolution, cache policy, response-cache clearing, and Fetch
+cancellation. This keeps network/cache/interception state in WASM while Node
+retains only HTTP response bytes and V8/network execution. The package CDP
+adapter translates raw action metadata to its existing host-action executor,
+then sends generation-checked batched completions back to WASM. Screenshot
+resource preparation is performed before the raw render command so resource
+Fetch interception remains observable.
+
+Verification for this checkpoint:
+
+- `obscura-wasm`: **73/73 passed** without render and **79/79 passed** with
+  render.
+- portable `obscura-cdp`: **46/46 passed**.
+- wasm32 render check and native-server CDP check passed.
+- npm package tests without a raw artifact: **9 passed, 2 skipped**.
+- npm package tests with real release wasm-bindgen artifact:
+  **10 passed, 1 skipped**. The real test covered navigation, evaluation,
+  cookies, Network events and bodies, Fetch request/response interception,
+  cache disable/clear, stylesheet/image resource interception, screenshot, and
+  PDF.
+- Artifact used for the raw route: `obscura_wasm_bg.wasm` SHA-256
+  `1ca2b9f4be7e03c583e08b9f7e151b9e6a787c465afe7f8b09ff004e262ed6bb`;
+  wrapper SHA-256
+  `a91b9413b181ef8d5041a0e7848fb8eebea0db6067b1639d5f183fd33377652d`.
+- `git diff --check` passed.
+
+This is a transport cutover, not completion of C3.8/C3.9: the package still
+has browser-level target/context bookkeeping and a compatibility routing table,
+the WASM `PortableCdp` migration scaffolding remains in the crate, and
+Playwright/Puppeteer/concurrency/resource gates plus the missing companion
+obstacle course remain outstanding.

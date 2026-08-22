@@ -265,6 +265,7 @@ class PageTarget {
     this.sessions = new Set();
     this.remoteObjects = new Map();
     this.portableCdpConnections = new Map();
+    this.portableCdpRawMode = null;
     this.networkFlushPromise = null;
     this.networkFlushTimer = null;
     this.networkFlushPaused = false;
@@ -307,7 +308,10 @@ class PageTarget {
     this.sessions.clear();
     this.remoteObjects.clear();
     for (const record of this.portableCdpConnections.values()) {
-      try { await this.worker?.portableCdpClose(record.connectionId); } catch {}
+      try {
+        if (record.raw) await this.worker?.portableCdpRawClose(record.connectionId);
+        else await this.worker?.portableCdpClose(record.connectionId);
+      } catch {}
     }
     this.portableCdpConnections.clear();
     if (this.worker) await this.worker.close();
@@ -327,7 +331,10 @@ class PageTarget {
         recorded = { recorded: true, count: 0 };
       } else {
         try {
-          recorded = await this.worker.portableCdpRecordNetwork({ requestTimeoutMs: this.server.requestTimeoutMs });
+          const rawRecord = [...this.portableCdpConnections.values()].find((record) => record.raw);
+          recorded = rawRecord
+            ? await this.worker.portableCdpRawRecordNetwork({ requestTimeoutMs: this.server.requestTimeoutMs })
+            : await this.worker.portableCdpRecordNetwork({ requestTimeoutMs: this.server.requestTimeoutMs });
         } catch {
           return;
         }
@@ -341,7 +348,9 @@ class PageTarget {
         if (!core || connection.closed) continue;
         let events;
         try {
-          events = await this.worker.portableCdpPoll(core.connectionId, 512, { requestTimeoutMs: this.server.requestTimeoutMs });
+          events = core.raw
+            ? await this.worker.portableCdpRawPoll(core.connectionId, 512, { requestTimeoutMs: this.server.requestTimeoutMs })
+            : await this.worker.portableCdpPoll(core.connectionId, 512, { requestTimeoutMs: this.server.requestTimeoutMs });
         } catch {
           continue;
         }
@@ -441,6 +450,21 @@ class PageTarget {
 
   async screenshot(params = {}) {
     await this.start();
+    await this.prepareRenderResources(params);
+    const width = params.width ?? this.viewport.width;
+    const height = params.height ?? this.viewport.height;
+    const result = await this.worker.screenshotPng({
+      width,
+      height,
+      scrollX: params.scrollX ?? 0,
+      scrollY: params.scrollY ?? 0,
+      requestTimeoutMs: this.server.requestTimeoutMs,
+    });
+    return result.data;
+  }
+
+  async prepareRenderResources(params = {}) {
+    await this.start();
     const width = params.width ?? this.viewport.width;
     const height = params.height ?? this.viewport.height;
     if (typeof this.worker.prepareRenderResources === "function") {
@@ -452,14 +476,6 @@ class PageTarget {
       });
       await this.flushPortableNetworkEvents();
     }
-    const result = await this.worker.screenshotPng({
-      width,
-      height,
-      scrollX: params.scrollX ?? 0,
-      scrollY: params.scrollY ?? 0,
-      requestTimeoutMs: this.server.requestTimeoutMs,
-    });
-    return result.data;
   }
 
   async pdf(params = {}) {
@@ -508,8 +524,123 @@ class PageTarget {
     return this.worker.bridgeStatus();
   }
 
+  async portableCdpRawCommand(connectionId, command) {
+    const openRaw = typeof this.worker.portableCdpRawOpen === "function";
+    const requestRaw = typeof this.worker.portableCdpRawRequest === "function";
+    if (!openRaw || !requestRaw) return null;
+    let record = this.portableCdpConnections.get(connectionId);
+    if (!record) {
+      let coreConnectionId;
+      try {
+        let html = "";
+        try { html = await this.portableCdpHtml(); } catch {}
+        coreConnectionId = await this.worker.portableCdpRawOpen({
+          html,
+          requestTimeoutMs: this.server.requestTimeoutMs,
+        });
+        const attached = await this.worker.portableCdpRawRequest(
+          coreConnectionId,
+          JSON.stringify({ id: 0, method: "Target.attachToTarget", params: { targetId: "page-1", flatten: true } }),
+          { requestTimeoutMs: this.server.requestTimeoutMs },
+        );
+        const attachedResponse = attached?.response;
+        if (attachedResponse?.error || typeof attachedResponse?.result?.sessionId !== "string") {
+          await this.worker.portableCdpRawClose(coreConnectionId, { requestTimeoutMs: this.server.requestTimeoutMs });
+          return null;
+        }
+        record = {
+          raw: true,
+          connectionId: coreConnectionId,
+          sessionId: attachedResponse.result.sessionId,
+          externalSessionId: command.sessionId,
+        };
+        this.portableCdpConnections.set(connectionId, record);
+        try { await this.worker.portableCdpRawPoll(coreConnectionId, 512, { requestTimeoutMs: this.server.requestTimeoutMs }); } catch {}
+      } catch {
+        try { if (coreConnectionId !== undefined) await this.worker.portableCdpRawClose(coreConnectionId); } catch {}
+        return null;
+      }
+    }
+    const requestParams = { ...(command.params ?? {}) };
+    if (new Set([
+      "Network.getAllCookies",
+      "Network.enable",
+      "Network.disable",
+      "Network.getResponseBody",
+      "Network.setCookies",
+      "Network.deleteCookies",
+      "Network.clearBrowserCookies",
+      "Storage.getCookies",
+      "Storage.setCookies",
+      "Storage.clearDataForOrigin",
+    ]).has(command.method)) {
+      requestParams._obscuraNowSecs = Math.floor(Date.now() / 1000);
+    }
+    const request = { ...command, params: requestParams, sessionId: record.sessionId };
+    const routed = await this.worker.portableCdpRawRequest(
+      record.connectionId,
+      JSON.stringify(request),
+      { requestTimeoutMs: this.server.requestTimeoutMs },
+    );
+    const response = routed?.response;
+    if (response?.error?.code === -32601 || response?.error?.code === -32602) return null;
+    if (command.method === "Emulation.setDeviceMetricsOverride") {
+      const width = command.params?.width;
+      const height = command.params?.height;
+      const deviceScaleFactor = command.params?.deviceScaleFactor;
+      if (Number.isSafeInteger(width) && width > 0) this.viewport.width = Math.min(width, 4096);
+      if (Number.isSafeInteger(height) && height > 0) this.viewport.height = Math.min(height, 4096);
+      if (typeof deviceScaleFactor === "number" && Number.isFinite(deviceScaleFactor)) this.viewport.deviceScaleFactor = deviceScaleFactor;
+    } else if (command.method === "Emulation.clearDeviceMetricsOverride") {
+      this.viewport = { width: 800, height: 600, deviceScaleFactor: 1 };
+    }
+    if (response && typeof response === "object") {
+      response.sessionId = command.sessionId;
+      rewritePortableTargetIds(response, "page-1", this.frameId);
+    }
+    let events = [];
+    try {
+      events = await this.worker.portableCdpRawPoll(record.connectionId, 512, { requestTimeoutMs: this.server.requestTimeoutMs });
+      if (!Array.isArray(events)) events = [];
+      for (const event of events) {
+        if (typeof event?.sessionId === "string") event.sessionId = command.sessionId;
+        rewritePortableTargetIds(event, "page-1", this.frameId);
+      }
+    } catch {}
+    const action = Array.isArray(routed?.actions)
+      ? routed.actions.find((candidate) => candidate?.requestId === command.id)
+      : undefined;
+    if (action && record.raw) record.actionGeneration = action.generation;
+    return {
+      record,
+      response,
+      events,
+      action: action
+        ? {
+            actionId: action.actionId,
+            generation: action.generation,
+            kind: action.kind,
+            payload: action.payload,
+          }
+        : null,
+    };
+  }
+
   async portableCdpCommand(connectionId, command) {
     await this.start();
+    if (this.portableCdpRawMode !== false && typeof this.worker.portableCdpRawAbiVersion === "function") {
+      try {
+        const abi = await this.worker.portableCdpRawAbiVersion({ requestTimeoutMs: this.server.requestTimeoutMs });
+        this.portableCdpRawMode = abi === 2;
+      } catch {
+        this.portableCdpRawMode = false;
+      }
+      if (this.portableCdpRawMode) {
+        const routed = await this.portableCdpRawCommand(connectionId, command);
+        if (routed !== null) return routed;
+        this.portableCdpRawMode = false;
+      }
+    }
     if (typeof this.worker.portableCdpAbiVersion !== "function" ||
         typeof this.worker.portableCdpOpen !== "function" ||
         typeof this.worker.portableCdpRequest !== "function") return null;
@@ -597,7 +728,18 @@ class PageTarget {
   }
 
   async portableCdpComplete(record, actionId, result) {
-    if (!record || typeof this.worker.portableCdpComplete !== "function") return null;
+    if (!record) return null;
+    if (record.raw) {
+      if (typeof this.worker.portableCdpRawComplete !== "function") return null;
+      if (!Number.isSafeInteger(record.actionGeneration)) return null;
+      return this.worker.portableCdpRawComplete(
+        actionId,
+        record.actionGeneration,
+        JSON.stringify(result),
+        { requestTimeoutMs: this.server.requestTimeoutMs },
+      );
+    }
+    if (typeof this.worker.portableCdpComplete !== "function") return null;
     return this.worker.portableCdpComplete(
       actionId,
       JSON.stringify(result),
@@ -607,7 +749,16 @@ class PageTarget {
 
   async portableCdpOpenStream(connectionId, data) {
     const record = this.portableCdpConnections.get(connectionId);
-    if (!record || typeof this.worker.portableCdpOpenStream !== "function") return null;
+    if (!record) return null;
+    if (record.raw) {
+      if (typeof this.worker.portableCdpRawOpenStream !== "function") return null;
+      return this.worker.portableCdpRawOpenStream(
+        record.connectionId,
+        data,
+        { requestTimeoutMs: this.server.requestTimeoutMs },
+      );
+    }
+    if (typeof this.worker.portableCdpOpenStream !== "function") return null;
     return this.worker.portableCdpOpenStream(
       record.connectionId,
       data,
@@ -1005,6 +1156,10 @@ export class ObscuraCdpServer {
     ]).has(method)) {
       return undefined;
     }
+    if (method === "Page.captureScreenshot") {
+      await target.prepareRenderResources({ requestTimeoutMs: this.server.requestTimeoutMs });
+    }
+    const replaceInitialHistory = method === "Page.navigate" && target.url === "about:blank";
     const routed = await target.portableCdpCommand(connection.id, command);
     if (!routed) return undefined;
     // A previous page fetch/XHR may have completed after its Runtime action
@@ -1040,10 +1195,13 @@ export class ObscuraCdpServer {
     } else if (method === "Network.clearBrowserCookies" || method === "Storage.clearDataForOrigin") {
       await target.cookies("clear");
     }
-    const action = response?.result?.obscuraAction;
+    const action = response?.result?.obscuraAction ?? routed.action;
     if (!action) {
       if (deferNetworkFlush) target.networkFlushPaused = false;
       return response?.result ?? {};
+    }
+    if (routed.record.raw && Number.isSafeInteger(action.generation)) {
+      routed.record.actionGeneration = action.generation;
     }
     const hostParams = { ...(command.params ?? {}) };
     if (action.payload?.extraHTTPHeaders && typeof action.payload.extraHTTPHeaders === "object") {
@@ -1096,11 +1254,17 @@ export class ObscuraCdpServer {
     // state). Drain them before returning the command so ordering is
     // deterministic for CDP clients which await Page.navigate.
     try {
-      const completedEvents = await target.worker.portableCdpPoll(
-        routed.record.connectionId,
-        512,
-        { requestTimeoutMs: this.server.requestTimeoutMs },
-      );
+      const completedEvents = routed.record.raw
+        ? await target.worker.portableCdpRawPoll(
+          routed.record.connectionId,
+          512,
+          { requestTimeoutMs: this.server.requestTimeoutMs },
+        )
+        : await target.worker.portableCdpPoll(
+          routed.record.connectionId,
+          512,
+          { requestTimeoutMs: this.server.requestTimeoutMs },
+        );
       for (const event of Array.isArray(completedEvents) ? completedEvents : []) {
         if (typeof event?.method !== "string") continue;
         if (typeof event.sessionId === "string") event.sessionId = command.sessionId;
@@ -1108,6 +1272,16 @@ export class ObscuraCdpServer {
         connection.event(event.method, event.params ?? {}, command.sessionId);
       }
     } catch {}
+    if (replaceInitialHistory && !completed?.error) {
+      try {
+        await target.portableCdpCommand(connection.id, {
+          id: 0,
+          method: "Page.resetNavigationHistory",
+          params: {},
+          sessionId: command.sessionId,
+        });
+      } catch {}
+    }
     return completed?.result ?? hostResult;
   }
 
