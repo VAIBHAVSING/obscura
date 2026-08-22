@@ -1,7 +1,7 @@
 # Obscura Node and WebAssembly migration memory
 
 Latest verified implementation commit:
-`32cb905` (`feat: add portable bounded HTTP cache policy`).
+`8519ce8` (`feat: add bounded raw wasm cdp abi`).
 The prior checkpoint was `c78d6a5` (`feat: route portable navigation network state through WASM`).
 Earlier harness, portable rendering, resource discovery, PDF, and
 boundary-hardening milestones remain recorded below.
