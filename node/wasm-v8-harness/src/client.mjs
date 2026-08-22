@@ -784,6 +784,22 @@ export class WasmV8Worker {
     return this.request("portableCdpRaw", { operation: "close", connectionId }, options.requestTimeoutMs);
   }
 
+  portableCdpRawContextExport(contextId, options = {}) {
+    if (!Number.isSafeInteger(contextId) || contextId < 0 || contextId > 0xffff_ffff) {
+      return Promise.reject(new TypeError("CDP context ID must be an unsigned 32-bit integer"));
+    }
+    return this.request("portableCdpRaw", { operation: "contextExport", contextId }, options.requestTimeoutMs);
+  }
+
+  portableCdpRawContextImport(snapshot, options = {}) {
+    try {
+      requireBoundedBytes(snapshot, 8 * 1024 * 1024, "context snapshot");
+    } catch (error) {
+      return Promise.reject(error);
+    }
+    return this.request("portableCdpRaw", { operation: "contextImport", snapshot }, options.requestTimeoutMs);
+  }
+
   portableCdpRawOpenStream(connectionId, data, options = {}) {
     if (!Number.isSafeInteger(connectionId) || connectionId < 0 || connectionId > 0xffff_ffff) {
       return Promise.reject(new TypeError("CDP connection ID must be an unsigned 32-bit integer"));

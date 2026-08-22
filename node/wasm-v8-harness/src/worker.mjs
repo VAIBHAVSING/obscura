@@ -1338,6 +1338,8 @@ function portableCdpRawApi() {
     RAW_CDP_BROWSER_CLOSE_NAMES,
     RAW_CDP_CONNECTION_OPEN_NAMES,
     RAW_CDP_CONNECTION_CLOSE_NAMES,
+    RAW_CDP_CONTEXT_EXPORT_NAMES,
+    RAW_CDP_CONTEXT_IMPORT_NAMES,
     RAW_CDP_INGEST_NAMES,
     RAW_CDP_DRAIN_EVENTS_NAMES,
     RAW_CDP_DRAIN_ACTIONS_NAMES,
@@ -1686,6 +1688,17 @@ function portableCdpRawOperation(payload = {}) {
       requireUnsignedU32(payload.connectionId, "CDP connection ID"),
     );
     return {};
+  }
+  if (operation === "contextExport") {
+    if (portableCdpRawBrowserId === null || !api.contextExport) throw portableCdpError("raw CDP browser is not open");
+    const contextId = requireUnsignedU32(payload.contextId, "CDP context ID");
+    return api.contextExport.fn(portableCdpRawBrowserId, contextId);
+  }
+  if (operation === "contextImport") {
+    if (portableCdpRawBrowserId === null || !api.contextImport) throw portableCdpError("raw CDP browser is not open");
+    const snapshot = rawCdpBytes(payload.snapshot, "context snapshot");
+    if (snapshot.byteLength > RAW_CDP_MAX_BYTES) throw new RangeError("context snapshot exceeds the raw ABI limit");
+    return requireUnsignedU32(api.contextImport.fn(portableCdpRawBrowserId, snapshot), "CDP context ID");
   }
   if (operation === "request") {
     const connectionId = requireUnsignedU32(payload.connectionId, "CDP connection ID");

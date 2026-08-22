@@ -1364,6 +1364,10 @@ then sends generation-checked batched completions back to WASM. Screenshot
 resource preparation is performed before the raw render command so resource
 Fetch interception remains observable.
 
+The Worker/client also expose raw context snapshot export/import calls, so a
+future persistence provider can move bounded snapshot bytes without recreating
+context semantics in JavaScript.
+
 Verification for this checkpoint:
 
 - `obscura-wasm`: **73/73 passed** without render and **79/79 passed** with
