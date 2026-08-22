@@ -1230,3 +1230,23 @@ Verification for this checkpoint:
 Remaining C3 work is navigation lifecycle/action completion, reduction of the
 legacy target/session metadata, raw-byte ABI/package finalization, and real
 Playwright/Puppeteer/concurrency gates.
+
+## Shared action identity checkpoint (2026-08-22)
+
+The duplicate WASM-to-portable `shared_actions` map is removed. The bounded
+host-action queue's numeric wire ID is now the same monotonic `EngineActionId`
+owned by `BrowserState`; queueing, completion, stale-target cancellation, and
+late completion rejection all derive that identity directly. A debug parity
+assertion catches allocator drift during development.
+
+Verification for this checkpoint:
+
+- `obscura-wasm`: **72/72 passed** without render and **78/78 passed** with
+  render.
+- wasm32 render check passed.
+- native-server CDP check passed.
+- `git diff --check` passed.
+
+Remaining C3 work is navigation lifecycle/action payload ownership, reduction
+of the legacy target/session metadata, raw-byte ABI/package finalization, and
+real Playwright/Puppeteer/concurrency gates.

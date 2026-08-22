@@ -265,7 +265,6 @@ pub struct PortableCdp {
     /// String-shaped target/session metadata remains only where the wire ABI
     /// still needs it during the final adapter cutover.
     shared_state: BrowserState,
-    shared_actions: BTreeMap<u32, EngineActionId>,
     targets: BTreeMap<String, Target>,
     connections: BTreeMap<u32, Connection>,
     actions: BTreeMap<u32, Action>,
@@ -321,7 +320,6 @@ impl PortableCdp {
         contexts.insert("default".to_string());
         Ok(Self {
             shared_state,
-            shared_actions: BTreeMap::new(),
             targets,
             connections: BTreeMap::new(),
             actions: BTreeMap::new(),
@@ -470,10 +468,7 @@ impl PortableCdp {
                 value: Value::Null,
             })
             .map_err(|_| js_error("stale or unknown CDP action"))?;
-        let shared_action_id = self
-            .shared_actions
-            .remove(&action_id)
-            .ok_or_else(|| js_error("shared CDP action is missing"))?;
+        let shared_action_id = EngineActionId::new(u64::from(action_id));
         let shared_result = if let Some(error) = result.get("error").and_then(Value::as_object) {
             let message = error.get("message").and_then(Value::as_str).unwrap_or("Portable host action failed");
             EngineActionResult::Failed(CdpFailure::host(message))
@@ -1976,7 +1971,7 @@ impl PortableCdp {
                 return cdp_error_response(&request.id, -32000, error.to_string(), request.session_id.as_deref());
             }
         };
-        self.shared_actions.insert(action_id, shared_action_id);
+        debug_assert_eq!(shared_action_id.get(), u64::from(action_id));
         self.actions.insert(action_id, Action {
             connection_id,
             request_id: request.id.clone(),
@@ -2272,12 +2267,11 @@ impl PortableCdp {
         for id in ids {
             self.actions.remove(&id);
             let _ = self.action_queue.cancel(id);
-            if let Some(shared_id) = self.shared_actions.remove(&id) {
-                let _ = self.shared_state.complete_action(
-                    shared_id,
-                    EngineActionResult::Failed(CdpFailure::StaleAction(shared_id)),
-                );
-            }
+            let shared_id = EngineActionId::new(u64::from(id));
+            let _ = self.shared_state.complete_action(
+                shared_id,
+                EngineActionResult::Failed(CdpFailure::StaleAction(shared_id)),
+            );
         }
     }
 
