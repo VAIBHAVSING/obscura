@@ -213,6 +213,12 @@ impl Default for PageDisplayState {
     }
 }
 
+impl PageDisplayState {
+    fn is_default(&self) -> bool {
+        self == &Self::default()
+    }
+}
+
 impl PageNetworkState {
     fn clear_response_bodies(&mut self) {
         self.response_bodies.clear();
@@ -717,7 +723,10 @@ impl BrowserState {
         {
             return Err(CdpFailure::invalid_argument("device metrics are outside portable limits"));
         }
-        let display = self.display.get_mut(page).ok_or(CdpFailure::UnknownPage(*page))?;
+        if !self.pages.contains_key(page) {
+            return Err(CdpFailure::UnknownPage(*page));
+        }
+        let display = self.display.entry(*page).or_default();
         display.width = width;
         display.height = height;
         display.device_scale_factor = device_scale_factor;
@@ -726,11 +735,19 @@ impl BrowserState {
     }
 
     pub fn clear_device_metrics(&mut self, page: &PageId) -> Result<(), CdpFailure> {
-        let display = self.display.get_mut(page).ok_or(CdpFailure::UnknownPage(*page))?;
+        if !self.pages.contains_key(page) {
+            return Err(CdpFailure::UnknownPage(*page));
+        }
+        let Some(display) = self.display.get_mut(page) else {
+            return Ok(());
+        };
         display.width = DEFAULT_VIEWPORT_WIDTH;
         display.height = DEFAULT_VIEWPORT_HEIGHT;
         display.device_scale_factor = 1.0;
         display.mobile = false;
+        if display.is_default() {
+            self.display.remove(page);
+        }
         Ok(())
     }
 
@@ -738,14 +755,26 @@ impl BrowserState {
         if media.len() > MAX_METHOD_BYTES {
             return Err(CdpFailure::invalid_argument("emulated media exceeds the byte limit"));
         }
-        let display = self.display.get_mut(page).ok_or(CdpFailure::UnknownPage(*page))?;
+        if !self.pages.contains_key(page) {
+            return Err(CdpFailure::UnknownPage(*page));
+        }
+        let display = self.display.entry(*page).or_default();
         display.emulated_media = media;
+        if display.is_default() {
+            self.display.remove(page);
+        }
         Ok(())
     }
 
     pub fn set_focus_emulation(&mut self, page: &PageId, enabled: bool) -> Result<(), CdpFailure> {
-        let display = self.display.get_mut(page).ok_or(CdpFailure::UnknownPage(*page))?;
+        if !self.pages.contains_key(page) {
+            return Err(CdpFailure::UnknownPage(*page));
+        }
+        let display = self.display.entry(*page).or_default();
         display.focus_emulation = enabled;
+        if display.is_default() {
+            self.display.remove(page);
+        }
         Ok(())
     }
 
@@ -1292,7 +1321,6 @@ impl CdpEngine for BrowserState {
                 network: PageNetworkState::default(),
             },
         );
-        self.display.insert(id, PageDisplayState::default());
         self.history.insert(
             id,
             PageHistoryState {
@@ -1624,6 +1652,31 @@ mod tests {
         assert_eq!(state.pending_host_action_count(), 0);
         assert!(!state.has_ready_host_actions());
         assert!(state.host_action(action).is_err());
+    }
+
+    #[test]
+    fn display_state_is_lazy_and_released_when_emulation_is_cleared() {
+        let mut state = BrowserState::new();
+        let page = state.create_page(&state.default_context(), "about:blank").unwrap();
+        assert!(state.display_state(&page).is_none());
+
+        state.clear_device_metrics(&page).unwrap();
+        assert!(state.display_state(&page).is_none());
+        state.set_device_metrics(&page, 640, 480, 1.0, false).unwrap();
+        assert_eq!(state.display_state(&page).unwrap().width, 640);
+        state.clear_device_metrics(&page).unwrap();
+        assert!(state.display_state(&page).is_none());
+
+        state.set_emulated_media(&page, "print".to_string()).unwrap();
+        assert_eq!(state.display_state(&page).unwrap().emulated_media, "print");
+        state.set_emulated_media(&page, String::new()).unwrap();
+        assert!(state.display_state(&page).is_none());
+        state.set_focus_emulation(&page, true).unwrap();
+        assert!(state.display_state(&page).unwrap().focus_emulation);
+        state.set_focus_emulation(&page, false).unwrap();
+        assert!(state.display_state(&page).is_none());
+        state.close_page(&page).unwrap();
+        assert!(state.display_state(&page).is_none());
     }
 
     #[test]

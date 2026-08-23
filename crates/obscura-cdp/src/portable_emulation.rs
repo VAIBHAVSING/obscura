@@ -78,9 +78,10 @@ pub fn dispatch(request: &CdpRequest, state: &mut BrowserState, page_id: PageId)
             }
         }
         "Page.getLayoutMetrics" => {
-            let Some(display) = state.display_state(&page_id) else {
+            if state.page(&page_id).is_none() {
                 return error(request, -32000, "target is not known");
-            };
+            }
+            let display = state.display_state(&page_id).cloned().unwrap_or_default();
             let width = display.width;
             let height = display.height;
             CdpResponse::success(
@@ -111,6 +112,9 @@ mod tests {
     fn metrics_and_media_are_owned_by_shared_state() {
         let mut state = BrowserState::new();
         let page = state.create_page(&state.default_context(), "about:blank").unwrap();
+        assert!(state.display_state(&page).is_none());
+        let defaults = dispatch(&request(0, "Page.getLayoutMetrics", json!({})), &mut state, page);
+        assert_eq!(defaults.result.as_ref().unwrap()["layoutViewport"]["clientWidth"], DEFAULT_VIEWPORT_WIDTH);
         assert!(dispatch(
             &request(1, "Emulation.setDeviceMetricsOverride", json!({"width": 640, "height": 480, "deviceScaleFactor": 2, "mobile": true})),
             &mut state,

@@ -1581,7 +1581,7 @@ impl PortableCdp {
             session_id: request.session_id.clone(),
         };
         let page_id = shared_page_id(target_id)?;
-        let display = self.shared_state.display_state(&page_id)?.clone();
+        let display = self.shared_state.display_state(&page_id).cloned().unwrap_or_default();
         let target = self.targets.get_mut(target_id)?;
         let mut backend = CoreRenderBackend {
             core: &mut target.core,
