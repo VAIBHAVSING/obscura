@@ -206,11 +206,6 @@ struct FetchPattern {
 }
 
 struct Target {
-    id: String,
-    frame_id: String,
-    loader_id: String,
-    url: String,
-    title: String,
     document_handle: u32,
     revision: u32,
     paused_fetches: BTreeMap<String, PausedFetch>,
@@ -238,7 +233,6 @@ pub struct PortableCdp {
     connections: BTreeMap<u32, Connection>,
     actions: BTreeMap<u32, Action>,
     next_connection_id: u32,
-    next_target_id: u32,
     next_loader_id: u32,
     io: obscura_cdp::portable_io::IoState,
     fetch_resolutions: VecDeque<Value>,
@@ -258,15 +252,19 @@ impl PortableCdp {
             .create_page(&default_context, "about:blank")
             .map_err(|error| js_error(&format!("shared CDP state initialization failed: {error}")))?;
         debug_assert_eq!(default_page, PageId::new(1));
+        shared_state
+            .update_page(
+                &default_page,
+                None,
+                None,
+                Some("loader-blank-page-1"),
+                None,
+            )
+            .map_err(|error| js_error(&format!("shared CDP page metadata initialization failed: {error}")))?;
         let mut targets = BTreeMap::new();
         targets.insert(
             "page-1".to_string(),
             Target {
-                id: "page-1".to_string(),
-                frame_id: "page-1".to_string(),
-                loader_id: "loader-blank-page-1".to_string(),
-                url: "about:blank".to_string(),
-                title: String::new(),
                 document_handle,
                 revision,
                 paused_fetches: BTreeMap::new(),
@@ -279,7 +277,6 @@ impl PortableCdp {
             connections: BTreeMap::new(),
             actions: BTreeMap::new(),
             next_connection_id: 0,
-            next_target_id: 1,
             next_loader_id: 0,
             io: obscura_cdp::portable_io::IoState::with_limits(128, MAX_STREAM_BYTES),
             fetch_resolutions: VecDeque::new(),
@@ -424,30 +421,24 @@ impl PortableCdp {
         let is_navigation = matches!(host_action.kind.as_str(), "navigate" | "reload" | "setDocumentContent");
         let is_failure = matches!(&shared_result, EngineActionResult::Failed(_));
 
-        // Validate generation before entering the target's document mirror.
-        // This is the critical stale-completion barrier: a late result cannot
-        // replace the DOM after a newer navigation has claimed the page.
+        // Complete the shared record before entering the target's document
+        // mirror. This keeps page URL/title/loader metadata in BrowserState
+        // and makes the stale-generation barrier cover both state layers.
+        match self.shared_state.complete_action(shared_action_id, shared_result) {
+            Ok(()) | Err(CdpFailure::Host(_)) => {}
+            Err(error) => {
+                self.actions.remove(&action_id);
+                self.shared_state.cancel_action(shared_action_id);
+                return Err(js_error(&format!("shared CDP action completion failed: {error}")));
+            }
+        }
         if is_navigation && !is_failure {
-            if let Some(target) = self.targets.get_mut(&action.target_id) {
-                if let Some(url) = result.get("url").and_then(Value::as_str) {
-                    target.url = url.to_string();
-                }
-                if let Some(loader_id) = result.get("loaderId").and_then(Value::as_str) {
-                    target.loader_id = loader_id.to_string();
-                }
-                if let Some(title) = result.get("title").and_then(Value::as_str) {
-                    target.title = title.to_string();
-                }
-                if let Some(state) = result.get("__obscuraState").and_then(Value::as_object) {
-                    if let Some(url) = state.get("url").and_then(Value::as_str) {
-                        target.url = url.to_string();
-                    }
-                    if let Some(loader_id) = state.get("loaderId").and_then(Value::as_str) {
-                        target.loader_id = loader_id.to_string();
-                    }
-                    if let Some(title) = state.get("title").and_then(Value::as_str) {
-                        target.title = title.to_string();
-                    }
+            if let Some(state) = result.get("__obscuraState").and_then(Value::as_object) {
+                let document_url = shared_page_id(&action.target_id)
+                    .and_then(|page| self.shared_state.page(&page))
+                    .map(|page| page.url.clone())
+                    .unwrap_or_default();
+                if let Some(target) = self.targets.get_mut(&action.target_id) {
                     if let Some(document_handle) = state.get("documentHandle").and_then(Value::as_u64) {
                         target.document_handle = u32::try_from(document_handle).map_err(|_| js_error("document handle exceeds u32"))?;
                     }
@@ -461,20 +452,12 @@ impl PortableCdp {
                             .map_err(|_| js_error("portable CDP document replacement failed"))?;
                         target
                             .core
-                            .set_document_metadata(&target.url, "", "UTF-8")
+                            .set_document_metadata(&document_url, "", "UTF-8")
                             .map_err(|_| js_error("portable CDP document metadata update failed"))?;
                         target.document_handle = target.core.document_handle();
                         target.revision = target.core.page_revision();
                     }
                 }
-            }
-        }
-        match self.shared_state.complete_action(shared_action_id, shared_result) {
-            Ok(()) | Err(CdpFailure::Host(_)) => {}
-            Err(error) => {
-                self.actions.remove(&action_id);
-                self.shared_state.cancel_action(shared_action_id);
-                return Err(js_error(&format!("shared CDP action completion failed: {error}")));
             }
         }
         self.actions.remove(&action_id);
@@ -819,12 +802,21 @@ impl PortableCdp {
         if events.len() > MAX_EVENT_QUEUE {
             return Err(js_range_error("portable network metadata exceeds the event limit"));
         }
-        let shared_page = shared_page_id(target_id);
+        let shared_page = shared_page_id(target_id)
+            .filter(|page| self.shared_state.page(page).is_some());
         let mut shared_bodies = Vec::new();
         let mut pending_events: Vec<(u32, String, &'static str, Value)> = Vec::new();
-        let Some(target) = self.targets.get(target_id) else {
+        if !self.targets.contains_key(target_id) {
+            return Err(js_error("portable network target is not known"));
+        }
+        let Some(shared_page) = shared_page else {
             return Err(js_error("portable network target is not known"));
         };
+        let (frame_id, document_url) = self
+            .shared_state
+            .page(&shared_page)
+            .map(|page| (page.frame_id.clone(), page.url.clone()))
+            .ok_or_else(|| js_error("portable network target is not known"))?;
         for event in events {
             let Some(event) = event.as_object() else {
                 return Err(js_error("portable network event must be an object"));
@@ -860,17 +852,11 @@ impl PortableCdp {
             let status = event.get("status").and_then(Value::as_u64).unwrap_or(200);
             let mime_type = event.get("mimeType").and_then(Value::as_str).unwrap_or("");
             let resource_type = event.get("resourceType").and_then(Value::as_str).unwrap_or("Document");
-            let frame_id = target.frame_id.clone();
-            let document_url = target.url.clone();
-            let session_ids: Vec<(u32, String)> = shared_page
-                .iter()
-                .copied()
-                .flat_map(|page| {
-                    self.shared_state
-                        .sessions_for_page(page)
-                        .into_iter()
-                        .map(move |pair| (page, pair))
-                })
+            let session_ids: Vec<(u32, String)> = self
+                .shared_state
+                .sessions_for_page(shared_page)
+                .into_iter()
+                .map(|pair| (shared_page, pair))
                 .filter_map(|(page, (session, connection))| {
                     let connection = u32::try_from(connection.get()).ok()?;
                     let session_id = format!("page-{}-session-{}", target_id.strip_prefix("page-")?, session.get());
@@ -910,12 +896,10 @@ impl PortableCdp {
         for (connection_id, session_id, method, params) in pending_events {
             self.queue_event(connection_id, method, params, Some(&session_id));
         }
-        if let Some(shared_page) = shared_page {
-            for (request_id, body, base64_encoded) in shared_bodies {
-                self.shared_state
-                    .store_response_body(&shared_page, &request_id, body, base64_encoded)
-                    .map_err(|error| js_error(&format!("portable network response state failed: {error}")))?;
-            }
+        for (request_id, body, base64_encoded) in shared_bodies {
+            self.shared_state
+                .store_response_body(&shared_page, &request_id, body, base64_encoded)
+                .map_err(|error| js_error(&format!("portable network response state failed: {error}")))?;
         }
         Ok(())
     }
@@ -939,7 +923,12 @@ impl PortableCdp {
         if request_stage != "Request" && request_stage != "Response" {
             return Err(js_error("Fetch requestStage must be Request or Response"));
         }
-        let shared_page = shared_page_id(target_id);
+        let shared_page = shared_page_id(target_id)
+            .filter(|page| self.shared_state.page(page).is_some());
+        let default_frame_id = shared_page
+            .and_then(|page| self.shared_state.page(&page))
+            .map(|page| page.frame_id.clone())
+            .ok_or_else(|| js_error("portable Fetch target is not known"))?;
         let shared_response_body = if request_stage == "Response" {
             if let Some(body_base64) = metadata.get("responseBodyBase64").and_then(Value::as_str) {
                 bounded(body_base64, MAX_ACTION_RESULT_BYTES, "Fetch response body")?;
@@ -992,11 +981,10 @@ impl PortableCdp {
         let frame_id = metadata
             .get("frameId")
             .and_then(Value::as_str)
-            .unwrap_or(&target.frame_id)
+            .unwrap_or(&default_frame_id)
             .to_string();
         let matching_sessions: Vec<(u32, String)> = shared_page
-            .iter()
-            .copied()
+            .into_iter()
             .flat_map(|page| {
                 self.shared_state
                     .sessions_for_page(page)
@@ -1295,13 +1283,13 @@ impl PortableCdp {
                 }
                 let doomed: Vec<String> = self
                     .targets
-                    .values()
-                    .filter(|target| {
-                        shared_page_id(&target.id)
+                    .keys()
+                    .filter(|target_id| {
+                        shared_page_id(target_id)
                             .and_then(|page| self.shared_state.context_for_page(&page).ok())
                             == Some(shared_id)
                     })
-                    .map(|target| target.id.clone())
+                    .cloned()
                     .collect();
                 if let Err(error) = self.shared_state.dispose_context(&shared_id) {
                     return cdp_error_response(&request.id, -32000, error.to_string(), session);
@@ -1312,7 +1300,7 @@ impl PortableCdp {
                 cdp_result_response(&request.id, json!({}), session)
             }
             "Target.getTargets" => {
-                let infos: Vec<Value> = self.targets.values().map(|target| self.target_info(target)).collect();
+                let infos: Vec<Value> = self.targets.keys().map(|target_id| self.target_info(target_id)).collect();
                 cdp_result_response(&request.id, json!({"targetInfos": infos}), session)
             }
             "Target.setDiscoverTargets" => {
@@ -1321,7 +1309,7 @@ impl PortableCdp {
                     connection.discover_targets = discover;
                 }
                 if discover {
-                    let infos: Vec<Value> = self.targets.values().map(|target| self.target_info(target)).collect();
+                    let infos: Vec<Value> = self.targets.keys().map(|target_id| self.target_info(target_id)).collect();
                     for info in infos {
                         self.queue_event(connection_id, "Target.targetCreated", json!({"targetInfo": info}), None);
                     }
@@ -1356,7 +1344,7 @@ impl PortableCdp {
                     Ok(session_id) => session_id,
                     Err(error) => return cdp_error_response(&request.id, -32000, error.to_string(), session),
                 };
-                let info = self.targets.get(target_id).map(|target| self.target_info(target)).unwrap_or(Value::Null);
+                let info = self.targets.contains_key(target_id).then(|| self.target_info(target_id)).unwrap_or(Value::Null);
                 self.queue_event(
                     connection_id,
                     "Target.attachedToTarget",
@@ -1429,13 +1417,13 @@ impl PortableCdp {
                 .and_then(shared_context_id)
                 .map(|context| {
                     self.targets
-                        .values()
-                        .filter(|target| {
-                            shared_page_id(&target.id)
+                        .keys()
+                        .filter(|target_id| {
+                            shared_page_id(target_id)
                                 .and_then(|page| self.shared_state.context_for_page(&page).ok())
                                 == Some(context)
                         })
-                        .filter_map(|target| shared_page_id(&target.id).map(|page| (target.id.clone(), page)))
+                        .filter_map(|target_id| shared_page_id(target_id).map(|page| (target_id.clone(), page)))
                         .flat_map(|(target_id, page)| {
                             self.shared_state
                                 .sessions_for_page(page)
@@ -1467,13 +1455,13 @@ impl PortableCdp {
                         .filter(|id| *id != "default")
                         .map(|id| {
                             self.targets
-                                .values()
-                                .filter(|target| {
-                                    shared_page_id(&target.id)
+                                .keys()
+                                .filter(|target_id| {
+                                    shared_page_id(target_id)
                                         .and_then(|page| self.shared_state.context_for_page(&page).ok())
                                         == shared_context_id(id)
                                 })
-                                .map(|target| target.id.clone())
+                                .cloned()
                                 .collect()
                         })
                         .unwrap_or_default();
@@ -1955,6 +1943,10 @@ impl PortableCdp {
                 cdp_result_response(&request.id, json!({"cookies": cookies}), session)
             }
             "Network.setCookies" | "Storage.setCookies" => {
+                let page_url = shared_page_id(&target_id)
+                    .and_then(|page| self.shared_state.page(&page))
+                    .map(|page| page.url.clone())
+                    .unwrap_or_else(|| "about:blank".to_string());
                 let Some(target) = self.targets.get_mut(&target_id) else {
                     return cdp_error_response(&request.id, -32000, "target is not known", session);
                 };
@@ -1962,7 +1954,7 @@ impl PortableCdp {
                     Ok(value) => value,
                     Err(error) => return cdp_error_response(&request.id, -32602, error, session),
                 };
-                let import = match cdp_cookie_import(&request.params, &target.url) {
+                let import = match cdp_cookie_import(&request.params, &page_url) {
                     Ok(value) => value,
                     Err(error) => return cdp_error_response(&request.id, -32602, error, session),
                 };
@@ -2026,30 +2018,42 @@ impl PortableCdp {
                 }
             }
             "Page.getFrameTree" => {
-                let Some(target) = self.targets.get(&target_id) else {
+                let Some(page_id) = shared_page_id(&target_id) else {
+                    return cdp_error_response(&request.id, -32000, "target is not known", session);
+                };
+                if !self.targets.contains_key(&target_id) {
+                    return cdp_error_response(&request.id, -32000, "target is not known", session);
+                }
+                let Some(page) = self.shared_state.page(&page_id) else {
                     return cdp_error_response(&request.id, -32000, "target is not known", session);
                 };
                 cdp_result_response(&request.id, json!({"frameTree": {"frame": {
-                    "id": target.frame_id,
-                    "loaderId": target.loader_id,
-                    "url": target.url,
+                    "id": page.frame_id,
+                    "loaderId": page.loader_id,
+                    "url": page.url,
                     "domainAndRegistry": "",
-                    "securityOrigin": target.url,
+                    "securityOrigin": page.url,
                     "mimeType": "text/html",
                     "name": "",
                 }}}), session)
             }
             "Page.getNavigationHistory" => {
-                let Some(target) = self.targets.get(&target_id) else {
+                let Some(page_id) = shared_page_id(&target_id) else {
+                    return cdp_error_response(&request.id, -32000, "target is not known", session);
+                };
+                if !self.targets.contains_key(&target_id) {
+                    return cdp_error_response(&request.id, -32000, "target is not known", session);
+                }
+                let Some(page) = self.shared_state.page(&page_id) else {
                     return cdp_error_response(&request.id, -32000, "target is not known", session);
                 };
                 cdp_result_response(&request.id, json!({
                     "currentIndex": 0,
                     "entries": [{
                         "id": 1,
-                        "url": target.url,
-                        "userTypedURL": target.url,
-                        "title": target.title,
+                        "url": page.url,
+                        "userTypedURL": page.url,
+                        "title": page.title,
                         "transitionType": "typed",
                     }],
                 }), session)
@@ -2144,19 +2148,16 @@ impl PortableCdp {
         shared_page: PageId,
     ) -> String {
         let page_number = u32::try_from(shared_page.get()).expect("portable page ID fits wire ID");
-        self.next_target_id = self.next_target_id.max(page_number);
         let target_id = format!("page-{page_number}");
         debug_assert_eq!(shared_page_id(&target_id), Some(shared_page));
         let mut core = ObscuraCore::new(html).expect("empty document is valid");
         let _ = core.set_document_metadata(url, "", "UTF-8");
         let loader_id = format!("loader-{target_id}-{}", self.next_loader_id);
         self.next_loader_id = self.next_loader_id.saturating_add(1);
+        self.shared_state
+            .update_page(&shared_page, Some(url), None, Some(&loader_id), None)
+            .expect("portable target metadata must remain shared");
         self.targets.insert(target_id.clone(), Target {
-            id: target_id.clone(),
-            frame_id: target_id.clone(),
-            loader_id,
-            url: url.to_string(),
-            title: String::new(),
             document_handle: core.document_handle(),
             revision: core.page_revision(),
             paused_fetches: BTreeMap::new(),
@@ -2170,9 +2171,10 @@ impl PortableCdp {
     /// newly created target. Connections and targets are BTree maps, so the
     /// order is deterministic for hosts which drain their event queues later.
     fn announce_target_created(&mut self, target_id: &str) {
-        let Some(info) = self.targets.get(target_id).map(|target| self.target_info(target)) else {
+        if !self.targets.contains_key(target_id) {
             return;
-        };
+        }
+        let info = self.target_info(target_id);
         let connection_ids: Vec<u32> = self.connections.keys().copied().collect();
         for connection_id in connection_ids {
             let (discover, auto_attach) = self
@@ -2217,9 +2219,10 @@ impl PortableCdp {
             if attached {
                 continue;
             }
-            let Some(info) = self.targets.get(&target_id).map(|target| self.target_info(target)) else {
+            if !self.targets.contains_key(&target_id) {
                 continue;
-            };
+            }
+            let info = self.target_info(&target_id);
             if let Ok(session_id) = self.allocate_session(connection_id, &target_id) {
                 self.queue_event(
                     connection_id,
@@ -2316,7 +2319,7 @@ impl PortableCdp {
         // A target close can arrive while its host operation is in flight.
         // Completing one of those actions must be rejected, not applied to a
         // subsequent page with a coincidentally similar identifier.
-        self.cancel_actions_where(|action| action.target_id == target.id);
+        self.cancel_actions_where(|action| action.target_id == target_id);
         let mut pending_events: Vec<(u32, Option<String>)> = Vec::new();
         for (shared_session, shared_connection) in shared_sessions {
             let Some(connection_id) = u32::try_from(shared_connection.get()).ok() else { continue; };
@@ -2338,14 +2341,14 @@ impl PortableCdp {
                 self.queue_event(
                     connection_id,
                     "Target.detachedFromTarget",
-                    json!({"sessionId": session_id, "targetId": target.id}),
+                    json!({"sessionId": session_id, "targetId": target_id}),
                     None,
                 );
             } else {
                 self.queue_event(
                     connection_id,
                     "Target.targetDestroyed",
-                    json!({"targetId": target.id}),
+                    json!({"targetId": target_id}),
                     None,
                 );
             }
@@ -2380,11 +2383,11 @@ impl PortableCdp {
         }
     }
 
-    fn target_info(&self, target: &Target) -> Value {
-        let page = shared_page_id(&target.id);
+    fn target_info(&self, target_id: &str) -> Value {
+        let page = shared_page_id(target_id);
         let page_state = page.and_then(|page| self.shared_state.page(&page));
         json!({
-            "targetId": target.id,
+            "targetId": target_id,
             "type": "page",
             "title": page_state.map(|page| page.title.as_str()).unwrap_or(""),
             "url": page_state.map(|page| page.url.as_str()).unwrap_or("about:blank"),
@@ -3942,8 +3945,51 @@ mod tests {
         assert_eq!(json(&completed)["id"], 3);
         let late = cdp.complete_action(evaluate_id, r#"{"result":{"value":99}}"#);
         assert!(late.is_err());
-        assert_eq!(cdp.targets["page-1"].url, "https://example.test/replacement");
+        assert_eq!(cdp.shared_state.page(&PageId::new(1)).unwrap().url, "https://example.test/replacement");
         assert_eq!(cdp.shared_state.page(&PageId::new(1)).unwrap().document_generation, 2);
+    }
+
+    #[test]
+    fn target_wire_metadata_reads_shared_page_state_after_navigation() {
+        let mut cdp = PortableCdp::new("").unwrap();
+        let connection = cdp.open_connection().unwrap();
+        let attached = json(&cdp
+            .cdp_request(
+                connection,
+                r#"{"id":1,"method":"Target.attachToTarget","params":{"targetId":"page-1","flatten":true}}"#,
+            )
+            .unwrap());
+        let session = attached["result"]["sessionId"].as_str().unwrap().to_string();
+        let navigate = json(&cdp
+            .cdp_request(
+                connection,
+                &format!(r#"{{"id":2,"sessionId":"{session}","method":"Page.navigate","params":{{"url":"https://example.test/shared"}}}}"#),
+            )
+            .unwrap());
+        let action_id = navigate["result"]["obscuraAction"]["actionId"].as_u64().unwrap() as u32;
+        cdp.complete_action(
+            action_id,
+            r#"{"__obscuraState":{"url":"https://example.test/shared","loaderId":"loader-shared","title":"Shared","html":"<p>shared</p>"}}"#,
+        )
+        .unwrap();
+
+        let frame_tree = json(&cdp
+            .cdp_request(
+                connection,
+                &format!(r#"{{"id":3,"sessionId":"{session}","method":"Page.getFrameTree"}}"#),
+            )
+            .unwrap());
+        assert_eq!(frame_tree["result"]["frameTree"]["frame"]["id"], "page-1");
+        assert_eq!(frame_tree["result"]["frameTree"]["frame"]["loaderId"], "loader-shared");
+        assert_eq!(frame_tree["result"]["frameTree"]["frame"]["url"], "https://example.test/shared");
+
+        let target_info = json(&cdp
+            .cdp_request(connection, r#"{"id":4,"method":"Target.getTargets"}"#)
+            .unwrap());
+        assert_eq!(target_info["result"]["targetInfos"][0]["title"], "Shared");
+        assert_eq!(target_info["result"]["targetInfos"][0]["url"], "https://example.test/shared");
+        assert_eq!(target_info["result"]["targetInfos"][0]["canAccessOpener"], false);
+        assert_eq!(cdp.shared_state.page(&PageId::new(1)).unwrap().loader_id, "loader-shared");
     }
 
     #[test]
@@ -3975,7 +4021,7 @@ mod tests {
             .unwrap();
         assert_eq!(cdp.shared_state.pending_host_action_count(), 0);
         assert!(cdp.complete_action(id, r#"{"url":"https://example.test/late"}"#).is_err());
-        assert_eq!(cdp.targets["page-1"].url, "https://example.test/payload");
+        assert_eq!(cdp.shared_state.page(&PageId::new(1)).unwrap().url, "https://example.test/payload");
     }
 
     #[cfg(feature = "render")]
@@ -4038,13 +4084,13 @@ impl CdpEngine for PortableCdp {
         }
         let doomed: Vec<String> = self
             .targets
-            .values()
-            .filter(|target| {
-                shared_page_id(&target.id)
+            .keys()
+            .filter(|target_id| {
+                shared_page_id(target_id)
                     .and_then(|page| self.shared_state.context_for_page(&page).ok())
                     == Some(*id)
             })
-            .map(|target| target.id.clone())
+            .cloned()
             .collect();
         self.shared_state.dispose_context(id)?;
         for target_id in doomed {
@@ -4080,8 +4126,6 @@ impl CdpEngine for PortableCdp {
     }
 
     fn page_snapshot(&self, page: &PageId) -> Result<obscura_cdp::engine::PageSnapshot, CdpFailure> {
-        let wire_page = format!("page-{}", page.get());
-        let target = self.targets.get(&wire_page).ok_or(CdpFailure::UnknownPage(*page))?;
         let page_state = self.shared_state.page(page).ok_or(CdpFailure::UnknownPage(*page))?;
         Ok(obscura_cdp::engine::PageSnapshot {
             page_id: *page,
