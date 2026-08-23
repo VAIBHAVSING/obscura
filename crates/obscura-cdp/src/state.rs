@@ -14,6 +14,7 @@ use crate::engine::{
     ActionId, ActionResult, CdpEngine, CdpFailure, ContextId, ContextOptions, EngineAction,
     PageId, PageSnapshot,
 };
+use crate::action::{HostAction, MAX_ACTION_BYTES};
 use crate::protocol::{CdpEvent, MAX_METHOD_BYTES};
 
 pub const MAX_CONTEXTS: usize = 256;
@@ -23,6 +24,7 @@ pub const MAX_PAGES: usize = 4096;
 pub const MAX_CONNECTIONS: usize = 512;
 pub const MAX_SESSIONS: usize = 8192;
 pub const MAX_ACTIONS: usize = 512;
+pub const MAX_ACTION_RESULT_BYTES: usize = 16 * 1024 * 1024;
 pub const MAX_URL_BYTES: usize = 8 * 1024 * 1024;
 pub const MAX_STORAGE_STATE_BYTES: usize = 16 * 1024 * 1024;
 pub const MAX_NETWORK_RESPONSE_BODIES: usize = 128;
@@ -247,6 +249,19 @@ struct PendingAction {
     page: Option<PageId>,
     context: Option<ContextId>,
     generation: u64,
+    #[serde(default)]
+    document_generation: Option<u64>,
+    #[serde(default)]
+    host: Option<PendingHostAction>,
+}
+
+/// Host payload ownership stays in the shared state until the action is
+/// completed or canceled. The ready queue stores only IDs, so a page which
+/// never requests host work does not allocate a navigation/action payload.
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+struct PendingHostAction {
+    kind: String,
+    payload: Value,
 }
 
 /// Bounded browser identity state shared by transport adapters.
@@ -264,6 +279,8 @@ pub struct BrowserState {
     #[serde(skip)]
     events: BTreeMap<ConnectionId, VecDeque<CdpEvent>>,
     actions: BTreeMap<ActionId, PendingAction>,
+    #[serde(skip)]
+    ready_host_actions: Option<VecDeque<ActionId>>,
     next_context: u64,
     next_page: u64,
     next_connection: u64,
@@ -304,6 +321,7 @@ impl BrowserState {
             session_connections: BTreeMap::new(),
             events: BTreeMap::new(),
             actions: BTreeMap::new(),
+            ready_host_actions: None,
             next_context: 1,
             next_page: 0,
             next_connection: 0,
@@ -404,6 +422,85 @@ impl BrowserState {
 
     pub fn pending_action_count(&self) -> usize {
         self.actions.len()
+    }
+
+    /// Number of host actions which have not yet been completed or canceled.
+    /// This is intentionally separate from the ready count because a host may
+    /// have already drained an action while its network/V8 work is in flight.
+    pub fn pending_host_action_count(&self) -> usize {
+        self.actions.values().filter(|pending| pending.host.is_some()).count()
+    }
+
+    /// Whether the lazy host-action ready queue has been allocated. This is a
+    /// diagnostic used by portable tests to guard the no-work page invariant.
+    pub fn has_ready_host_actions(&self) -> bool {
+        self.ready_host_actions.as_ref().is_some_and(|queue| !queue.is_empty())
+    }
+
+    /// Return a copy of the bounded host payload for an outstanding action.
+    /// The pending record remains owned by `BrowserState` until completion.
+    pub fn host_action(&self, id: ActionId) -> Result<HostAction, CdpFailure> {
+        let pending = self.actions.get(&id).ok_or(CdpFailure::UnknownAction(id))?;
+        let host = pending.host.as_ref().ok_or(CdpFailure::UnknownAction(id))?;
+        Ok(HostAction {
+            action_id: u32::try_from(id.get()).map_err(|_| CdpFailure::IdExhausted)?,
+            generation: pending.document_generation.unwrap_or(pending.generation),
+            kind: host.kind.clone(),
+            payload: host.payload.clone(),
+        })
+    }
+
+    /// Inspect the oldest ready host action without consuming it. Adapters use
+    /// this to enforce their own complete-frame byte limit before taking the
+    /// payload out of the shared queue.
+    pub fn peek_host_action(&self) -> Option<HostAction> {
+        let id = self.ready_host_actions.as_ref()?.front().copied()?;
+        self.host_action(id).ok()
+    }
+
+    /// Remove one action from the ready queue while retaining its pending
+    /// completion record. Legacy string hosts claim actions this way because
+    /// the action payload is already present in their compatibility response.
+    pub fn claim_host_action(&mut self, id: ActionId) -> Result<(), CdpFailure> {
+        let empty = {
+            let Some(queue) = self.ready_host_actions.as_mut() else {
+                return Err(CdpFailure::UnknownAction(id));
+            };
+            let Some(position) = queue.iter().position(|queued| *queued == id) else {
+                return Err(CdpFailure::UnknownAction(id));
+            };
+            queue.remove(position);
+            queue.is_empty()
+        };
+        if empty {
+            self.ready_host_actions = None;
+        }
+        Ok(())
+    }
+
+    /// Drain ready host actions in FIFO order. The pending action map remains
+    /// the source of truth, so cancellation after a drain still rejects a
+    /// late completion and cannot reuse the payload for a replacement page.
+    pub fn drain_host_actions(&mut self, limit: usize) -> Vec<HostAction> {
+        let mut drained = Vec::new();
+        let limit = limit.min(MAX_ACTIONS);
+        while drained.len() < limit {
+            let id = match self.ready_host_actions.as_mut() {
+                Some(queue) => queue.pop_front(),
+                None => break,
+            };
+            let Some(id) = id else {
+                self.ready_host_actions = None;
+                break;
+            };
+            if let Ok(action) = self.host_action(id) {
+                drained.push(action);
+            }
+            if self.ready_host_actions.as_ref().is_some_and(|queue| queue.is_empty()) {
+                self.ready_host_actions = None;
+            }
+        }
+        drained
     }
 
     pub fn event_count(&self, connection: ConnectionId) -> usize {
@@ -1050,6 +1147,7 @@ impl BrowserState {
         self.session_connections.clear();
         self.events.clear();
         self.actions.clear();
+        self.ready_host_actions = None;
         self.generation = self.generation.saturating_add(1);
     }
 
@@ -1096,7 +1194,14 @@ impl BrowserState {
         self.sessions.retain(|_, page| *page != id);
         let live_sessions: BTreeSet<SessionId> = self.sessions.keys().copied().collect();
         self.session_connections.retain(|session, _| live_sessions.contains(session));
-        self.actions.retain(|_, pending| pending.page != Some(id));
+        let doomed: Vec<ActionId> = self
+            .actions
+            .iter()
+            .filter_map(|(action, pending)| (pending.page == Some(id)).then_some(*action))
+            .collect();
+        for action in doomed {
+            self.remove_action(action);
+        }
         Ok(())
     }
 }
@@ -1225,10 +1330,89 @@ impl CdpEngine for BrowserState {
     }
 
     fn start_action(&mut self, action: EngineAction) -> Result<ActionId, CdpFailure> {
+        self.start_action_record(action, None)
+    }
+
+    fn complete_action(&mut self, id: ActionId, result: ActionResult) -> Result<(), CdpFailure> {
+        let Some(pending) = self.actions.get(&id).cloned() else {
+            return Err(CdpFailure::UnknownAction(id));
+        };
+        self.validate_action_result(&result)?;
+        if let Err(error) = self.validate_pending_action(id, &pending) {
+            self.remove_action(id);
+            return Err(error);
+        }
+
+        if let ActionResult::Failed(failure) = &result {
+            self.remove_action(id);
+            return Err(failure.clone());
+        }
+
+        if let (Some(page), ActionResult::Value(value)) = (pending.page, &result) {
+            if matches!(&pending.action, EngineAction::Navigate { .. }) {
+                self.apply_navigation_metadata(page, value)?;
+            }
+        }
+        self.remove_action(id);
+        Ok(())
+    }
+}
+
+impl BrowserState {
+    /// Start a host-backed action while retaining its protocol kind and
+    /// bounded payload in the shared portable state. The adapter receives a
+    /// copy only when it drains the ready queue.
+    pub fn start_host_action(
+        &mut self,
+        action: EngineAction,
+        kind: impl Into<String>,
+        payload: Value,
+    ) -> Result<ActionId, CdpFailure> {
+        let kind = kind.into();
+        let payload_bytes = serde_json::to_vec(&payload)
+            .map_err(|_| CdpFailure::invalid_argument("host action payload is not serializable"))?;
+        if kind.is_empty() || kind.len().saturating_add(payload_bytes.len()) > MAX_ACTION_BYTES {
+            return Err(CdpFailure::invalid_argument("host action payload exceeds the byte limit"));
+        }
+        self.start_action_record(action, Some(PendingHostAction { kind, payload }))
+    }
+
+    /// Validate a completion without consuming it. WASM uses this before it
+    /// mutates its DOM/document mirror, so stale or duplicate host results
+    /// cannot touch a replacement document.
+    pub fn validate_action_completion(
+        &self,
+        id: ActionId,
+        result: &ActionResult,
+    ) -> Result<(), CdpFailure> {
+        let pending = self.actions.get(&id).ok_or(CdpFailure::UnknownAction(id))?;
+        self.validate_action_result(result)?;
+        self.validate_pending_action(id, pending)?;
+        if let (Some(page), ActionResult::Value(value)) = (pending.page, result) {
+            if matches!(&pending.action, EngineAction::Navigate { .. }) {
+                self.validate_navigation_metadata(page, value)?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Cancel an outstanding action and discard its queued payload. This is
+    /// idempotent at teardown call sites while direct completion still reports
+    /// a controlled unknown-action error for duplicates.
+    pub fn cancel_action(&mut self, id: ActionId) -> bool {
+        self.remove_action(id)
+    }
+
+    fn start_action_record(
+        &mut self,
+        action: EngineAction,
+        host: Option<PendingHostAction>,
+    ) -> Result<ActionId, CdpFailure> {
         self.ensure_open()?;
         if self.actions.len() >= MAX_ACTIONS {
             return Err(CdpFailure::ActionQueueFull);
         }
+        let is_navigation = matches!(&action, EngineAction::Navigate { .. });
         let (page, context) = match &action {
             EngineAction::Navigate { page, .. }
             | EngineAction::FetchResource { page, .. }
@@ -1255,6 +1439,26 @@ impl CdpEngine for BrowserState {
             EngineAction::Wake { .. } => (None, None),
         };
         let id = ActionId::new(Self::next_id(&mut self.next_action)?);
+        if host.is_some() && id.get() > u64::from(u32::MAX) {
+            return Err(CdpFailure::IdExhausted);
+        }
+
+        // A navigation claims the next document generation immediately. This
+        // invalidates evaluations/input/resource work still tied to the old
+        // document, while the navigation itself is stamped with the new
+        // generation and may complete asynchronously.
+        let document_generation = if let Some(page_id) = page {
+            let page_state = self.pages.get_mut(&page_id).ok_or(CdpFailure::UnknownPage(page_id))?;
+            if is_navigation {
+                page_state.document_generation = page_state
+                    .document_generation
+                    .checked_add(1)
+                    .ok_or(CdpFailure::IdExhausted)?;
+            }
+            Some(page_state.document_generation)
+        } else {
+            None
+        };
         self.actions.insert(
             id,
             PendingAction {
@@ -1262,22 +1466,94 @@ impl CdpEngine for BrowserState {
                 page,
                 context,
                 generation: self.generation,
+                document_generation,
+                host,
             },
         );
+        if self.actions.get(&id).and_then(|pending| pending.host.as_ref()).is_some() {
+            self.ready_host_actions.get_or_insert_with(VecDeque::new).push_back(id);
+        }
         Ok(id)
     }
 
-    fn complete_action(&mut self, id: ActionId, result: ActionResult) -> Result<(), CdpFailure> {
-        let Some(pending) = self.actions.remove(&id) else {
-            return Err(CdpFailure::UnknownAction(id));
-        };
+    fn validate_pending_action(&self, id: ActionId, pending: &PendingAction) -> Result<(), CdpFailure> {
         if pending.generation != self.generation {
             return Err(CdpFailure::StaleAction(id));
         }
-        if let ActionResult::Failed(failure) = result {
-            return Err(failure);
+        if let Some(page_id) = pending.page {
+            let Some(page) = self.pages.get(&page_id) else {
+                return Err(CdpFailure::StaleAction(id));
+            };
+            if pending.document_generation != Some(page.document_generation) {
+                return Err(CdpFailure::StaleAction(id));
+            }
         }
         Ok(())
+    }
+
+    fn validate_action_result(&self, result: &ActionResult) -> Result<(), CdpFailure> {
+        let bytes = serde_json::to_vec(result)
+            .map_err(|_| CdpFailure::invalid_argument("host action result is not serializable"))?;
+        if bytes.len() > MAX_ACTION_RESULT_BYTES {
+            return Err(CdpFailure::invalid_argument("host action result exceeds the byte limit"));
+        }
+        Ok(())
+    }
+
+    fn remove_action(&mut self, id: ActionId) -> bool {
+        let removed = self.actions.remove(&id).is_some();
+        if let Some(queue) = self.ready_host_actions.as_mut() {
+            queue.retain(|queued| *queued != id);
+        }
+        if self.ready_host_actions.as_ref().is_some_and(|queue| queue.is_empty()) {
+            self.ready_host_actions = None;
+        }
+        removed
+    }
+
+    fn apply_navigation_metadata(&mut self, page: PageId, value: &Value) -> Result<(), CdpFailure> {
+        let (url, title, loader_id) = self.navigation_metadata(page, value)?;
+        self.update_page(&page, url, title, loader_id, None)
+    }
+
+    fn validate_navigation_metadata(&self, page: PageId, value: &Value) -> Result<(), CdpFailure> {
+        let _ = self.navigation_metadata(page, value)?;
+        Ok(())
+    }
+
+    fn navigation_metadata<'a>(
+        &self,
+        page: PageId,
+        value: &'a Value,
+    ) -> Result<(Option<&'a str>, Option<&'a str>, Option<&'a str>), CdpFailure> {
+        if !self.pages.contains_key(&page) {
+            return Err(CdpFailure::UnknownPage(page));
+        }
+        let object = value
+            .as_object()
+            .ok_or_else(|| CdpFailure::invalid_argument("navigation completion must be an object"))?;
+        let state = value.get("__obscuraState").and_then(Value::as_object);
+        let url = state
+            .and_then(|state| state.get("url"))
+            .or_else(|| object.get("url"))
+            .and_then(Value::as_str);
+        let title = state
+            .and_then(|state| state.get("title"))
+            .or_else(|| object.get("title"))
+            .and_then(Value::as_str);
+        let loader_id = state
+            .and_then(|state| state.get("loaderId"))
+            .or_else(|| object.get("loaderId"))
+            .and_then(Value::as_str);
+        if let Some(url) = url {
+            Self::validate_url(url)?;
+        }
+        if title.is_some_and(|title| title.len() > MAX_METHOD_BYTES)
+            || loader_id.is_some_and(|loader_id| loader_id.len() > MAX_METHOD_BYTES)
+        {
+            return Err(CdpFailure::invalid_argument("navigation metadata exceeds the byte limit"));
+        }
+        Ok((url, title, loader_id))
     }
 }
 
@@ -1316,6 +1592,81 @@ mod tests {
         state.close_page(&page).unwrap();
         assert!(state.attached_page(session).is_none());
         assert_eq!(state.complete_action(action, ActionResult::unit()), Err(CdpFailure::UnknownAction(action)));
+    }
+
+    #[test]
+    fn unused_pages_do_not_allocate_host_action_payload_state() {
+        let mut state = BrowserState::new();
+        let page = state.create_page(&state.default_context(), "about:blank").unwrap();
+        assert_eq!(state.pending_action_count(), 0);
+        assert_eq!(state.pending_host_action_count(), 0);
+        assert!(!state.has_ready_host_actions());
+        assert!(state.ready_host_actions.is_none());
+        assert!(state.actions.is_empty());
+
+        let action = state
+            .start_host_action(
+                EngineAction::Evaluate { page, expression: "1".into() },
+                "evaluate",
+                serde_json::json!({"expression": "1"}),
+            )
+            .unwrap();
+        assert!(state.has_ready_host_actions());
+        state.close_page(&page).unwrap();
+        assert_eq!(state.pending_action_count(), 0);
+        assert_eq!(state.pending_host_action_count(), 0);
+        assert!(state.ready_host_actions.is_none());
+        assert!(state.actions.is_empty());
+
+        let new_page = state.create_page(&state.default_context(), "about:blank").unwrap();
+        assert_ne!(new_page, page);
+        assert_eq!(state.pending_action_count(), 0);
+        assert_eq!(state.pending_host_action_count(), 0);
+        assert!(!state.has_ready_host_actions());
+        assert!(state.host_action(action).is_err());
+    }
+
+    #[test]
+    fn host_payload_is_shared_and_document_generation_rejects_stale_work() {
+        let mut state = BrowserState::new();
+        let page = state.create_page(&state.default_context(), "about:blank").unwrap();
+        let evaluate = state
+            .start_host_action(
+                EngineAction::Evaluate { page, expression: "1 + 1".into() },
+                "evaluate",
+                serde_json::json!({"expression": "1 + 1"}),
+            )
+            .unwrap();
+        let evaluate_payload = state.host_action(evaluate).unwrap();
+        assert_eq!(evaluate_payload.kind, "evaluate");
+        assert_eq!(evaluate_payload.payload["expression"], "1 + 1");
+
+        let navigate = state
+            .start_host_action(
+                EngineAction::Navigate { page, url: "https://example.test/new".into() },
+                "navigate",
+                serde_json::json!({"url": "https://example.test/new"}),
+            )
+            .unwrap();
+        assert_eq!(state.host_action(navigate).unwrap().generation, 2);
+        assert_eq!(
+            state.complete_action(evaluate, ActionResult::value(serde_json::json!({"value": 2}))),
+            Err(CdpFailure::StaleAction(evaluate))
+        );
+        assert_eq!(state.pending_host_action_count(), 1);
+        assert_eq!(state.drain_host_actions(8).len(), 1);
+        assert_eq!(state.complete_action(navigate, ActionResult::value(serde_json::json!({
+            "__obscuraState": {
+                "url": "https://example.test/new",
+                "loaderId": "loader-new",
+                "title": "New",
+            }
+        }))), Ok(()));
+        assert_eq!(state.page(&page).unwrap().url, "https://example.test/new");
+        assert_eq!(
+            state.complete_action(navigate, ActionResult::unit()),
+            Err(CdpFailure::UnknownAction(navigate))
+        );
     }
 
     #[test]

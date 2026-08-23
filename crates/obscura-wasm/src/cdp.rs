@@ -15,7 +15,6 @@ use serde_json::{json, Map, Value};
 use url::Url;
 use wasm_bindgen::prelude::*;
 
-use obscura_cdp::action::{ActionQueue, HostActionResult};
 use obscura_cdp::engine::{
     ActionId as EngineActionId, ActionResult as EngineActionResult, CdpEngine, CdpFailure,
     ContextId, ContextOptions, EngineAction, PageId,
@@ -187,7 +186,6 @@ struct Action {
     request_id: Value,
     session_id: Option<String>,
     target_id: String,
-    kind: String,
 }
 
 struct PausedFetch {
@@ -239,14 +237,12 @@ pub struct PortableCdp {
     targets: BTreeMap<String, Target>,
     connections: BTreeMap<u32, Connection>,
     actions: BTreeMap<u32, Action>,
-    action_queue: ActionQueue,
     next_connection_id: u32,
     next_target_id: u32,
     next_loader_id: u32,
     io: obscura_cdp::portable_io::IoState,
     fetch_resolutions: VecDeque<Value>,
     raw_abi_mode: bool,
-    raw_actions: VecDeque<obscura_cdp::action::HostAction>,
 }
 
 #[wasm_bindgen]
@@ -282,14 +278,12 @@ impl PortableCdp {
             targets,
             connections: BTreeMap::new(),
             actions: BTreeMap::new(),
-            action_queue: ActionQueue::new(1),
             next_connection_id: 0,
             next_target_id: 1,
             next_loader_id: 0,
             io: obscura_cdp::portable_io::IoState::with_limits(128, MAX_STREAM_BYTES),
             fetch_resolutions: VecDeque::new(),
             raw_abi_mode: false,
-            raw_actions: VecDeque::new(),
         })
     }
 
@@ -403,20 +397,11 @@ impl PortableCdp {
         // the ownership again immediately before accepting its result.
         if !self.action_is_live(&action) {
             self.actions.remove(&action_id);
-            let _ = self.action_queue.cancel(action_id);
+            self.shared_state.cancel_action(EngineActionId::new(u64::from(action_id)));
             return Err(js_error("CDP action target session is no longer live"));
         }
         let mut result: Value = serde_json::from_str(result_json)
             .map_err(|error| js_error(&format!("invalid CDP action result: {error}")))?;
-        let generation = self.action_queue.generation();
-        self.action_queue
-            .complete(&HostActionResult {
-                action_id,
-                generation,
-                ok: true,
-                value: Value::Null,
-            })
-            .map_err(|_| js_error("stale or unknown CDP action"))?;
         let shared_action_id = EngineActionId::new(u64::from(action_id));
         let shared_result = if let Some(error) = result.get("error").and_then(Value::as_object) {
             let message = error.get("message").and_then(Value::as_str).unwrap_or("Portable host action failed");
@@ -424,12 +409,25 @@ impl PortableCdp {
         } else {
             EngineActionResult::Value(result.clone())
         };
-        match self.shared_state.complete_action(shared_action_id, shared_result) {
-            Ok(()) | Err(CdpFailure::Host(_)) => {}
-            Err(error) => return Err(js_error(&format!("shared CDP action completion failed: {error}"))),
+        if let Err(error) = self
+            .shared_state
+            .validate_action_completion(shared_action_id, &shared_result)
+        {
+            self.actions.remove(&action_id);
+            self.shared_state.cancel_action(shared_action_id);
+            return Err(js_error(&format!("stale or unknown CDP action: {error}")));
         }
-        self.actions.remove(&action_id);
-        if action.kind == "navigate" || action.kind == "reload" || action.kind == "setDocumentContent" {
+        let host_action = self
+            .shared_state
+            .host_action(shared_action_id)
+            .map_err(|error| js_error(&format!("shared CDP action payload is unavailable: {error}")))?;
+        let is_navigation = matches!(host_action.kind.as_str(), "navigate" | "reload" | "setDocumentContent");
+        let is_failure = matches!(&shared_result, EngineActionResult::Failed(_));
+
+        // Validate generation before entering the target's document mirror.
+        // This is the critical stale-completion barrier: a late result cannot
+        // replace the DOM after a newer navigation has claimed the page.
+        if is_navigation && !is_failure {
             if let Some(target) = self.targets.get_mut(&action.target_id) {
                 if let Some(url) = result.get("url").and_then(Value::as_str) {
                     target.url = url.to_string();
@@ -471,20 +469,15 @@ impl PortableCdp {
                 }
             }
         }
-        if action.kind == "navigate" || action.kind == "reload" || action.kind == "setDocumentContent" {
-            if let (Some(shared_page), Some(target)) = (
-                shared_page_id(&action.target_id),
-                self.targets.get(&action.target_id),
-            ) {
-                let _ = self.shared_state.update_page(
-                    &shared_page,
-                    Some(&target.url),
-                    Some(&target.title),
-                    Some(&target.loader_id),
-                    Some(u64::from(target.revision)),
-                );
+        match self.shared_state.complete_action(shared_action_id, shared_result) {
+            Ok(()) | Err(CdpFailure::Host(_)) => {}
+            Err(error) => {
+                self.actions.remove(&action_id);
+                self.shared_state.cancel_action(shared_action_id);
+                return Err(js_error(&format!("shared CDP action completion failed: {error}")));
             }
         }
+        self.actions.remove(&action_id);
         let mut network_metadata = None;
         if let Value::Object(ref mut object) = result {
             network_metadata = object.remove("__obscuraNetwork");
@@ -647,7 +640,7 @@ impl PortableCdp {
             "cdpRawAbiVersion": crate::RAW_CDP_ABI_VERSION,
             "targets": self.targets.len(),
             "connections": self.connections.len(),
-            "pendingActions": self.action_queue.pending_len(),
+            "pendingActions": self.shared_state.pending_action_count(),
             "eventQueueLimit": MAX_EVENT_QUEUE,
             "actionResultBytes": MAX_ACTION_RESULT_BYTES,
             "streamBytes": MAX_STREAM_BYTES,
@@ -731,15 +724,17 @@ impl PortableCdp {
         let mut frames = Vec::new();
         let mut bytes = 0usize;
         while frames.len() < max_items {
-            let Some(action) = self.raw_actions.front() else {
+            let Some(action) = self.shared_state.peek_host_action() else {
                 break;
             };
+            let action_id = u32::try_from(action.action_id)
+                .map_err(|_| js_range_error("CDP action ID exceeds the raw ABI range"))?;
             let metadata = self
                 .actions
-                .get(&action.action_id)
+                .get(&action_id)
                 .ok_or_else(|| js_error("raw CDP action metadata is stale"))?;
             let frame = serde_json::to_vec(&json!({
-                "actionId": action.action_id,
+                "actionId": action_id,
                 "generation": action.generation,
                 "kind": action.kind,
                 "targetId": metadata.target_id,
@@ -758,7 +753,9 @@ impl PortableCdp {
                 }
                 break;
             }
-            let _ = self.raw_actions.pop_front();
+            self.shared_state
+                .claim_host_action(EngineActionId::new(u64::from(action.action_id)))
+                .map_err(|error| js_error(&format!("raw CDP action queue is stale: {error}")))?;
             bytes = next;
             frames.push(frame);
         }
@@ -801,7 +798,12 @@ impl PortableCdp {
         generation: u64,
         result: &[u8],
     ) -> Result<Vec<u8>, JsValue> {
-        if generation != self.action_queue.generation() {
+        let shared_action_id = EngineActionId::new(u64::from(action_id));
+        let action = self
+            .shared_state
+            .host_action(shared_action_id)
+            .map_err(|_| js_error("stale or unknown CDP action"))?;
+        if generation != action.generation {
             return Err(js_error("stale CDP action generation"));
         }
         let result = std::str::from_utf8(result)
@@ -2053,14 +2055,6 @@ impl PortableCdp {
                 }), session)
             }
             "Page.resetNavigationHistory" => cdp_result_response(&request.id, json!({}), session),
-            #[cfg(not(feature = "render"))]
-            "Page.captureScreenshot" => self.queue_action(connection_id, request.clone(), target_id, "screenshot", json!({
-                "format": request.params.get("format").and_then(Value::as_str).unwrap_or("png"),
-            })),
-            #[cfg(not(feature = "render"))]
-            "Page.printToPDF" => self.queue_action(connection_id, request.clone(), target_id, "pdf", json!({
-                "landscape": request.params.get("landscape").and_then(Value::as_bool).unwrap_or(false),
-            })),
             _ => cdp_error_response(&request.id, -32601, "method is not implemented", session),
         }
     }
@@ -2070,46 +2064,55 @@ impl PortableCdp {
             Ok(action) => action,
             Err(error) => return cdp_error_response(&request.id, -32000, error.to_string(), request.session_id.as_deref()),
         };
-        let action_id = match self.action_queue.enqueue(kind, payload.clone()) {
-            Ok(value) => value,
+        let shared_action_id = match self
+            .shared_state
+            .start_host_action(shared_action, kind.to_string(), payload.clone())
+        {
+            Ok(id) => id,
             Err(error) => {
-                let message = match error {
-                    obscura_cdp::action::ActionError::QueueFull => "CDP action queue is full",
-                    obscura_cdp::action::ActionError::PayloadTooLarge => "CDP action payload exceeds the byte limit",
-                    obscura_cdp::action::ActionError::IdExhausted => "CDP action ID space is exhausted",
-                    obscura_cdp::action::ActionError::UnknownAction | obscura_cdp::action::ActionError::StaleGeneration => "CDP action queue is invalid",
+                let message = match &error {
+                    CdpFailure::ActionQueueFull => "CDP action queue is full",
+                    CdpFailure::IdExhausted => "CDP action ID space is exhausted",
+                    CdpFailure::InvalidArgument(message)
+                        if message == "host action payload exceeds the byte limit" =>
+                        "CDP action payload exceeds the byte limit",
+                    _ => return cdp_error_response(&request.id, -32000, error.to_string(), request.session_id.as_deref()),
                 };
                 return cdp_error_response(&request.id, -32000, message, request.session_id.as_deref());
             }
         };
-        // The CDP response is the transport-facing action drain. Keep the
-        // shared queue's pending ownership, but remove its ready copy so the
-        // host cannot accidentally execute the same action twice by polling
-        // both legacy and shared paths.
-        let drained = self.action_queue.drain(1);
-        let shared_action_id = match self.shared_state.start_action(shared_action) {
+        let action_id = match u32::try_from(shared_action_id.get()) {
             Ok(id) => id,
-            Err(error) => {
-                let _ = self.action_queue.cancel(action_id);
-                return cdp_error_response(&request.id, -32000, error.to_string(), request.session_id.as_deref());
+            Err(_) => {
+                self.shared_state.cancel_action(shared_action_id);
+                return cdp_error_response(&request.id, -32000, "CDP action ID exceeds the 32-bit ABI", request.session_id.as_deref());
             }
         };
-        if self.raw_abi_mode {
-            self.raw_actions.extend(drained);
+        if !self.raw_abi_mode {
+            // The legacy string response carries the payload inline. Claim
+            // only the ready marker; the shared pending record remains until
+            // the host calls completeAction.
+            let _ = self.shared_state.claim_host_action(shared_action_id);
         }
-        debug_assert_eq!(shared_action_id.get(), u64::from(action_id));
         self.actions.insert(action_id, Action {
             connection_id,
             request_id: request.id.clone(),
             session_id: request.session_id.clone(),
             target_id: target_id.clone(),
-            kind: kind.to_string(),
         });
+        let host_action = match self.shared_state.host_action(shared_action_id) {
+            Ok(action) => action,
+            Err(error) => {
+                self.actions.remove(&action_id);
+                self.shared_state.cancel_action(shared_action_id);
+                return cdp_error_response(&request.id, -32000, error.to_string(), request.session_id.as_deref());
+            }
+        };
         cdp_result_response(&request.id, json!({"obscuraAction": {
             "actionId": action_id,
-            "kind": kind,
+            "kind": host_action.kind,
             "targetId": target_id,
-            "payload": payload,
+            "payload": host_action.payload,
         }}), request.session_id.as_deref())
     }
 
@@ -2372,13 +2375,8 @@ impl PortableCdp {
             .collect();
         for id in ids {
             self.actions.remove(&id);
-            let _ = self.action_queue.cancel(id);
-            self.raw_actions.retain(|action| action.action_id != id);
             let shared_id = EngineActionId::new(u64::from(id));
-            let _ = self.shared_state.complete_action(
-                shared_id,
-                EngineActionResult::Failed(CdpFailure::StaleAction(shared_id)),
-            );
+            self.shared_state.cancel_action(shared_id);
         }
     }
 
@@ -3906,6 +3904,78 @@ mod tests {
         assert_eq!(events.as_array().unwrap().len(), 1);
         assert_eq!(events[0]["method"], "Target.detachedFromTarget");
         assert_eq!(events[0]["params"]["sessionId"], session);
+    }
+
+    #[test]
+    fn navigation_generation_rejects_late_completion_before_and_after_commit() {
+        let mut cdp = PortableCdp::new("").unwrap();
+        let connection = cdp.open_connection().unwrap();
+        let attached = json(&cdp
+            .cdp_request(
+                connection,
+                r#"{"id":1,"method":"Target.attachToTarget","params":{"targetId":"page-1"}}"#,
+            )
+            .unwrap());
+        let session = attached["result"]["sessionId"].as_str().unwrap().to_string();
+        let evaluate = json(&cdp
+            .cdp_request(
+                connection,
+                &format!(r#"{{"id":2,"sessionId":"{session}","method":"Runtime.evaluate","params":{{"expression":"1"}}}}"#),
+            )
+            .unwrap());
+        let evaluate_id = evaluate["result"]["obscuraAction"]["actionId"].as_u64().unwrap() as u32;
+        let navigate = json(&cdp
+            .cdp_request(
+                connection,
+                &format!(r#"{{"id":3,"sessionId":"{session}","method":"Page.navigate","params":{{"url":"https://example.test/replacement"}}}}"#),
+            )
+            .unwrap());
+        let navigate_id = navigate["result"]["obscuraAction"]["actionId"].as_u64().unwrap() as u32;
+
+        assert!(cdp.complete_action(evaluate_id, r#"{"result":{"value":1}}"#).is_err());
+        let completed = cdp
+            .complete_action(
+                navigate_id,
+                r#"{"__obscuraState":{"url":"https://example.test/replacement","loaderId":"loader-replacement","title":"Replacement","html":"<p>replacement</p>"}}"#,
+            )
+            .unwrap();
+        assert_eq!(json(&completed)["id"], 3);
+        let late = cdp.complete_action(evaluate_id, r#"{"result":{"value":99}}"#);
+        assert!(late.is_err());
+        assert_eq!(cdp.targets["page-1"].url, "https://example.test/replacement");
+        assert_eq!(cdp.shared_state.page(&PageId::new(1)).unwrap().document_generation, 2);
+    }
+
+    #[test]
+    fn completed_action_is_removed_once_and_shared_payload_survives_wire_claim() {
+        let mut cdp = PortableCdp::new("").unwrap();
+        let connection = cdp.open_connection().unwrap();
+        let attached = json(&cdp
+            .cdp_request(
+                connection,
+                r#"{"id":1,"method":"Target.attachToTarget","params":{"targetId":"page-1"}}"#,
+            )
+            .unwrap());
+        let session = attached["result"]["sessionId"].as_str().unwrap();
+        let queued = json(&cdp
+            .cdp_request(
+                connection,
+                &format!(r#"{{"id":2,"sessionId":"{session}","method":"Page.navigate","params":{{"url":"https://example.test/payload"}}}}"#),
+            )
+            .unwrap());
+        let id = queued["result"]["obscuraAction"]["actionId"].as_u64().unwrap() as u32;
+        let shared = cdp
+            .shared_state
+            .host_action(EngineActionId::new(u64::from(id)))
+            .unwrap();
+        assert_eq!(shared.kind, "navigate");
+        assert_eq!(shared.payload["url"], "https://example.test/payload");
+        assert_eq!(cdp.shared_state.pending_host_action_count(), 1);
+        cdp.complete_action(id, r#"{"url":"https://example.test/payload","loaderId":"loader-payload"}"#)
+            .unwrap();
+        assert_eq!(cdp.shared_state.pending_host_action_count(), 0);
+        assert!(cdp.complete_action(id, r#"{"url":"https://example.test/late"}"#).is_err());
+        assert_eq!(cdp.targets["page-1"].url, "https://example.test/payload");
     }
 
     #[cfg(feature = "render")]

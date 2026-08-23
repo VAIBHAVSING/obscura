@@ -55,6 +55,12 @@ pub fn from_request(
         "Input.dispatchMouseEvent" | "Input.dispatchKeyEvent" | "Input.insertText" => {
             request.params.clone()
         }
+        "Page.captureScreenshot" => serde_json::json!({
+            "format": request.params.get("format").and_then(Value::as_str).unwrap_or("png"),
+        }),
+        "Page.printToPDF" => serde_json::json!({
+            "landscape": request.params.get("landscape").and_then(Value::as_bool).unwrap_or(false),
+        }),
         _ => return None,
     };
     let kind = match request.method.as_str() {
@@ -70,6 +76,8 @@ pub fn from_request(
         "Input.dispatchMouseEvent" => "dispatchMouseEvent",
         "Input.dispatchKeyEvent" => "dispatchKeyEvent",
         "Input.insertText" => "insertText",
+        "Page.captureScreenshot" => "screenshot",
+        "Page.printToPDF" => "pdf",
         _ => unreachable!("payload match and action kind match must stay aligned"),
     };
     Some(Ok(HostActionRequest {
@@ -185,5 +193,39 @@ mod tests {
         assert_eq!(action.kind, "reload");
         assert_eq!(action.payload["url"], "https://example.test/");
         assert_eq!(action.payload["extraHTTPHeaders"]["x-test"], "yes");
+    }
+
+    #[test]
+    fn maps_capture_payloads_in_shared_action_source_of_truth() {
+        let mut state = BrowserState::new();
+        let page = state.create_page(&state.default_context(), "about:blank").unwrap();
+        let screenshot = from_request(
+            &CdpRequest {
+                id: 1,
+                method: "Page.captureScreenshot".into(),
+                params: serde_json::json!({"format": "jpeg"}),
+                session_id: None,
+            },
+            &state,
+            page,
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(screenshot.kind, "screenshot");
+        assert_eq!(screenshot.payload["format"], "jpeg");
+        let pdf = from_request(
+            &CdpRequest {
+                id: 2,
+                method: "Page.printToPDF".into(),
+                params: serde_json::json!({"landscape": true}),
+                session_id: None,
+            },
+            &state,
+            page,
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(pdf.kind, "pdf");
+        assert_eq!(pdf.payload["landscape"], true);
     }
 }
