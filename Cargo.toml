@@ -13,7 +13,6 @@ members = [
     "crates/obscura-wasm",
     "crates/obscura",
 ]
-exclude = ["crates/obscura-node"]
 
 [workspace.package]
 version = "0.1.0"

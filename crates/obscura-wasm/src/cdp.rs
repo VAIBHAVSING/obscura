@@ -10,7 +10,7 @@
 use std::collections::{BTreeMap, HashMap, VecDeque};
 
 use base64::{engine::general_purpose::STANDARD as BASE64, Engine as _};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use serde_json::{json, Map, Value};
 use url::Url;
 use wasm_bindgen::prelude::*;
@@ -180,12 +180,16 @@ struct Request {
     session_id: Option<String>,
 }
 
-#[derive(Debug, Clone)]
-struct Action {
-    connection_id: u32,
-    request_id: Value,
-    session_id: Option<String>,
-    target_id: String,
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct RawHostActionFrame<'a> {
+    action_id: u32,
+    generation: u64,
+    kind: &'a str,
+    target_id: &'a str,
+    request_id: &'a Value,
+    session_id: Option<&'a str>,
+    payload: &'a Value,
 }
 
 struct PausedFetch {
@@ -231,7 +235,6 @@ pub struct PortableCdp {
     shared_state: BrowserState,
     targets: BTreeMap<String, Target>,
     connections: BTreeMap<u32, Connection>,
-    actions: BTreeMap<u32, Action>,
     next_connection_id: u32,
     next_loader_id: u32,
     io: obscura_cdp::portable_io::IoState,
@@ -275,7 +278,6 @@ impl PortableCdp {
             shared_state,
             targets,
             connections: BTreeMap::new(),
-            actions: BTreeMap::new(),
             next_connection_id: 0,
             next_loader_id: 0,
             io: obscura_cdp::portable_io::IoState::with_limits(128, MAX_STREAM_BYTES),
@@ -348,7 +350,8 @@ impl PortableCdp {
         }
         self.io.close_connection(shared_id);
         self.shared_state.close_connection(shared_id);
-        self.cancel_actions_where(|action| action.connection_id == connection_id);
+        self.shared_state
+            .cancel_host_actions_for_connection(shared_id);
         Ok(())
     }
 
@@ -386,20 +389,32 @@ impl PortableCdp {
     #[wasm_bindgen(js_name = completeAction)]
     pub fn complete_action(&mut self, action_id: u32, result_json: &str) -> Result<String, JsValue> {
         bounded(result_json, MAX_ACTION_RESULT_BYTES, "CDP action result")?;
-        let Some(action) = self.actions.get(&action_id).cloned() else {
-            return Err(js_error("stale or unknown CDP action"));
+        let shared_action_id = EngineActionId::new(u64::from(action_id));
+        let (request_id, session_id, target_id, action_is_live, is_navigation) = {
+            let metadata = self
+                .shared_state
+                .host_action_wire_view(shared_action_id)
+                .map_err(|_| js_error("stale or unknown CDP action"))?;
+            let target_id = format!("page-{}", metadata.metadata.target_page.get());
+            let action_is_live = self.action_is_live(&metadata.metadata, &target_id);
+            let is_navigation = matches!(metadata.kind, "navigate" | "reload" | "setDocumentContent");
+            (
+                metadata.metadata.request.clone(),
+                metadata.metadata.session_id.map(str::to_owned),
+                target_id,
+                action_is_live,
+                is_navigation,
+            )
         };
+        if !action_is_live {
+            self.shared_state.cancel_action(shared_action_id);
+            return Err(js_error("CDP action target session is no longer live"));
+        }
         // Actions are capabilities for a live target session, not durable work
         // items. A host can race a completion with detach/close, so validate
         // the ownership again immediately before accepting its result.
-        if !self.action_is_live(&action) {
-            self.actions.remove(&action_id);
-            self.shared_state.cancel_action(EngineActionId::new(u64::from(action_id)));
-            return Err(js_error("CDP action target session is no longer live"));
-        }
         let mut result: Value = serde_json::from_str(result_json)
             .map_err(|error| js_error(&format!("invalid CDP action result: {error}")))?;
-        let shared_action_id = EngineActionId::new(u64::from(action_id));
         let shared_result = if let Some(error) = result.get("error").and_then(Value::as_object) {
             let message = error.get("message").and_then(Value::as_str).unwrap_or("Portable host action failed");
             EngineActionResult::Failed(CdpFailure::host(message))
@@ -410,15 +425,9 @@ impl PortableCdp {
             .shared_state
             .validate_action_completion(shared_action_id, &shared_result)
         {
-            self.actions.remove(&action_id);
             self.shared_state.cancel_action(shared_action_id);
             return Err(js_error(&format!("stale or unknown CDP action: {error}")));
         }
-        let host_action = self
-            .shared_state
-            .host_action(shared_action_id)
-            .map_err(|error| js_error(&format!("shared CDP action payload is unavailable: {error}")))?;
-        let is_navigation = matches!(host_action.kind.as_str(), "navigate" | "reload" | "setDocumentContent");
         let is_failure = matches!(&shared_result, EngineActionResult::Failed(_));
 
         // Complete the shared record before entering the target's document
@@ -427,18 +436,17 @@ impl PortableCdp {
         match self.shared_state.complete_action(shared_action_id, shared_result) {
             Ok(()) | Err(CdpFailure::Host(_)) => {}
             Err(error) => {
-                self.actions.remove(&action_id);
                 self.shared_state.cancel_action(shared_action_id);
                 return Err(js_error(&format!("shared CDP action completion failed: {error}")));
             }
         }
         if is_navigation && !is_failure {
             if let Some(state) = result.get("__obscuraState").and_then(Value::as_object) {
-                let document_url = shared_page_id(&action.target_id)
+                let document_url = shared_page_id(&target_id)
                     .and_then(|page| self.shared_state.page(&page))
                     .map(|page| page.url.clone())
                     .unwrap_or_default();
-                if let Some(target) = self.targets.get_mut(&action.target_id) {
+                if let Some(target) = self.targets.get_mut(&target_id) {
                     if let Some(document_handle) = state.get("documentHandle").and_then(Value::as_u64) {
                         target.document_handle = u32::try_from(document_handle).map_err(|_| js_error("document handle exceeds u32"))?;
                     }
@@ -460,13 +468,12 @@ impl PortableCdp {
                 }
             }
         }
-        self.actions.remove(&action_id);
         let mut network_metadata = None;
         if let Value::Object(ref mut object) = result {
             network_metadata = object.remove("__obscuraNetwork");
         }
         if let Some(network_metadata) = network_metadata {
-            self.record_network_metadata(&action.target_id, &network_metadata)?;
+            self.record_network_metadata(&target_id, &network_metadata)?;
         }
         let response = if let Value::Object(mut object) = result {
             object.remove("__obscuraState");
@@ -477,17 +484,17 @@ impl PortableCdp {
                     .and_then(Value::as_str)
                     .unwrap_or("Portable host action failed");
                 cdp_error_response_with_data(
-                    &action.request_id,
+                    &request_id,
                     code,
                     message,
                     error.get("data"),
-                    action.session_id.as_deref(),
+                    session_id.as_deref(),
                 )
             } else {
-                cdp_result_response(&action.request_id, Value::Object(object), action.session_id.as_deref())
+                cdp_result_response(&request_id, Value::Object(object), session_id.as_deref())
             }
         } else {
-            cdp_result_response(&action.request_id, result, action.session_id.as_deref())
+            cdp_result_response(&request_id, result, session_id.as_deref())
         };
         Ok(serde_json::to_string(&response)
             .map_err(|error| js_error(&format!("CDP response serialization failed: {error}")))?)
@@ -663,6 +670,44 @@ impl PortableCdp {
         Ok(wire_id)
     }
 
+    pub(crate) fn restore_context(
+        &mut self,
+        context_id: u32,
+        snapshot: &[u8],
+    ) -> Result<u64, JsValue> {
+        let context = ContextId::new(u64::from(context_id));
+        let generation = self
+            .shared_state
+            .restore_context(&context, snapshot)
+            .map_err(|error| js_error(&format!("context restore failed: {error}")))?;
+        let cookie_json = self
+            .shared_state
+            .context_cookies_for_context_json(&context, 0)
+            .map_err(|error| js_error(&format!("restored context cookie serialization failed: {error}")))?;
+        let targets = self
+            .targets
+            .keys()
+            .filter(|target_id| {
+                shared_page_id(target_id)
+                    .and_then(|page| self.shared_state.context_for_page(&page).ok())
+                    == Some(context)
+            })
+            .cloned()
+            .collect::<Vec<_>>();
+        for target_id in targets {
+            let target = self
+                .targets
+                .get_mut(&target_id)
+                .expect("live context target remains present during synchronous restore");
+            target.core.cdp_clear_cookies();
+            target
+                .core
+                .cdp_import_cookies(&cookie_json, 0)
+                .map_err(|error| js_error(&format!("restored context cookie synchronization failed: {error}")))?;
+        }
+        Ok(generation)
+    }
+
     /// Process one request for the bounded byte ABI. Host-backed responses do
     /// not carry an inline `obscuraAction`; the action is delivered by
     /// `drain_raw_actions` so request, event, and action channels stay
@@ -707,25 +752,28 @@ impl PortableCdp {
         let mut frames = Vec::new();
         let mut bytes = 0usize;
         while frames.len() < max_items {
-            let Some(action) = self.shared_state.peek_host_action() else {
-                break;
+            let (action_id, frame) = {
+                let action = self
+                    .shared_state
+                    .peek_host_action_with_metadata()
+                    .map_err(|_| js_error("raw CDP action metadata is stale"))?;
+                let Some(action) = action else {
+                    break;
+                };
+                let action_id = action.action_id;
+                let target_id = format!("page-{}", action.metadata.target_page.get());
+                let frame = serde_json::to_vec(&RawHostActionFrame {
+                    action_id,
+                    generation: action.generation,
+                    kind: action.kind,
+                    target_id: &target_id,
+                    request_id: action.metadata.request,
+                    session_id: action.metadata.session_id,
+                    payload: action.payload,
+                })
+                .map_err(|error| js_error(&format!("CDP action serialization failed: {error}")))?;
+                (action_id, frame)
             };
-            let action_id = u32::try_from(action.action_id)
-                .map_err(|_| js_range_error("CDP action ID exceeds the raw ABI range"))?;
-            let metadata = self
-                .actions
-                .get(&action_id)
-                .ok_or_else(|| js_error("raw CDP action metadata is stale"))?;
-            let frame = serde_json::to_vec(&json!({
-                "actionId": action_id,
-                "generation": action.generation,
-                "kind": action.kind,
-                "targetId": metadata.target_id,
-                "requestId": metadata.request_id,
-                "sessionId": metadata.session_id,
-                "payload": action.payload,
-            }))
-            .map_err(|error| js_error(&format!("CDP action serialization failed: {error}")))?;
             let next = bytes
                 .checked_add(4)
                 .and_then(|value| value.checked_add(frame.len()))
@@ -737,7 +785,7 @@ impl PortableCdp {
                 break;
             }
             self.shared_state
-                .claim_host_action(EngineActionId::new(u64::from(action.action_id)))
+                .claim_host_action(EngineActionId::new(u64::from(action_id)))
                 .map_err(|error| js_error(&format!("raw CDP action queue is stale: {error}")))?;
             bytes = next;
             frames.push(frame);
@@ -782,11 +830,12 @@ impl PortableCdp {
         result: &[u8],
     ) -> Result<Vec<u8>, JsValue> {
         let shared_action_id = EngineActionId::new(u64::from(action_id));
-        let action = self
+        let expected_generation = self
             .shared_state
-            .host_action(shared_action_id)
+            .host_action_wire_view(shared_action_id)
+            .map(|action| action.generation)
             .map_err(|_| js_error("stale or unknown CDP action"))?;
-        if generation != action.generation {
+        if generation != expected_generation {
             return Err(js_error("stale CDP action generation"));
         }
         let result = std::str::from_utf8(result)
@@ -1714,9 +1763,12 @@ impl PortableCdp {
         if let Some(shared_response) = self.shared_portable_page_response(connection_id, &request, &target_id) {
             return shared_response;
         }
-        if let (Some(id), Some(page_id)) = (request.id.as_u64(), shared_page_id(&target_id)) {
+        if let Some(page_id) = shared_page_id(&target_id) {
             let shared_request = obscura_cdp::protocol::CdpRequest {
-                id,
+                // `from_request` only needs an engine-local numeric slot for
+                // dispatch. The exact wire ID remains in the shared action
+                // metadata and is restored by completeAction.
+                id: request.id.as_u64().unwrap_or(0),
                 method: request.method.clone(),
                 params: Value::Object(request.params.clone()),
                 session_id: request.session_id.clone(),
@@ -2064,13 +2116,32 @@ impl PortableCdp {
     }
 
     fn queue_action(&mut self, connection_id: u32, request: Request, target_id: String, kind: &str, payload: Value) -> Value {
+        let target_page = match shared_page_id(&target_id) {
+            Some(page) => page,
+            None => {
+                return cdp_error_response(
+                    &request.id,
+                    -32000,
+                    "target is not known",
+                    request.session_id.as_deref(),
+                );
+            }
+        };
         let shared_action = match self.shared_engine_action(&target_id, kind, &payload) {
             Ok(action) => action,
             Err(error) => return cdp_error_response(&request.id, -32000, error.to_string(), request.session_id.as_deref()),
         };
         let shared_action_id = match self
             .shared_state
-            .start_host_action(shared_action, kind.to_string(), payload.clone())
+            .start_host_action_with_metadata(
+                shared_action,
+                kind.to_string(),
+                payload,
+                ConnectionId::new(u64::from(connection_id)),
+                target_page,
+                request.id.clone(),
+                request.session_id.clone(),
+            )
         {
             Ok(id) => id,
             Err(error) => {
@@ -2097,17 +2168,15 @@ impl PortableCdp {
             // only the ready marker; the shared pending record remains until
             // the host calls completeAction.
             let _ = self.shared_state.claim_host_action(shared_action_id);
+        } else {
+            // The byte ABI delivers the queued action through
+            // drain_raw_actions. Return the exact empty CDP result envelope
+            // here and leave the ready marker untouched for that drain.
+            return cdp_result_response(&request.id, json!({}), request.session_id.as_deref());
         }
-        self.actions.insert(action_id, Action {
-            connection_id,
-            request_id: request.id.clone(),
-            session_id: request.session_id.clone(),
-            target_id: target_id.clone(),
-        });
         let host_action = match self.shared_state.host_action(shared_action_id) {
             Ok(action) => action,
             Err(error) => {
-                self.actions.remove(&action_id);
                 self.shared_state.cancel_action(shared_action_id);
                 return cdp_error_response(&request.id, -32000, error.to_string(), request.session_id.as_deref());
             }
@@ -2142,7 +2211,7 @@ impl PortableCdp {
 
     fn create_target_with_shared_page(
         &mut self,
-        context_id: &str,
+        _context_id: &str,
         url: &str,
         html: &str,
         shared_page: PageId,
@@ -2262,9 +2331,10 @@ impl PortableCdp {
             target.paused_fetches.clear();
         }
         self.shared_state.detach(shared_session);
-        self.cancel_actions_where(|action| {
-            action.connection_id == connection_id && action.session_id.as_deref() == Some(session_id)
-        });
+        self.shared_state.cancel_host_actions_for_session(
+            ConnectionId::new(u64::from(connection_id)),
+            session_id,
+        );
         self.discard_session_events(connection_id, session_id);
         self.queue_event(
             connection_id,
@@ -2319,7 +2389,9 @@ impl PortableCdp {
         // A target close can arrive while its host operation is in flight.
         // Completing one of those actions must be rejected, not applied to a
         // subsequent page with a coincidentally similar identifier.
-        self.cancel_actions_where(|action| action.target_id == target_id);
+        if let Some(page) = shared_page {
+            self.shared_state.cancel_host_actions_for_page(page);
+        }
         let mut pending_events: Vec<(u32, Option<String>)> = Vec::new();
         for (shared_session, shared_connection) in shared_sessions {
             let Some(connection_id) = u32::try_from(shared_connection.get()).ok() else { continue; };
@@ -2355,32 +2427,13 @@ impl PortableCdp {
         }
     }
 
-    fn action_is_live(&self, action: &Action) -> bool {
-        let Some(session_id) = action.session_id.as_deref() else {
-            return false;
-        };
+    fn action_is_live(&self, metadata: &obscura_cdp::state::HostActionMetadata<'_>, target_id: &str) -> bool {
+        let Some(session_id) = metadata.session_id else { return false; };
         let Some(shared_session) = shared_session_id(session_id) else { return false; };
-        self.shared_state.session_connection(shared_session)
-            == Some(ConnectionId::new(u64::from(action.connection_id)))
-            && self.shared_state.attached_page(shared_session)
-                == shared_page_id(&action.target_id)
-            && self.targets.contains_key(&action.target_id)
-    }
-
-    fn cancel_actions_where<F>(&mut self, mut predicate: F)
-    where
-        F: FnMut(&Action) -> bool,
-    {
-        let ids: Vec<u32> = self
-            .actions
-            .iter()
-            .filter_map(|(id, action)| predicate(action).then_some(*id))
-            .collect();
-        for id in ids {
-            self.actions.remove(&id);
-            let shared_id = EngineActionId::new(u64::from(id));
-            self.shared_state.cancel_action(shared_id);
-        }
+        let page = metadata.target_page;
+        self.shared_state.session_connection(shared_session) == Some(metadata.connection_id)
+            && self.shared_state.attached_page(shared_session) == Some(page)
+            && self.targets.contains_key(target_id)
     }
 
     fn target_info(&self, target_id: &str) -> Value {
@@ -3288,6 +3341,87 @@ mod tests {
     }
 
     #[test]
+    fn host_actions_preserve_numeric_string_and_null_request_ids() {
+        let mut cdp = PortableCdp::new("").unwrap();
+        let connection = cdp.open_connection().unwrap();
+        let attached = json(&cdp.cdp_request(
+            connection,
+            r#"{"id":1,"method":"Target.attachToTarget","params":{"targetId":"page-1","flatten":true}}"#,
+        ).unwrap());
+        let session = attached["result"]["sessionId"].as_str().unwrap().to_string();
+        for (request_id, expected_id) in [
+            (serde_json::json!(7), serde_json::json!(7)),
+            (serde_json::json!("string-request"), serde_json::json!("string-request")),
+            (Value::Null, Value::Null),
+        ] {
+            let request = serde_json::json!({
+                "id": request_id,
+                "sessionId": session,
+                "method": "Runtime.getIsolateId",
+                "params": {},
+            });
+            let queued = json(&cdp.cdp_request(connection, &request.to_string()).unwrap());
+            let action_id = queued["result"]["obscuraAction"]["actionId"].as_u64().unwrap() as u32;
+            let metadata = cdp
+                .shared_state
+                .host_action_metadata(EngineActionId::new(u64::from(action_id)))
+                .unwrap();
+            assert_eq!(metadata.request, &expected_id);
+            assert_eq!(metadata.target_page, PageId::new(1));
+            assert_eq!(metadata.session_id, Some(session.as_str()));
+            let completed = json(&cdp.complete_action(action_id, r#"{"result":{"value":true}}"#).unwrap());
+            assert_eq!(completed["id"], expected_id);
+            assert_eq!(completed["sessionId"], session);
+            assert_eq!(completed["result"]["result"]["value"], true);
+            assert!(cdp.complete_action(action_id, r#"{}"#).is_err());
+        }
+    }
+
+    #[test]
+    fn get_isolate_id_action_is_live_for_inline_and_raw_completion() {
+        let mut cdp = PortableCdp::new("").unwrap();
+        let connection = cdp.open_connection().unwrap();
+        let attached = json(&cdp.cdp_request(
+            connection,
+            r#"{"id":1,"method":"Target.attachToTarget","params":{"targetId":"page-1","flatten":true}}"#,
+        ).unwrap());
+        let session = attached["result"]["sessionId"].as_str().unwrap().to_string();
+
+        let raw_request = format!(
+            r#"{{"id":"raw-id","sessionId":"{session}","method":"Runtime.getIsolateId","params":{{}}}}"#
+        );
+        let raw_response = cdp.raw_cdp_request(connection, raw_request.as_bytes()).unwrap();
+        let expected_raw_response = format!(r#"{{"id":"raw-id","result":{{}},"sessionId":"{session}"}}"#);
+        assert_eq!(std::str::from_utf8(&raw_response).unwrap(), expected_raw_response);
+        let response: Value = serde_json::from_slice(&raw_response).unwrap();
+        assert_eq!(response, serde_json::json!({
+            "id": "raw-id",
+            "result": {},
+            "sessionId": session,
+        }));
+        assert!(cdp.drain_raw_actions(8, 1).is_err());
+        let frames = cdp.drain_raw_actions(8, obscura_cdp::protocol::MAX_OUTPUT_BYTES).unwrap();
+        assert_eq!(frames.len(), 1);
+        let action: Value = serde_json::from_slice(&frames[0]).unwrap();
+        assert_eq!(action["kind"], "getIsolateId");
+        assert_eq!(action["targetId"], "page-1");
+        assert_eq!(action["requestId"], "raw-id");
+        assert_eq!(action["sessionId"], session);
+        let action_id = action["actionId"].as_u64().unwrap() as u32;
+        let generation = action["generation"].as_u64().unwrap();
+        assert!(cdp
+            .raw_complete_action(action_id, generation.saturating_add(1), br#"{"result":{"value":41}}"#)
+            .is_err());
+        let result = cdp
+            .raw_complete_action(action_id, generation, br#"{"result":{"value":42}}"#)
+            .unwrap();
+        let completed: Value = serde_json::from_slice(&result).unwrap();
+        assert_eq!(completed["id"], "raw-id");
+        assert_eq!(completed["sessionId"], session);
+        assert_eq!(completed["result"]["result"]["value"], 42);
+    }
+
+    #[test]
     fn host_action_errors_remain_cdp_errors() {
         let mut cdp = PortableCdp::new("").unwrap();
         let connection = cdp.open_connection().unwrap();
@@ -4175,5 +4309,50 @@ mod shared_engine_tests {
         CdpEngine::close_page(&mut cdp, &page).unwrap();
         CdpEngine::dispose_context(&mut cdp, &context).unwrap();
         assert_eq!(CdpEngine::page_snapshot(&cdp, &page), Err(CdpFailure::UnknownPage(page)));
+    }
+
+    #[test]
+    fn context_restore_keeps_identity_and_syncs_every_live_page_cookie_jar() {
+        let mut cdp = PortableCdp::new("").unwrap();
+        let context = ContextId::new(1);
+        let second_page = CdpEngine::create_page(
+            &mut cdp,
+            &context,
+            "https://example.test/second",
+        ).unwrap();
+        let snapshot = serde_json::to_vec(&serde_json::json!({
+            "schemaVersion": obscura_cdp::state::CONTEXT_SNAPSHOT_VERSION,
+            "options": {
+                "user_agent": "Restored",
+                "locale": null,
+                "timezone_id": null,
+                "storage_state": null
+            },
+            "cookies": [{
+                "name": "sid",
+                "value": "profile",
+                "domain": "example.test",
+                "path": "/",
+                "secure": false,
+                "httpOnly": true,
+                "sameSite": "Lax",
+                "expires": null,
+                "hostOnly": false
+            }]
+        })).unwrap();
+
+        let generation = cdp.restore_context(1, &snapshot).unwrap();
+
+        assert_eq!(generation, 2);
+        assert_eq!(cdp.shared_state.context(&context).unwrap().id, context);
+        assert_eq!(cdp.shared_state.context(&context).unwrap().options.user_agent.as_deref(), Some("Restored"));
+        assert_eq!(CdpEngine::page_snapshot(&cdp, &second_page).unwrap().context_id, context);
+        for target_id in ["page-1", "page-2"] {
+            let cookies: Value = serde_json::from_str(
+                &cdp.targets[target_id].core.cdp_all_cookies(0).unwrap(),
+            ).unwrap();
+            assert_eq!(cookies[0]["name"], "sid");
+            assert_eq!(cookies[0]["value"], "profile");
+        }
     }
 }

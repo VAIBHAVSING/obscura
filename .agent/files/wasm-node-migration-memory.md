@@ -1,5 +1,117 @@
 # Obscura Node and WebAssembly migration memory
 
+## 2026-08-25 TypeScript browser package checkpoint
+
+This section supersedes the old Node package layout and native-addon guidance
+below. The implementation is on branch `wasm-node-migration`.
+
+### Current package architecture
+
+- The root is an npm workspace (`packages/*`) with strict TypeScript builds.
+- `packages/browser` is the public `@obscura/browser` package. Its default
+  `createBrowser()` API starts the bundled WASM browser in the Node process and
+  opens no listening port. Each page Worker is a Node V8 isolate boundary and
+  its page realm is a separate `vm` context.
+- The package exports `@obscura/browser/cdp`, `/storage`, `/s3`, `/transport`,
+  `/puppeteer`, and `/playwright`. Puppeteer uses the in-memory CDP transport.
+  Playwright lazily opens a loopback CDP listener because its public connection
+  API requires an endpoint. An external port is otherwise opt-in.
+- `packages/protocol` owns the bounded, versioned request/event transport for a
+  future remote browser service. The public browser API is intentionally
+  placement-neutral even though only local placement is implemented today.
+- `packages/storage` owns the generic `ProfileStore`, atomic/versioned local
+  storage, encrypted profile containers, and a SigV4 S3-compatible adapter.
+  Any object store can be supported by implementing `ProfileStore`; the API is
+  not coupled to AWS.
+- `packages/runtime` is the private TypeScript Worker/V8 host. The previous
+  `node/obscura` and `node/wasm-v8-harness` JavaScript trees were migrated into
+  the workspace. `crates/obscura-node` and all native-addon discovery/config
+  paths were removed. `.node` inputs now fail with
+  `ERR_OBSCURA_NATIVE_UNSUPPORTED`.
+- The distributable includes the render-enabled wasm-bindgen artifact and does
+  not download Chromium or another browser during installation.
+
+### Chrome-style profile semantics
+
+- A browser context owns the stable profile identity. The browser runtime may
+  host many contexts; each context can use ephemeral state, the default local
+  store, a caller-selected directory, an S3-compatible store, or an arbitrary
+  `ProfileStore` implementation.
+- `context.backup()` creates an explicit checkpoint. Dirty contexts use a
+  debounced automatic checkpoint by default, and normal `close()` requires a
+  final checkpoint. `close({ persist: "skip" })` is the deliberate force-close
+  escape hatch.
+- Writes use optimistic versions so two writers cannot silently overwrite one
+  profile. The local adapter uses cross-process lock files, atomic rename,
+  fsync, bounded reads, and restrictive permissions. The S3 adapter uses ETags
+  and conditional writes. Profile containers optionally use AES-256-GCM.
+- Rust `BrowserState::restore_context` validates the full versioned snapshot
+  before mutation, keeps the context/page identities, replaces durable state,
+  and increments generations so pre-restore work becomes stale. The WASM
+  `contextRestore` ABI synchronizes restored cookies into every live page core.
+- Current snapshot schema v1 persists cookies and context options. Full
+  localStorage, sessionStorage, IndexedDB, cache, permissions, and service
+  worker persistence are not implemented yet and must not be described as
+  complete Chrome user-data-directory parity.
+
+### Current verification evidence
+
+- Strict TypeScript build for all four packages: passed.
+- Public browser suite: 14 passed, 2 optional integration skips, zero failed.
+  This includes a real save, browser destruction, and cookie restore through
+  the rebuilt bundled WASM artifact. Direct screenshot capture also has a
+  regression proving it works without opening a CDP listener.
+- Private runtime suite: 62 passed, 6 real-artifact environment skips, zero
+  failed. Protocol and storage suites: 6/6 each.
+- Fresh tarball install with `--ignore-scripts`: passed direct in-process
+  navigation; `processInfo()` reported no host or port.
+- Render-enabled `obscura-wasm` release nextest: 86/86 passed.
+- Render-enabled `obscura-cdp` release nextest: 203/203 passed with 3
+  configured skips.
+- The literal all-workspace `--features render` build cannot link
+  `obscura-wasm` on the native target because Cargo feature unification pulls
+  native V8 into its `cdylib` and V8's local-exec TLS relocations are invalid
+  in a shared object. Verify WASM separately, then run the workspace gate with
+  `--exclude obscura-wasm`.
+- The workspace gate exposed and fixed a missing scoped `base64::Engine` import
+  in the CDP IO tests. The portable CDP release suite then passed 54/54. The
+  workspace-excluding-WASM rerun was externally terminated during V8 test
+  binary linking (exit 143), so it has no final test summary.
+- The exact release `obscura-cli` render build passed after the final Rust
+  change. A final packed-tarball install contained 80 entries, included the
+  WASM artifact and README, contained no `.node` file, navigated successfully,
+  and opened no listening port. `npm audit` reported zero vulnerabilities.
+- The 33/33 obstacle course is unavailable because the companion
+  `../obscura-benchmark` checkout is absent.
+- A separate Luna stress audit completed 30/30 complex data-URL navigations,
+  20/20 multi-context isolation and cookie checks, 4/4 cookie profile restores,
+  public-site navigation, timeout recovery, and idempotent close checks. Its
+  no-listener screenshot defect was fixed and covered by the public suite.
+  Remaining observed gaps are Promise-returning `evaluate()` support, redirect
+  following in direct `Page.goto()`, and the bounded real-artifact test not
+  completing within 20 seconds.
+- The bundled WASM is 16,492,936 bytes with SHA-256
+  `f03d26579c85330ef729be58e32b231f331af04080ea40980caa49fdab8b91fd`.
+
+### Current commands
+
+```bash
+npm run build
+npm test
+
+cargo build --release -p obscura-wasm \
+  --target wasm32-unknown-unknown --features render
+wasm-bindgen --target nodejs --out-dir "$WASM_BINDGEN_OUT" \
+  target/wasm32-unknown-unknown/release/obscura_wasm.wasm
+npm run prepare:wasm -w @obscura/browser -- "$WASM_BINDGEN_OUT"
+
+cargo nextest run --release --features render -p obscura-wasm
+cargo nextest run --release --features render --workspace \
+  --exclude obscura-wasm --no-fail-fast
+CARGO_INCREMENTAL=0 CARGO_BUILD_JOBS=2 \
+  cargo build --release -p obscura-cli --bins --features render
+```
+
 Latest verified implementation commit:
 `8519ce8` (`feat: add bounded raw wasm cdp abi`).
 The prior checkpoint was `c78d6a5` (`feat: route portable navigation network state through WASM`).

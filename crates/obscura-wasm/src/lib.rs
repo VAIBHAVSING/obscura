@@ -2230,6 +2230,21 @@ pub fn context_import(browser_id: u32, snapshot: &[u8]) -> Result<u32, JsValue> 
     with_raw_browser(browser_id, |browser| browser.import_context(snapshot))
 }
 
+/// Replace the durable profile state of an existing context while retaining
+/// its identity and live pages. The returned generation lets hosts order
+/// checkpoints without interpreting the opaque snapshot.
+#[wasm_bindgen(js_name = contextRestore)]
+pub fn context_restore(
+    browser_id: u32,
+    context_id: u32,
+    snapshot: &[u8],
+) -> Result<u64, JsValue> {
+    if snapshot.len() > obscura_cdp::state::MAX_CONTEXT_SNAPSHOT_BYTES {
+        return Err(js_sys::RangeError::new("context snapshot exceeds the byte limit").into());
+    }
+    with_raw_browser(browser_id, |browser| browser.restore_context(context_id, snapshot))
+}
+
 /// Host-side stream ingress for IO.read/IO.close. The raw CDP request path
 /// remains JSON-free for transport callers; this typed helper is used only
 /// when a Node host has already fetched a response body or PDF payload.
@@ -2537,6 +2552,39 @@ mod tests {
 
         assert!(cdp_complete_actions(browser, &[1, 0, 0], 0).is_err());
         connection_close(browser, connection).unwrap();
+        browser_close(browser).unwrap();
+    }
+
+    #[test]
+    fn raw_context_restore_reuses_the_existing_profile_identity() {
+        let browser = browser_create(b"").unwrap();
+        let snapshot = serde_json::to_vec(&serde_json::json!({
+            "schemaVersion": obscura_cdp::state::CONTEXT_SNAPSHOT_VERSION,
+            "options": {
+                "user_agent": "Restored profile",
+                "locale": null,
+                "timezone_id": null,
+                "storage_state": null
+            },
+            "cookies": [{
+                "name": "session",
+                "value": "kept",
+                "domain": "example.test",
+                "path": "/",
+                "secure": false,
+                "httpOnly": true,
+                "sameSite": "Lax",
+                "expires": null,
+                "hostOnly": false
+            }]
+        })).unwrap();
+
+        assert_eq!(context_restore(browser, 1, &snapshot).unwrap(), 2);
+        let restored: serde_json::Value =
+            serde_json::from_slice(&context_export(browser, 1).unwrap()).unwrap();
+        assert_eq!(restored["options"]["user_agent"], "Restored profile");
+        assert_eq!(restored["cookies"][0]["name"], "session");
+        assert!(context_export(browser, 2).is_err());
         browser_close(browser).unwrap();
     }
 

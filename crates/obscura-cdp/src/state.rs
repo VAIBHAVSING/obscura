@@ -6,6 +6,7 @@
 //! transport and asynchronous actions.
 
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
+use std::io::{self, Write};
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -15,7 +16,7 @@ use crate::engine::{
     PageId, PageSnapshot,
 };
 use crate::action::{HostAction, MAX_ACTION_BYTES};
-use crate::protocol::{CdpEvent, MAX_METHOD_BYTES};
+use crate::protocol::{CdpEvent, MAX_MESSAGE_BYTES, MAX_METHOD_BYTES, MAX_SESSION_BYTES};
 
 pub const MAX_CONTEXTS: usize = 256;
 pub const CONTEXT_SNAPSHOT_VERSION: u32 = 1;
@@ -106,7 +107,7 @@ pub struct ContextState {
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
-#[serde(rename_all = "camelCase")]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct ContextCookieState {
     pub name: String,
     pub value: String,
@@ -129,6 +130,34 @@ pub struct ContextSnapshot {
     pub schema_version: u32,
     pub options: ContextOptions,
     pub cookies: Vec<ContextCookieState>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ContextSnapshotOptions {
+    user_agent: Option<String>,
+    locale: Option<String>,
+    timezone_id: Option<String>,
+    storage_state: Option<Vec<u8>>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct ValidatedContextSnapshot {
+    schema_version: u32,
+    options: ContextSnapshotOptions,
+    cookies: Vec<ContextCookieState>,
+}
+
+impl From<ContextSnapshotOptions> for ContextOptions {
+    fn from(options: ContextSnapshotOptions) -> Self {
+        Self {
+            user_agent: options.user_agent,
+            locale: options.locale,
+            timezone_id: options.timezone_id,
+            storage_state: options.storage_state,
+        }
+    }
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -268,6 +297,60 @@ struct PendingAction {
 struct PendingHostAction {
     kind: String,
     payload: Value,
+    #[serde(default)]
+    wire: Option<PendingHostWireMetadata>,
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+struct PendingHostWireMetadata {
+    connection_id: ConnectionId,
+    target_page: PageId,
+    request: Value,
+    #[serde(default)]
+    session_id: Option<String>,
+}
+
+/// Borrowed wire metadata for one shared host action. The typed target page
+/// stays with the action so adapters do not need a duplicate target map.
+pub struct HostActionMetadata<'a> {
+    pub connection_id: ConnectionId,
+    pub target_page: PageId,
+    pub request: &'a Value,
+    pub session_id: Option<&'a str>,
+}
+
+/// Borrowed host action and wire metadata view used by the raw adapter. It
+/// avoids cloning the payload and looking up the same pending action twice
+/// before the adapter decides whether a complete frame fits.
+pub struct HostActionWireView<'a> {
+    pub action_id: u32,
+    pub generation: u64,
+    pub kind: &'a str,
+    pub payload: &'a Value,
+    pub metadata: HostActionMetadata<'a>,
+}
+
+struct ByteCounter(usize);
+
+impl Write for ByteCounter {
+    fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+        self.0 = self
+            .0
+            .checked_add(bytes.len())
+            .ok_or_else(|| io::Error::new(io::ErrorKind::Other, "serialized value length overflow"))?;
+        Ok(bytes.len())
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
+    }
+}
+
+fn request_id_wire_len(value: &Value) -> Result<usize, CdpFailure> {
+    let mut counter = ByteCounter(0);
+    serde_json::to_writer(&mut counter, value)
+        .map_err(|_| CdpFailure::invalid_argument("host action request is not serializable"))?;
+    Ok(counter.0)
 }
 
 /// Bounded browser identity state shared by transport adapters.
@@ -388,30 +471,87 @@ impl BrowserState {
         Ok(bytes)
     }
 
-    /// Import a host-provided context snapshot and allocate a fresh monotonic
-    /// context identity. Validation happens before allocation so malformed
-    /// state cannot leave a partially-created context behind.
-    pub fn import_context(&mut self, bytes: &[u8]) -> Result<ContextId, CdpFailure> {
+    fn validate_context_snapshot(
+        bytes: &[u8],
+    ) -> Result<(ContextOptions, BTreeMap<(String, String, String), ContextCookieState>), CdpFailure> {
         if bytes.len() > MAX_CONTEXT_SNAPSHOT_BYTES {
             return Err(CdpFailure::invalid_argument("context snapshot exceeds the byte limit"));
         }
-        let snapshot: ContextSnapshot = serde_json::from_slice(bytes)
+        let snapshot: ValidatedContextSnapshot = serde_json::from_slice(bytes)
             .map_err(|error| CdpFailure::invalid_argument(format!("invalid context snapshot: {error}")))?;
         if snapshot.schema_version != CONTEXT_SNAPSHOT_VERSION {
             return Err(CdpFailure::invalid_argument("unsupported context snapshot schema"));
         }
+        let options = ContextOptions::from(snapshot.options);
+        Self::validate_options(&options)?;
         if snapshot.cookies.len() > MAX_COOKIE_COUNT {
             return Err(CdpFailure::invalid_argument("context snapshot has too many cookies"));
+        }
+        let cookie_bytes = serde_json::to_vec(&snapshot.cookies)
+            .map_err(|error| CdpFailure::host(format!("cookie serialization failed: {error}")))?;
+        if cookie_bytes.len() > MAX_COOKIE_BYTES {
+            return Err(CdpFailure::invalid_argument("context snapshot cookie state exceeds the byte limit"));
         }
         let mut cookies = BTreeMap::new();
         for cookie in snapshot.cookies {
             validate_cookie(&cookie)?;
             let key = (cookie.domain.clone(), cookie.name.clone(), cookie.path.clone());
-            cookies.insert(key, cookie);
+            if cookies.insert(key, cookie).is_some() {
+                return Err(CdpFailure::invalid_argument("context snapshot contains duplicate cookies"));
+            }
         }
-        let id = self.create_context(snapshot.options)?;
+        Ok((options, cookies))
+    }
+
+    /// Import a host-provided context snapshot and allocate a fresh monotonic
+    /// context identity. Validation happens before allocation so malformed
+    /// state cannot leave a partially-created context behind.
+    pub fn import_context(&mut self, bytes: &[u8]) -> Result<ContextId, CdpFailure> {
+        let (options, cookies) = Self::validate_context_snapshot(bytes)?;
+        let id = self.create_context(options)?;
         self.cookies.insert(id, cookies);
         Ok(id)
+    }
+
+    /// Replace the durable state of an existing browser context without
+    /// changing its identity or disturbing live pages. Snapshot validation
+    /// and generation-overflow checks finish before any state is changed.
+    pub fn restore_context(&mut self, id: &ContextId, bytes: &[u8]) -> Result<u64, CdpFailure> {
+        self.ensure_open()?;
+        let generation = self
+            .contexts
+            .get(id)
+            .ok_or(CdpFailure::UnknownContext(*id))?
+            .generation
+            .checked_add(1)
+            .ok_or(CdpFailure::IdExhausted)?;
+        let (options, cookies) = Self::validate_context_snapshot(bytes)?;
+        let page_generations = self
+            .pages
+            .values()
+            .filter(|page| page.context_id == *id)
+            .map(|page| {
+                page.document_generation
+                    .checked_add(1)
+                    .map(|generation| (page.id, generation))
+                    .ok_or(CdpFailure::IdExhausted)
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+
+        let context = self
+            .contexts
+            .get_mut(id)
+            .expect("validated context remains present during synchronous restore");
+        context.options = options;
+        context.generation = generation;
+        self.cookies.insert(*id, cookies);
+        for (page, generation) in page_generations {
+            self.pages
+                .get_mut(&page)
+                .expect("validated page remains present during synchronous restore")
+                .document_generation = generation;
+        }
+        Ok(generation)
     }
 
     pub fn page(&self, id: &PageId) -> Option<&PageState> {
@@ -456,12 +596,75 @@ impl BrowserState {
         })
     }
 
+    /// Borrow the optional adapter-owned wire metadata for a host action.
+    /// Metadata-free legacy actions intentionally return `UnknownAction`.
+    pub fn host_action_metadata(&self, id: ActionId) -> Result<HostActionMetadata<'_>, CdpFailure> {
+        Ok(self.host_action_wire_view(id)?.metadata)
+    }
+
+    /// Borrow one pending host action together with its exact wire metadata.
+    /// This is the single source lookup used by completion and raw drain.
+    pub fn host_action_wire_view(&self, id: ActionId) -> Result<HostActionWireView<'_>, CdpFailure> {
+        let pending = self.actions.get(&id).ok_or(CdpFailure::UnknownAction(id))?;
+        let host = pending.host.as_ref().ok_or(CdpFailure::UnknownAction(id))?;
+        let wire = host.wire.as_ref().ok_or(CdpFailure::UnknownAction(id))?;
+        Ok(HostActionWireView {
+            action_id: u32::try_from(id.get()).map_err(|_| CdpFailure::IdExhausted)?,
+            generation: pending.document_generation.unwrap_or(pending.generation),
+            kind: &host.kind,
+            payload: &host.payload,
+            metadata: HostActionMetadata {
+                connection_id: wire.connection_id,
+                target_page: wire.target_page,
+                request: &wire.request,
+                session_id: wire.session_id.as_deref(),
+            },
+        })
+    }
+
+    pub fn cancel_host_actions_for_connection(&mut self, connection: ConnectionId) -> usize {
+        self.cancel_host_actions_where(|metadata| metadata.connection_id == connection)
+    }
+
+    pub fn cancel_host_actions_for_session(&mut self, connection: ConnectionId, session: &str) -> usize {
+        self.cancel_host_actions_where(|metadata| {
+            metadata.connection_id == connection && metadata.session_id.as_deref() == Some(session)
+        })
+    }
+
+    pub fn cancel_host_actions_for_page(&mut self, page: PageId) -> usize {
+        let ids = self
+            .actions
+            .iter()
+            .filter_map(|(id, pending)| {
+                let host = pending.host.as_ref()?;
+                let targets_page = pending.page == Some(page)
+                    || host
+                        .wire
+                        .as_ref()
+                        .is_some_and(|wire| wire.target_page == page);
+                targets_page.then_some(*id)
+            })
+            .collect();
+        self.cancel_host_action_ids(ids)
+    }
+
     /// Inspect the oldest ready host action without consuming it. Adapters use
     /// this to enforce their own complete-frame byte limit before taking the
     /// payload out of the shared queue.
     pub fn peek_host_action(&self) -> Option<HostAction> {
         let id = self.ready_host_actions.as_ref()?.front().copied()?;
         self.host_action(id).ok()
+    }
+
+    /// Borrow the oldest ready host action and its exact wire metadata in one
+    /// lookup. The pending record remains owned by shared state until the
+    /// caller claims the ready marker.
+    pub fn peek_host_action_with_metadata(&self) -> Result<Option<HostActionWireView<'_>>, CdpFailure> {
+        let Some(id) = self.ready_host_actions.as_ref().and_then(|queue| queue.front()).copied() else {
+            return Ok(None);
+        };
+        self.host_action_wire_view(id).map(Some)
     }
 
     /// Remove one action from the ready queue while retaining its pending
@@ -607,9 +810,20 @@ impl BrowserState {
         now_secs: u64,
     ) -> Result<Vec<ContextCookieState>, CdpFailure> {
         let context = self.context_for_page(page)?;
+        self.context_cookies_for_context(&context, now_secs)
+    }
+
+    pub fn context_cookies_for_context(
+        &self,
+        context: &ContextId,
+        now_secs: u64,
+    ) -> Result<Vec<ContextCookieState>, CdpFailure> {
+        if !self.contexts.contains_key(context) {
+            return Err(CdpFailure::UnknownContext(*context));
+        }
         Ok(self
             .cookies
-            .get(&context)
+            .get(context)
             .into_iter()
             .flat_map(|cookies| cookies.values())
             .filter(|cookie| !cookie_expired(cookie, now_secs))
@@ -618,7 +832,16 @@ impl BrowserState {
     }
 
     pub fn context_cookies_json(&self, page: &PageId, now_secs: u64) -> Result<String, CdpFailure> {
-        let cookies = self.context_cookies(page, now_secs)?;
+        let context = self.context_for_page(page)?;
+        self.context_cookies_for_context_json(&context, now_secs)
+    }
+
+    pub fn context_cookies_for_context_json(
+        &self,
+        context: &ContextId,
+        now_secs: u64,
+    ) -> Result<String, CdpFailure> {
+        let cookies = self.context_cookies_for_context(context, now_secs)?;
         let value = serde_json::to_string(&cookies)
             .map_err(|error| CdpFailure::host(format!("cookie serialization failed: {error}")))?;
         if value.len() > MAX_COOKIE_BYTES {
@@ -1226,11 +1449,17 @@ impl BrowserState {
         let doomed: Vec<ActionId> = self
             .actions
             .iter()
-            .filter_map(|(action, pending)| (pending.page == Some(id)).then_some(*action))
+            .filter_map(|(action, pending)| {
+                let targets_page = pending.page == Some(id)
+                    || pending
+                        .host
+                        .as_ref()
+                        .and_then(|host| host.wire.as_ref())
+                        .is_some_and(|wire| wire.target_page == id);
+                targets_page.then_some(*action)
+            })
             .collect();
-        for action in doomed {
-            self.remove_action(action);
-        }
+        self.cancel_host_action_ids(doomed);
         Ok(())
     }
 }
@@ -1286,6 +1515,12 @@ impl CdpEngine for BrowserState {
             return Err(CdpFailure::UnknownContext(*id));
         }
         self.cookies.remove(id);
+        let context_actions: Vec<ActionId> = self
+            .actions
+            .iter()
+            .filter_map(|(action, pending)| (pending.context == Some(*id)).then_some(*action))
+            .collect();
+        self.cancel_host_action_ids(context_actions);
         let pages: Vec<PageId> = self
             .pages
             .values()
@@ -1362,11 +1597,11 @@ impl CdpEngine for BrowserState {
     }
 
     fn complete_action(&mut self, id: ActionId, result: ActionResult) -> Result<(), CdpFailure> {
-        let Some(pending) = self.actions.get(&id).cloned() else {
+        let Some(pending) = self.actions.get(&id) else {
             return Err(CdpFailure::UnknownAction(id));
         };
         self.validate_action_result(&result)?;
-        if let Err(error) = self.validate_pending_action(id, &pending) {
+        if let Err(error) = self.validate_pending_action(id, pending) {
             self.remove_action(id);
             return Err(error);
         }
@@ -1376,10 +1611,12 @@ impl CdpEngine for BrowserState {
             return Err(failure.clone());
         }
 
-        if let (Some(page), ActionResult::Value(value)) = (pending.page, &result) {
-            if matches!(&pending.action, EngineAction::Navigate { .. }) {
-                self.apply_navigation_metadata(page, value)?;
-            }
+        let navigation_page = match &pending.action {
+            EngineAction::Navigate { page, .. } => Some(*page),
+            _ => None,
+        };
+        if let (Some(page), ActionResult::Value(value)) = (navigation_page, &result) {
+            self.apply_navigation_metadata(page, value)?;
         }
         self.remove_action(id);
         Ok(())
@@ -1402,7 +1639,72 @@ impl BrowserState {
         if kind.is_empty() || kind.len().saturating_add(payload_bytes.len()) > MAX_ACTION_BYTES {
             return Err(CdpFailure::invalid_argument("host action payload exceeds the byte limit"));
         }
-        self.start_action_record(action, Some(PendingHostAction { kind, payload }))
+        self.start_action_record(action, Some(PendingHostAction { kind, payload, wire: None }))
+    }
+
+    /// Start a host-backed action with the exact adapter wire identity owned
+    /// by shared state. The request value is retained until completion so the
+    /// response cannot drift from the request that created the action.
+    pub fn start_host_action_with_metadata(
+        &mut self,
+        action: EngineAction,
+        kind: impl Into<String>,
+        payload: Value,
+        connection_id: ConnectionId,
+        target_page: PageId,
+        request: Value,
+        session_id: Option<String>,
+    ) -> Result<ActionId, CdpFailure> {
+        self.ensure_open()?;
+        if !self.pages.contains_key(&target_page) {
+            return Err(CdpFailure::UnknownPage(target_page));
+        }
+        let action_page = match &action {
+            EngineAction::Navigate { page, .. }
+            | EngineAction::FetchResource { page, .. }
+            | EngineAction::Evaluate { page, .. }
+            | EngineAction::CallFunctionOn { page, .. }
+            | EngineAction::GetProperties { page, .. }
+            | EngineAction::ReleaseObject { page, .. }
+            | EngineAction::FetchScript { page, .. }
+            | EngineAction::ResolveModule { page, .. }
+            | EngineAction::DeliverInput { page, .. }
+            | EngineAction::CaptureScreenshot { page, .. }
+            | EngineAction::PrintToPdf { page, .. } => Some(*page),
+            EngineAction::LoadContext { .. }
+            | EngineAction::StoreContext { .. }
+            | EngineAction::Wake { .. } => None,
+        };
+        if action_page.is_some_and(|page| page != target_page) {
+            return Err(CdpFailure::invalid_argument(
+                "host action target page does not match action page",
+            ));
+        }
+        let kind = kind.into();
+        let payload_bytes = serde_json::to_vec(&payload)
+            .map_err(|_| CdpFailure::invalid_argument("host action payload is not serializable"))?;
+        if kind.is_empty() || kind.len().saturating_add(payload_bytes.len()) > MAX_ACTION_BYTES {
+            return Err(CdpFailure::invalid_argument("host action payload exceeds the byte limit"));
+        }
+        if request_id_wire_len(&request)? > MAX_MESSAGE_BYTES {
+            return Err(CdpFailure::invalid_argument("host action request exceeds the byte limit"));
+        }
+        if session_id.as_ref().is_some_and(|session| session.len() > MAX_SESSION_BYTES) {
+            return Err(CdpFailure::invalid_argument("host action session ID exceeds the byte limit"));
+        }
+        self.start_action_record(
+            action,
+            Some(PendingHostAction {
+                kind,
+                payload,
+                wire: Some(PendingHostWireMetadata {
+                    connection_id,
+                    target_page,
+                    request,
+                    session_id,
+                }),
+            }),
+        )
     }
 
     /// Validate a completion without consuming it. WASM uses this before it
@@ -1487,13 +1789,16 @@ impl BrowserState {
         } else {
             None
         };
+        let generation = context
+            .and_then(|context| self.contexts.get(&context).map(|state| state.generation))
+            .unwrap_or(self.generation);
         self.actions.insert(
             id,
             PendingAction {
                 action,
                 page,
                 context,
-                generation: self.generation,
+                generation,
                 document_generation,
                 host,
             },
@@ -1505,7 +1810,15 @@ impl BrowserState {
     }
 
     fn validate_pending_action(&self, id: ActionId, pending: &PendingAction) -> Result<(), CdpFailure> {
-        if pending.generation != self.generation {
+        let current_generation = if let Some(context) = pending.context {
+            let Some(context) = self.contexts.get(&context) else {
+                return Err(CdpFailure::StaleAction(id));
+            };
+            context.generation
+        } else {
+            self.generation
+        };
+        if pending.generation != current_generation {
             return Err(CdpFailure::StaleAction(id));
         }
         if let Some(page_id) = pending.page {
@@ -1537,6 +1850,44 @@ impl BrowserState {
             self.ready_host_actions = None;
         }
         removed
+    }
+
+    fn cancel_host_actions_where<F>(&mut self, mut predicate: F) -> usize
+    where
+        F: FnMut(&HostActionMetadata<'_>) -> bool,
+    {
+        let ids: Vec<ActionId> = self
+            .actions
+            .iter()
+            .filter_map(|(id, pending)| {
+                let host = pending.host.as_ref()?;
+                let wire = host.wire.as_ref()?;
+                let metadata = HostActionMetadata {
+                    connection_id: wire.connection_id,
+                    target_page: wire.target_page,
+                    request: &wire.request,
+                    session_id: wire.session_id.as_deref(),
+                };
+                predicate(&metadata).then_some(*id)
+            })
+            .collect();
+        self.cancel_host_action_ids(ids)
+    }
+
+    fn cancel_host_action_ids(&mut self, ids: Vec<ActionId>) -> usize {
+        let count = ids.len();
+        if count == 0 {
+            return 0;
+        }
+        let doomed: BTreeSet<ActionId> = ids.into_iter().collect();
+        self.actions.retain(|id, _| !doomed.contains(id));
+        if let Some(queue) = self.ready_host_actions.as_mut() {
+            queue.retain(|queued| !doomed.contains(queued));
+        }
+        if self.ready_host_actions.as_ref().is_some_and(|queue| queue.is_empty()) {
+            self.ready_host_actions = None;
+        }
+        count
     }
 
     fn apply_navigation_metadata(&mut self, page: PageId, value: &Value) -> Result<(), CdpFailure> {
@@ -1723,6 +2074,180 @@ mod tests {
     }
 
     #[test]
+    fn host_action_wire_metadata_round_trips_and_cancellation_is_scoped() {
+        let mut state = BrowserState::new();
+        let page = state.create_page(&state.default_context(), "about:blank").unwrap();
+        let connection = state.open_connection().unwrap();
+        let session = state.attach(connection, page).unwrap();
+        let request = serde_json::json!(7);
+        let action = state
+            .start_host_action_with_metadata(
+                EngineAction::Evaluate { page, expression: "1".to_string() },
+                "evaluate",
+                serde_json::json!({"expression": "1"}),
+                connection,
+                page,
+                request.clone(),
+                Some("page-1-session-1".to_string()),
+            )
+            .unwrap();
+        let metadata = state.host_action_metadata(action).unwrap();
+        assert_eq!(metadata.connection_id, connection);
+        assert_eq!(metadata.target_page, page);
+        assert_eq!(metadata.request, &request);
+        assert_eq!(metadata.session_id, Some("page-1-session-1"));
+        let encoded = serde_json::to_vec(&state).unwrap();
+        let restored: BrowserState = serde_json::from_slice(&encoded).unwrap();
+        let restored_metadata = restored.host_action_metadata(action).unwrap();
+        assert_eq!(restored_metadata.connection_id, connection);
+        assert_eq!(restored_metadata.target_page, page);
+        assert_eq!(restored_metadata.request, &request);
+        assert_eq!(restored_metadata.session_id, Some("page-1-session-1"));
+        let legacy_wire: PendingHostAction = serde_json::from_value(serde_json::json!({
+            "kind": "evaluate",
+            "payload": {"expression": "1"},
+            "wire": {
+                "connection_id": connection.get(),
+                "target_page": page.get(),
+                "request": "legacy-id",
+                "session_id": "page-1-session-1"
+            }
+        })).unwrap();
+        assert_eq!(legacy_wire.wire.as_ref().unwrap().request, Value::String("legacy-id".into()));
+        let metadata_free: PendingHostAction = serde_json::from_value(serde_json::json!({
+            "kind": "evaluate",
+            "payload": null
+        })).unwrap();
+        assert!(metadata_free.wire.is_none());
+
+        let legacy = state
+            .start_host_action(
+                EngineAction::Evaluate { page, expression: "2".to_string() },
+                "evaluate",
+                serde_json::json!({"expression": "2"}),
+            )
+            .unwrap();
+        assert!(matches!(
+            state.host_action_metadata(legacy),
+            Err(CdpFailure::UnknownAction(id)) if id == legacy
+        ));
+        assert_eq!(state.cancel_host_actions_for_session(connection, "page-1-session-1"), 1);
+        assert_eq!(state.host_action(action), Err(CdpFailure::UnknownAction(action)));
+        assert!(state.host_action(legacy).is_ok());
+        assert_eq!(state.peek_host_action().unwrap().action_id, legacy.get() as u32);
+        // Raw adapters require wire metadata. A metadata-free legacy action
+        // at the ready-queue head is rejected in a controlled way rather
+        // than allowing a malformed frame or a head-blocking retry loop.
+        assert!(matches!(
+            state.peek_host_action_with_metadata(),
+            Err(CdpFailure::UnknownAction(id)) if id == legacy
+        ));
+        assert_eq!(state.cancel_host_actions_for_page(page), 1);
+        assert!(state.host_action(legacy).is_err());
+        assert_eq!(state.detach(session), Some(page));
+    }
+
+    #[test]
+    fn host_action_wire_metadata_bounds_request_and_session_without_leaking_state() {
+        let mut state = BrowserState::new();
+        let page = state.create_page(&state.default_context(), "about:blank").unwrap();
+        let connection = state.open_connection().unwrap();
+        let oversized_request = Value::String("x".repeat(MAX_MESSAGE_BYTES));
+        assert!(matches!(
+            state.start_host_action_with_metadata(
+                EngineAction::Evaluate { page, expression: "1".to_string() },
+                "evaluate",
+                serde_json::json!({"expression": "1"}),
+                connection,
+                page,
+                oversized_request,
+                None,
+            ),
+            Err(CdpFailure::InvalidArgument(message)) if message.contains("request")
+        ));
+        let oversized_session = "s".repeat(MAX_SESSION_BYTES + 1);
+        assert!(matches!(
+            state.start_host_action_with_metadata(
+                EngineAction::Evaluate { page, expression: "1".to_string() },
+                "evaluate",
+                serde_json::json!({"expression": "1"}),
+                connection,
+                page,
+                Value::Null,
+                Some(oversized_session),
+            ),
+            Err(CdpFailure::InvalidArgument(message)) if message.contains("session")
+        ));
+        assert_eq!(state.pending_host_action_count(), 0);
+    }
+
+    #[test]
+    fn host_action_request_id_wire_lengths_match_exact_json_for_all_value_shapes() {
+        let values = [
+            Value::Null,
+            serde_json::json!(true),
+            serde_json::json!(-42.5),
+            serde_json::json!("quoted\\\"line\n"),
+            serde_json::json!([null, false, {"id": "value"}]),
+        ];
+        for value in values {
+            assert_eq!(
+                request_id_wire_len(&value).unwrap(),
+                serde_json::to_vec(&value).unwrap().len()
+            );
+        }
+
+        let oversized = serde_json::json!({"id": "x".repeat(MAX_MESSAGE_BYTES)});
+        assert!(request_id_wire_len(&oversized).unwrap() > MAX_MESSAGE_BYTES);
+    }
+
+    #[test]
+    fn host_action_wire_target_is_validated_and_page_close_cancels_wake_actions() {
+        let mut state = BrowserState::new();
+        let page = state.create_page(&state.default_context(), "about:blank").unwrap();
+        let other_page = state.create_page(&state.default_context(), "about:blank").unwrap();
+        let connection = state.open_connection().unwrap();
+        let mismatch = state.start_host_action_with_metadata(
+            EngineAction::Evaluate { page, expression: "1".to_string() },
+            "evaluate",
+            serde_json::json!({"expression": "1"}),
+            connection,
+            other_page,
+            serde_json::json!(1),
+            None,
+        );
+        assert!(matches!(
+            mismatch,
+            Err(CdpFailure::InvalidArgument(message)) if message.contains("target page")
+        ));
+        assert!(matches!(
+            state.start_host_action_with_metadata(
+                EngineAction::Wake { deadline_millis: 0 },
+                "getIsolateId",
+                Value::Null,
+                connection,
+                PageId::new(999),
+                serde_json::json!(2),
+                None,
+            ),
+            Err(CdpFailure::UnknownPage(page_id)) if page_id == PageId::new(999)
+        ));
+        let wake = state
+            .start_host_action_with_metadata(
+                EngineAction::Wake { deadline_millis: 0 },
+                "getIsolateId",
+                Value::Null,
+                connection,
+                page,
+                serde_json::json!(3),
+                None,
+            )
+            .unwrap();
+        state.close_page(&page).unwrap();
+        assert_eq!(state.host_action(wake), Err(CdpFailure::UnknownAction(wake)));
+    }
+
+    #[test]
     fn close_is_terminal_and_rejects_new_state() {
         let mut state = BrowserState::new();
         state.close();
@@ -1789,6 +2314,95 @@ mod tests {
             state.import_context(&serde_json::to_vec(&unknown).unwrap()),
             Err(CdpFailure::InvalidArgument(_))
         ));
+    }
+
+    #[test]
+    fn context_restore_replaces_durable_state_and_invalidates_old_work() {
+        let mut state = BrowserState::new();
+        let context = state.default_context();
+        let page = state.create_page(&context, "https://example.test/").unwrap();
+        state
+            .merge_context_cookies(
+                &page,
+                vec![ContextCookieState {
+                    name: "old".to_string(),
+                    value: "discarded".to_string(),
+                    domain: "example.test".to_string(),
+                    path: "/".to_string(),
+                    secure: false,
+                    http_only: false,
+                    same_site: "Lax".to_string(),
+                    expires: None,
+                    host_only: false,
+                }],
+                0,
+            )
+            .unwrap();
+        let page_action = state.start_action(EngineAction::Evaluate {
+            page,
+            expression: "document.cookie".to_string(),
+        }).unwrap();
+        let context_action = state.start_action(EngineAction::StoreContext { context }).unwrap();
+        let prior_context_generation = state.context(&context).unwrap().generation;
+        let prior_document_generation = state.page(&page).unwrap().document_generation;
+        let snapshot = serde_json::to_vec(&serde_json::json!({
+            "schemaVersion": CONTEXT_SNAPSHOT_VERSION,
+            "options": {
+                "user_agent": "Obscura restored",
+                "locale": "en-GB",
+                "timezone_id": "Europe/London",
+                "storage_state": [1, 2, 3]
+            },
+            "cookies": [{
+                "name": "sid",
+                "value": "restored",
+                "domain": "example.test",
+                "path": "/",
+                "secure": true,
+                "httpOnly": true,
+                "sameSite": "Strict",
+                "expires": null,
+                "hostOnly": false
+            }]
+        })).unwrap();
+
+        let generation = state.restore_context(&context, &snapshot).unwrap();
+
+        assert_eq!(generation, prior_context_generation + 1);
+        let restored = state.context(&context).unwrap();
+        assert_eq!(restored.generation, generation);
+        assert_eq!(restored.options.user_agent.as_deref(), Some("Obscura restored"));
+        assert_eq!(restored.options.storage_state.as_deref(), Some(&[1, 2, 3][..]));
+        assert_eq!(state.page(&page).unwrap().document_generation, prior_document_generation + 1);
+        let cookies = state.context_cookies(&page, 0).unwrap();
+        assert_eq!(cookies.len(), 1);
+        assert_eq!(cookies[0].name, "sid");
+        assert_eq!(cookies[0].value, "restored");
+        assert_eq!(state.complete_action(page_action, ActionResult::unit()), Err(CdpFailure::StaleAction(page_action)));
+        assert_eq!(state.complete_action(context_action, ActionResult::unit()), Err(CdpFailure::StaleAction(context_action)));
+    }
+
+    #[test]
+    fn context_restore_rejects_invalid_nested_state_without_mutation() {
+        let mut state = BrowserState::new();
+        let context = state.default_context();
+        let page = state.create_page(&context, "about:blank").unwrap();
+        let before = state.export_context(&context).unwrap();
+        let generation = state.context(&context).unwrap().generation;
+        let document_generation = state.page(&page).unwrap().document_generation;
+        let invalid = serde_json::to_vec(&serde_json::json!({
+            "schemaVersion": CONTEXT_SNAPSHOT_VERSION,
+            "options": {"unexpected": true},
+            "cookies": []
+        })).unwrap();
+
+        assert!(matches!(
+            state.restore_context(&context, &invalid),
+            Err(CdpFailure::InvalidArgument(_))
+        ));
+        assert_eq!(state.export_context(&context).unwrap(), before);
+        assert_eq!(state.context(&context).unwrap().generation, generation);
+        assert_eq!(state.page(&page).unwrap().document_generation, document_generation);
     }
 
     #[test]

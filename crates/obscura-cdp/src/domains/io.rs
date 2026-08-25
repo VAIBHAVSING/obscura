@@ -56,6 +56,8 @@ pub async fn handle(method: &str, params: &Value, ctx: &mut CdpContext) -> Resul
 
 #[cfg(test)]
 mod tests {
+    use base64::Engine as _;
+
     use super::*;
 
     fn decode(s: &str) -> Vec<u8> {
