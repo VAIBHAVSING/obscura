@@ -11,6 +11,8 @@ import { local, openProfile, sealProfile, type ProfileStore } from "./internal/s
 const PACKAGE_VERSION = "0.1.0-portable";
 const DEFAULT_BACKUP_DEBOUNCE_MS = 1_000;
 const profileLeases = new WeakMap<ProfileStore, Set<string>>();
+let sharedDefaultBrowserPromise: Promise<BrowserVM> | undefined;
+let sharedDefaultBrowser: BrowserVM | undefined;
 
 export interface BrowserOptions {
   modulePath?: string;
@@ -486,10 +488,15 @@ export class BrowserVM {
 
   async close(options: ContextCloseOptions = {}): Promise<void> {
     if (this.#closed) return;
-    for (const context of [...this.#contextSet]) await context.close(options);
-    this.#closed = true;
-    await this.#client.close();
-    await this.server.close();
+    clearSharedDefaultBrowser(this);
+    try {
+      for (const context of [...this.#contextSet]) await context.close(options);
+      this.#closed = true;
+      await this.#client.close();
+      await this.server.close();
+    } finally {
+      clearSharedDefaultBrowser(this);
+    }
   }
 
   #ensureOpen(): void {
@@ -499,8 +506,32 @@ export class BrowserVM {
 
 export function version(): string { return PACKAGE_VERSION; }
 
+function clearSharedDefaultBrowser(browser: BrowserVM): void {
+  if (sharedDefaultBrowser !== browser) return;
+  sharedDefaultBrowser = undefined;
+  sharedDefaultBrowserPromise = undefined;
+}
+
 export async function createBrowser(options: BrowserOptions = {}): Promise<BrowserVM> {
   if (options === null || typeof options !== "object" || Array.isArray(options)) throw new TypeError("browser options must be an object");
+  // The unconfigured embedded browser is process-global so repeated callers
+  // reuse the already initialized Worker/V8/WASM runtime. Configured browsers
+  // remain independent because profiles, persistence, CDP, and transport
+  // settings are browser-wide state.
+  if (Object.keys(options).length === 0) {
+    if (sharedDefaultBrowserPromise) return sharedDefaultBrowserPromise;
+    const promise = BrowserVM.create(options);
+    sharedDefaultBrowserPromise = promise;
+    void promise.then(
+      (browser) => {
+        if (sharedDefaultBrowserPromise === promise) sharedDefaultBrowser = browser;
+      },
+      () => {
+        if (sharedDefaultBrowserPromise === promise) sharedDefaultBrowserPromise = undefined;
+      },
+    );
+    return promise;
+  }
   return BrowserVM.create(options);
 }
 
