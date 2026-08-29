@@ -5,7 +5,7 @@
 //! and the future WASM dispatcher can use while a host remains responsible for
 //! transport and asynchronous actions.
 
-use std::collections::{BTreeMap, BTreeSet, VecDeque};
+use std::collections::{btree_map::Entry, BTreeMap, BTreeSet, VecDeque};
 use std::io::{self, Write};
 
 use serde::{Deserialize, Serialize};
@@ -361,6 +361,7 @@ pub struct BrowserState {
     display: BTreeMap<PageId, PageDisplayState>,
     fetch_resolutions: BTreeMap<PageId, VecDeque<Value>>,
     cookies: BTreeMap<ContextId, BTreeMap<(String, String, String), ContextCookieState>>,
+    #[serde(default)]
     history: BTreeMap<PageId, PageHistoryState>,
     connections: BTreeSet<ConnectionId>,
     sessions: BTreeMap<SessionId, PageId>,
@@ -789,7 +790,12 @@ impl BrowserState {
     }
 
     pub fn reset_navigation_history(&mut self, page: &PageId) -> Result<(), CdpFailure> {
-        let history = self.history.get_mut(page).ok_or(CdpFailure::UnknownPage(*page))?;
+        if !self.pages.contains_key(page) {
+            return Err(CdpFailure::UnknownPage(*page));
+        }
+        let Some(history) = self.history.get_mut(page) else {
+            return Ok(());
+        };
         if let Some(current) = history.entries.get(history.current_index).cloned() {
             history.entries = vec![current];
             history.current_index = 0;
@@ -1247,49 +1253,91 @@ impl BrowserState {
         if let Some(url) = url {
             Self::validate_url(url)?;
         }
-        let page = self.pages.get_mut(id).ok_or(CdpFailure::UnknownPage(*id))?;
-        let previous_url = page.url.clone();
-        if let Some(url) = url {
-            page.url = url.to_string();
-        }
-        if let Some(title) = title {
-            page.title = title.to_string();
-        }
-        if let Some(loader_id) = loader_id {
-            page.loader_id = loader_id.to_string();
-        }
-        if let Some(document_generation) = document_generation {
-            page.document_generation = document_generation;
-        }
-        if let Some(history) = self.history.get_mut(id) {
-            if let Some(url) = url {
-                if url != previous_url {
-                    history.entries.truncate(history.current_index.saturating_add(1));
-                    let next_id = history
-                        .entries
-                        .iter()
-                        .map(|entry| entry.id)
-                        .max()
-                        .unwrap_or(0)
-                        .checked_add(1)
-                        .ok_or(CdpFailure::IdExhausted)?;
-                    history.entries.push(PageHistoryEntry {
-                        id: next_id,
-                        url: url.to_string(),
-                        user_typed_url: url.to_string(),
-                        title: page.title.clone(),
-                        transition_type: "typed".to_string(),
-                    });
-                    history.current_index = history.entries.len().saturating_sub(1);
-                    if history.entries.len() > MAX_HISTORY_ENTRIES {
-                        history.entries.remove(0);
-                        history.current_index = history.current_index.saturating_sub(1);
+        match self.history.entry(*id) {
+            Entry::Occupied(history) => {
+                let page = self.pages.get_mut(id).ok_or(CdpFailure::UnknownPage(*id))?;
+                let previous_url = page.url.clone();
+                if let Some(url) = url {
+                    page.url = url.to_string();
+                }
+                if let Some(title) = title {
+                    page.title = title.to_string();
+                }
+                if let Some(loader_id) = loader_id {
+                    page.loader_id = loader_id.to_string();
+                }
+                if let Some(document_generation) = document_generation {
+                    page.document_generation = document_generation;
+                }
+                let history = history.into_mut();
+                if let Some(url) = url {
+                    if url != previous_url {
+                        history.entries.truncate(history.current_index.saturating_add(1));
+                        let next_id = history
+                            .entries
+                            .iter()
+                            .map(|entry| entry.id)
+                            .max()
+                            .unwrap_or(0)
+                            .checked_add(1)
+                            .ok_or(CdpFailure::IdExhausted)?;
+                        history.entries.push(PageHistoryEntry {
+                            id: next_id,
+                            url: url.to_string(),
+                            user_typed_url: url.to_string(),
+                            title: page.title.clone(),
+                            transition_type: "typed".to_string(),
+                        });
+                        history.current_index = history.entries.len().saturating_sub(1);
+                        if history.entries.len() > MAX_HISTORY_ENTRIES {
+                            history.entries.remove(0);
+                            history.current_index = history.current_index.saturating_sub(1);
+                        }
+                    }
+                }
+                if let Some(title) = title {
+                    if let Some(current) = history.entries.get_mut(history.current_index) {
+                        current.title = title.to_string();
                     }
                 }
             }
-            if let Some(title) = title {
-                if let Some(current) = history.entries.get_mut(history.current_index) {
-                    current.title = title.to_string();
+            Entry::Vacant(history) => {
+                let page = self.pages.get_mut(id).ok_or(CdpFailure::UnknownPage(*id))?;
+                let previous_url = page.url.clone();
+                let url_changed = url.is_some_and(|url| url != previous_url);
+                let previous_title = url_changed.then(|| page.title.clone());
+                if let Some(url) = url {
+                    page.url = url.to_string();
+                }
+                if let Some(title) = title {
+                    page.title = title.to_string();
+                }
+                if let Some(loader_id) = loader_id {
+                    page.loader_id = loader_id.to_string();
+                }
+                if let Some(document_generation) = document_generation {
+                    page.document_generation = document_generation;
+                }
+                if let Some(previous_title) = previous_title {
+                    history.insert(PageHistoryState {
+                        current_index: 1,
+                        entries: vec![
+                            PageHistoryEntry {
+                                id: 1,
+                                url: previous_url.clone(),
+                                user_typed_url: previous_url,
+                                title: previous_title,
+                                transition_type: "typed".to_string(),
+                            },
+                            PageHistoryEntry {
+                                id: 2,
+                                url: page.url.clone(),
+                                user_typed_url: page.url.clone(),
+                                title: page.title.clone(),
+                                transition_type: "typed".to_string(),
+                            },
+                        ],
+                    });
                 }
             }
         }
@@ -1554,19 +1602,6 @@ impl CdpEngine for BrowserState {
                 loader_id: format!("loader-{id}-1"),
                 document_generation: self.generation,
                 network: PageNetworkState::default(),
-            },
-        );
-        self.history.insert(
-            id,
-            PageHistoryState {
-                current_index: 0,
-                entries: vec![PageHistoryEntry {
-                    id: 1,
-                    url: url.to_string(),
-                    user_typed_url: url.to_string(),
-                    title: String::new(),
-                    transition_type: "typed".to_string(),
-                }],
             },
         );
         Ok(id)
@@ -2003,6 +2038,85 @@ mod tests {
         assert_eq!(state.pending_host_action_count(), 0);
         assert!(!state.has_ready_host_actions());
         assert!(state.host_action(action).is_err());
+    }
+
+    #[test]
+    fn page_history_is_lazy_until_url_change_and_round_trips() {
+        let mut state = BrowserState::new();
+        let page = state.create_page(&state.default_context(), "about:blank").unwrap();
+        assert!(state.history(&page).is_none());
+
+        state
+            .update_page(&page, None, Some("Initial"), None, None)
+            .unwrap();
+        assert!(state.history(&page).is_none());
+        assert_eq!(state.reset_navigation_history(&page), Ok(()));
+        assert_eq!(
+            state.reset_navigation_history(&PageId::new(999)),
+            Err(CdpFailure::UnknownPage(PageId::new(999)))
+        );
+        let snapshot = serde_json::to_value(&state).unwrap();
+        assert_eq!(snapshot["history"], serde_json::json!({}));
+        let restored: BrowserState = serde_json::from_value(snapshot).unwrap();
+        assert!(restored.history(&page).is_none());
+
+        state
+            .update_page(
+                &page,
+                Some("https://example.test/next"),
+                Some("Next"),
+                None,
+                None,
+            )
+            .unwrap();
+        let history = state.history(&page).unwrap();
+        assert_eq!(history.current_index, 1);
+        assert_eq!(history.entries.len(), 2);
+        assert_eq!(history.entries[0].url, "about:blank");
+        assert_eq!(history.entries[0].title, "Initial");
+        assert_eq!(history.entries[1].url, "https://example.test/next");
+        assert_eq!(history.entries[1].title, "Next");
+
+        let encoded = serde_json::to_vec(&state).unwrap();
+        let restored: BrowserState = serde_json::from_slice(&encoded).unwrap();
+        assert_eq!(restored.history(&page), state.history(&page));
+    }
+
+    #[test]
+    fn page_history_deserializes_absent_and_legacy_populated_fields() {
+        let mut absent = serde_json::to_value(BrowserState::new()).unwrap();
+        absent
+            .as_object_mut()
+            .expect("browser state serializes as an object")
+            .remove("history");
+        let restored: BrowserState = serde_json::from_value(absent).unwrap();
+        assert!(restored.history.is_empty());
+
+        let mut legacy = serde_json::to_value({
+            let mut state = BrowserState::new();
+            state
+                .create_page(&state.default_context(), "about:blank")
+                .unwrap();
+            state
+        })
+        .unwrap();
+        legacy["history"] = serde_json::json!({
+            "1": {
+                "current_index": 0,
+                "entries": [{
+                    "id": 1,
+                    "url": "about:blank",
+                    "userTypedURL": "about:blank",
+                    "title": "",
+                    "transitionType": "typed"
+                }]
+            }
+        });
+        let restored: BrowserState = serde_json::from_value(legacy).unwrap();
+        let history = restored.history(&PageId::new(1)).unwrap();
+        assert_eq!(history.current_index, 0);
+        assert_eq!(history.entries[0].url, "about:blank");
+        assert_eq!(history.entries[0].user_typed_url, "about:blank");
     }
 
     #[test]
