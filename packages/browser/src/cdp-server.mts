@@ -264,6 +264,7 @@ class PageTarget {
     this.url = "about:blank";
     this.title = "";
     this.worker = null;
+    this.startPromise = null;
     this.sessions = new Set();
     this.remoteObjects = new Map();
     this.portableCdpConnections = new Map();
@@ -273,35 +274,62 @@ class PageTarget {
     this.networkFlushPaused = false;
     this.nextRemoteId = 1;
     this.viewport = { width: 800, height: 600, deviceScaleFactor: 1 };
+    this.embeddedClaimed = false;
     this.closed = false;
   }
 
   async start() {
-    if (this.worker) return;
-    this.worker = await this.server.workerFactory(this.server.modulePath, {
-      ...this.server.workerOptions,
-    });
-    await this.worker.ready(this.server.readyTimeoutMs);
-    const status = await this.worker.bridgeStatus();
-    if (!status.loaded) {
-      await this.worker.bootstrapEvaluate("undefined", {
-        html: "",
-        documentMetadata: { url: this.url, referrer: "", encoding: "UTF-8" },
-        timeoutMs: 1_000,
-      });
+    if (this.startPromise) {
+      await this.startPromise;
+      return;
     }
-    this.networkFlushTimer = setInterval(() => {
-      // Fetch interception may pause a parser/resource request while the
-      // navigation host action is awaiting network I/O. Poll portable CDP
-      // events during that await so the client can continue/fulfill/fail it.
-      void this.flushPortableNetworkEvents({ allowWhilePaused: true });
-    }, 25);
-    this.networkFlushTimer.unref?.();
+    if (this.worker) return;
+    if (this.closed) throw cdpError(-32000, `Target ${this.id} is closed`);
+    if (!this.startPromise) {
+      const startPromise = (async () => {
+        const worker = await this.server.workerFactory(this.server.modulePath, {
+          ...this.server.workerOptions,
+        });
+        if (this.closed) {
+          await worker.close().catch(() => undefined);
+          throw cdpError(-32000, `Target ${this.id} is closed`);
+        }
+        this.worker = worker;
+        try {
+          await worker.ready(this.server.readyTimeoutMs);
+          const status = await worker.bridgeStatus();
+          if (!status.loaded) {
+            await worker.bootstrapEvaluate("undefined", {
+              html: "",
+              documentMetadata: { url: this.url, referrer: "", encoding: "UTF-8" },
+              timeoutMs: 1_000,
+            });
+          }
+          this.networkFlushTimer = setInterval(() => {
+            // Fetch interception may pause a parser/resource request while the
+            // navigation host action is awaiting network I/O. Poll portable CDP
+            // events during that await so the client can continue/fulfill/fail it.
+            void this.flushPortableNetworkEvents({ allowWhilePaused: true });
+          }, 25);
+          this.networkFlushTimer.unref?.();
+        } catch (error) {
+          if (this.worker === worker) this.worker = null;
+          await worker.close().catch(() => undefined);
+          throw error;
+        }
+      })();
+      this.startPromise = startPromise;
+      void startPromise.finally(() => {
+        if (this.startPromise === startPromise) this.startPromise = null;
+      }).catch(() => undefined);
+    }
+    await this.startPromise;
   }
 
   async close() {
     if (this.closed) return;
     this.closed = true;
+    await this.startPromise?.catch(() => undefined);
     if (this.networkFlushTimer) {
       clearInterval(this.networkFlushTimer);
       this.networkFlushTimer = null;
@@ -480,6 +508,18 @@ class PageTarget {
     }
   }
 
+  async memorySnapshot() {
+    if (!this.worker) {
+      return { targetId: this.id, contextId: this.contextId, started: false };
+    }
+    return {
+      targetId: this.id,
+      contextId: this.contextId,
+      started: true,
+      worker: await this.worker.memorySnapshot({ requestTimeoutMs: this.server.requestTimeoutMs }),
+    };
+  }
+
   async pdf(params = {}) {
     await this.start();
     const viewportWidth = params.viewportWidth ?? this.viewport.width;
@@ -631,11 +671,16 @@ class PageTarget {
   async portableCdpCommand(connectionId, command) {
     await this.start();
     if (this.portableCdpRawMode !== false && typeof this.worker.portableCdpRawAbiVersion === "function") {
-      try {
-        const abi = await this.worker.portableCdpRawAbiVersion({ requestTimeoutMs: this.server.requestTimeoutMs });
-        this.portableCdpRawMode = abi === 2;
-      } catch {
-        this.portableCdpRawMode = false;
+      // The ABI is fixed for this worker. Re-probing on every command adds an
+      // IPC round trip and can queue Fetch.continueRequest behind the paused
+      // navigation that it needs to unblock.
+      if (this.portableCdpRawMode === null) {
+        try {
+          const abi = await this.worker.portableCdpRawAbiVersion({ requestTimeoutMs: this.server.requestTimeoutMs });
+          this.portableCdpRawMode = abi === 2;
+        } catch {
+          this.portableCdpRawMode = false;
+        }
       }
       if (this.portableCdpRawMode) {
         const routed = await this.portableCdpRawCommand(connectionId, command);
@@ -902,7 +947,14 @@ export class ObscuraCdpServer {
       (existsSync(sourceBootstrap) ? sourceBootstrap : existsSync(builtBootstrap) ? builtBootstrap : undefined);
     this.host = host;
     this.port = port;
-    this.workerOptions = { ...workerOptions, ...(this.bootstrapPath ? { bootstrapPath: this.bootstrapPath } : {}) };
+    this.workerOptions = {
+      ...workerOptions,
+      resourceLimits: {
+        maxYoungGenerationSizeMb: 16,
+        ...(workerOptions.resourceLimits ?? {}),
+      },
+      ...(this.bootstrapPath ? { bootstrapPath: this.bootstrapPath } : {}),
+    };
     this.workerFactory = workerFactory;
     this.readyTimeoutMs = readyTimeoutMs;
     this.requestTimeoutMs = requestTimeoutMs;
@@ -946,6 +998,78 @@ export class ObscuraCdpServer {
     return `${targetId}-session-${this.sessionCounter}`;
   }
 
+  claimInitialTarget(contextId = "default") {
+    if ([...this.connections].some((connection) => connection.discoverTargets || connection.autoAttach)) return null;
+    const target = [...this.targets.values()].find((candidate) =>
+      candidate.contextId === contextId &&
+      candidate.url === "about:blank" &&
+      !candidate.closed &&
+      !candidate.embeddedClaimed &&
+      candidate.sessions.size === 0
+    );
+    if (!target) return null;
+    target.embeddedClaimed = true;
+    return target.id;
+  }
+
+  async captureScreenshot(targetId, params = {}) {
+    const target = this.targets.get(targetId);
+    if (!target || target.closed) throw cdpError(-32000, `Target ${targetId} was not found`);
+    return target.screenshot(params);
+  }
+
+  async capturePdf(targetId, params = {}) {
+    const target = this.targets.get(targetId);
+    if (!target || target.closed) throw cdpError(-32000, `Target ${targetId} was not found`);
+    return target.pdf({
+      landscape: Boolean(params.landscape),
+      printBackground: Boolean(params.printBackground),
+      scale: params.scale,
+    });
+  }
+
+  async navigateTarget(targetId, url, params = {}) {
+    const target = this.targets.get(targetId);
+    if (!target || target.closed) throw cdpError(-32000, `Target ${targetId} was not found`);
+    return target.navigate(url, {
+      ...params,
+      allowPrivateNetwork: this.allowPrivateNetwork,
+      requestTimeoutMs: params.timeout ?? this.requestTimeoutMs,
+    });
+  }
+
+  async evaluateTarget(targetId, expression) {
+    const target = this.targets.get(targetId);
+    if (!target || target.closed) throw cdpError(-32000, `Target ${targetId} was not found`);
+    return target.evaluate(expression);
+  }
+
+  setTargetViewport(targetId, { width, height, deviceScaleFactor = 1 } = {}) {
+    const target = this.targets.get(targetId);
+    if (!target || target.closed) throw cdpError(-32000, `Target ${targetId} was not found`);
+    if (!Number.isSafeInteger(width) || width < 1 || width > 4096 ||
+        !Number.isSafeInteger(height) || height < 1 || height > 4096) {
+      throw cdpError(-32602, "Viewport dimensions must be integers between 1 and 4096");
+    }
+    if (typeof deviceScaleFactor !== "number" || !Number.isFinite(deviceScaleFactor) || deviceScaleFactor <= 0) {
+      throw cdpError(-32602, "Viewport deviceScaleFactor must be a positive finite number");
+    }
+    target.viewport = { width, height, deviceScaleFactor };
+  }
+
+  async closeTarget(targetId) {
+    const target = this.targets.get(targetId);
+    if (!target || target.closed) return false;
+    await this.#closeTarget(target);
+    return true;
+  }
+
+  async createEmbeddedTarget(contextId = "default") {
+    const target = await this.createTarget("about:blank", contextId);
+    target.embeddedClaimed = true;
+    return target.id;
+  }
+
   async createTarget(url = "about:blank", contextId = "default") {
     if (!this.contexts.has(contextId)) throw cdpError(-32000, `Browser context ${contextId} was not found`);
     const source = [...this.targets.values()].filter((candidate) => candidate.contextId === contextId).at(-1);
@@ -986,7 +1110,6 @@ export class ObscuraCdpServer {
     if (!this.runtimeStarted) {
       const target = new PageTarget(this, this.allocateTargetId());
       this.targets.set(target.id, target);
-      await target.start();
       this.runtimeStarted = true;
     }
     if (!listen || this.server) return this;
@@ -1048,12 +1171,19 @@ export class ObscuraCdpServer {
     let targets = [...this.targets.values()].filter((candidate) => candidate.contextId === contextId);
     if (targets.length === 0) targets = [await this.createTarget("about:blank", contextId)];
     for (const target of targets) {
+      await target.start();
       if (typeof target.worker?.portableCdpRawContextRestore !== "function") {
         throw cdpError(-32601, "This Obscura WASM artifact does not support profile snapshots");
       }
       await this.#restoreTargetSnapshot(target, snapshot);
     }
     return 1;
+  }
+
+  async memorySnapshots(contextId = "default") {
+    if (!this.contexts.has(contextId)) throw cdpError(-32000, `Browser context ${contextId} was not found`);
+    const targets = [...this.targets.values()].filter((candidate) => candidate.contextId === contextId);
+    return Promise.all(targets.map((target) => target.memorySnapshot()));
   }
 
   get defaultTarget() {

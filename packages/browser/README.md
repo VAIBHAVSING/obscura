@@ -57,6 +57,43 @@ Call `context.backup()` for an explicit checkpoint. Automatic debounced
 checkpoints are enabled by default. `close({ persist: "skip" })` is available
 for a deliberate force-close.
 
+## Crash-isolated profile processes
+
+Use one operating-system process per profile when a fatal V8 error, native
+crash, or process-wide out-of-memory failure in one customer profile must not
+terminate another profile. Pages within a profile can share that profile's
+process; separate customer identities must not.
+
+```ts
+import { launchProfileProcess } from "@obscura/browser/profile-process";
+
+const profile = await launchProfileProcess({ profile: "customer-123" });
+const browser = await profile.playwright(); // install playwright-core
+
+// All Playwright work here belongs to customer-123.
+
+const checkpoint = await profile.exportSnapshot();
+// Persist checkpoint in the trusted supervisor if required.
+await browser.close();
+await profile.close();
+```
+
+The child inherits only a small environment allowlist. Pass any additional
+non-secret variables explicitly through `environment`. The supervisor can use
+`waitForExit()` or `onExit()` to restart only the failed profile.
+
+For memory diagnosis, launch with `memoryTrace: true`. `memorySnapshot()`
+returns current profile-host RSS/PSS, Worker-isolate V8 heap/external memory,
+WASM linear memory, and host cache sizes. `memoryTrace()` returns the bounded
+structured timeline received so far, including render-resource fetch/seed,
+layout, framebuffer, PNG encoding, and screenshot transfer stages. Tracing is
+off by default and records counters only, never response or screenshot bodies.
+
+An OS process is a crash boundary, not a complete hostile-code sandbox. For
+untrusted websites, run each profile worker in its own gVisor sandbox (or an
+equivalent container boundary) and cgroup. Placing the supervisor and every
+profile process inside one shared sandbox does not provide tenant isolation.
+
 ## CDP, Puppeteer, and Playwright
 
 The direct API and Puppeteer adapter use an in-memory CDP transport. A network

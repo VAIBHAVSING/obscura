@@ -99,6 +99,7 @@ mod paint;
 pub use obscura_dom::resolve_document_base_url;
 #[cfg(feature = "paint")]
 pub use paint::{
+    encode_png_owned,
     css_resource_requests, css_resource_urls, image_intrinsic_dimensions, paint_dom,
     paint_dom_scrolled, CssResourceKind, CssResourceRequest,
     paint_dom_scrolled_at_animation_time,

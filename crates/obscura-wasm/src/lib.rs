@@ -365,6 +365,40 @@ struct PdfOptionsWire {
     margin_right: f32,
 }
 
+#[cfg(feature = "render")]
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct RenderMemoryTracePoint {
+    stage: &'static str,
+    timestamp_ms: f64,
+    wasm_memory_bytes: u32,
+    surface_bytes: usize,
+    output_bytes: usize,
+}
+
+fn current_wasm_memory_bytes() -> u32 {
+    #[cfg(target_arch = "wasm32")]
+    {
+        let pages = core::arch::wasm32::memory_size::<0>();
+        u32::try_from(pages.saturating_mul(64 * 1024)).unwrap_or(u32::MAX)
+    }
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        0
+    }
+}
+
+fn current_wall_time_ms() -> f64 {
+    #[cfg(target_arch = "wasm32")]
+    {
+        js_sys::Date::now()
+    }
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        0.0
+    }
+}
+
 /// Portable part of an Obscura page.
 ///
 /// JavaScript execution deliberately belongs to the host runtime. In Node,
@@ -377,6 +411,10 @@ pub struct ObscuraCore {
     cookies: cookies::CookieJar,
     #[cfg(feature = "render")]
     render_resources: obscura_render::RenderResourceCache,
+    #[cfg(feature = "render")]
+    memory_trace_enabled: bool,
+    #[cfg(feature = "render")]
+    memory_trace: Vec<RenderMemoryTracePoint>,
     /// Opaque handles are never recycled, even when `set_html` replaces the
     /// complete arena. This prevents a wrapper retained by host JavaScript
     /// from silently aliasing an unrelated node in the next document.
@@ -407,6 +445,10 @@ impl ObscuraCore {
             cookies: cookies::CookieJar::new(),
             #[cfg(feature = "render")]
             render_resources: portable_render_resources(),
+            #[cfg(feature = "render")]
+            memory_trace_enabled: false,
+            #[cfg(feature = "render")]
+            memory_trace: Vec::new(),
             handle_to_node,
             node_to_handle,
             next_handle: 2,
@@ -824,6 +866,10 @@ impl ObscuraCore {
         if !scroll_x.is_finite() || !scroll_y.is_finite() {
             return Err(js_sys::RangeError::new("screenshot scroll offsets must be finite").into());
         }
+        if self.memory_trace_enabled {
+            self.memory_trace.clear();
+            self.record_render_memory("beforePrepare", 0, 0);
+        }
         boundary_result("screenshot_png", || {
             let viewport = (width as f32, height as f32);
             let base_url =
@@ -835,14 +881,54 @@ impl ObscuraCore {
                 &mut self.render_resources,
             )
             .ok_or_else(|| "unable to prepare document render".to_string())?;
-            obscura_render::screenshot_prepared(
+            self.record_render_memory("afterPrepare", 0, 0);
+            let pixmap = obscura_render::paint_prepared(
                 &self.dom,
                 &mut prepared,
                 &mut self.render_resources,
                 (scroll_x, scroll_y),
             )
-            .ok_or_else(|| "unable to encode document screenshot".to_string())
+            .ok_or_else(|| "unable to paint document screenshot".to_string())?;
+            let surface_bytes = pixmap.data().len();
+            self.record_render_memory("afterPaint", surface_bytes, 0);
+            // This capture owns its preparation. Release layout, computed styles,
+            // and shaping buffers before the encoder allocates its working set.
+            drop(prepared);
+            self.record_render_memory("afterPrepareDrop", surface_bytes, 0);
+            let png = obscura_render::encode_png_owned(pixmap)
+                .map_err(|_| "unable to encode document screenshot".to_string())?;
+            self.record_render_memory("afterEncode", 0, png.len());
+            self.record_render_memory("afterSurfaceDrop", 0, png.len());
+            Ok(png)
         })
+    }
+
+    #[cfg(feature = "render")]
+    #[wasm_bindgen(js_name = setMemoryTraceEnabled)]
+    pub fn set_memory_trace_enabled(&mut self, enabled: bool) {
+        self.memory_trace_enabled = enabled;
+        self.memory_trace.clear();
+    }
+
+    #[cfg(feature = "render")]
+    #[wasm_bindgen(js_name = takeMemoryTrace)]
+    pub fn take_memory_trace(&mut self) -> String {
+        let trace = std::mem::take(&mut self.memory_trace);
+        serde_json::to_string(&trace).unwrap_or_else(|_| "[]".to_string())
+    }
+
+    #[cfg(feature = "render")]
+    fn record_render_memory(&mut self, stage: &'static str, surface_bytes: usize, output_bytes: usize) {
+        if !self.memory_trace_enabled {
+            return;
+        }
+        self.memory_trace.push(RenderMemoryTracePoint {
+            stage,
+            timestamp_ms: current_wall_time_ms(),
+            wasm_memory_bytes: current_wasm_memory_bytes(),
+            surface_bytes,
+            output_bytes,
+        });
     }
 
     /// Generate a bounded multi-page PDF entirely inside the portable module.
@@ -2166,6 +2252,11 @@ pub fn version() -> String {
     boundary_value("version", || env!("CARGO_PKG_VERSION").to_string())
 }
 
+#[wasm_bindgen(js_name = wasmMemoryBytes)]
+pub fn wasm_memory_bytes() -> u32 {
+    current_wasm_memory_bytes()
+}
+
 /// Allocate one independent portable browser instance in this WASM worker.
 /// The input is either UTF-8 HTML or a JSON object containing an `html` field.
 /// No native sockets, files, or V8 handles are created by this registry.
@@ -2301,6 +2392,21 @@ pub fn cdp_ingest(browser_id: u32, connection_id: u32, request: &[u8]) -> Result
         browser.raw_cdp_request(connection_id, request)
     })?;
     encode_raw_frames(&[response], MAX_RAW_BYTES)
+}
+
+#[cfg(feature = "render")]
+#[wasm_bindgen(js_name = cdpSetMemoryTraceEnabled)]
+pub fn cdp_set_memory_trace_enabled(browser_id: u32, enabled: bool) -> Result<(), JsValue> {
+    with_raw_browser(browser_id, |browser| {
+        browser.set_memory_trace_enabled(enabled);
+        Ok(())
+    })
+}
+
+#[cfg(feature = "render")]
+#[wasm_bindgen(js_name = cdpTakeMemoryTrace)]
+pub fn cdp_take_memory_trace(browser_id: u32) -> Result<String, JsValue> {
+    with_raw_browser(browser_id, |browser| Ok(browser.take_memory_trace_json()))
 }
 
 #[wasm_bindgen(js_name = cdpDrainEvents)]

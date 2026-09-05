@@ -625,6 +625,12 @@ class ObscuraCore {
         }
     }
     /**
+     * @param {boolean} enabled
+     */
+    setMemoryTraceEnabled(enabled) {
+        wasm.obscuracore_setMemoryTraceEnabled(this.__wbg_ptr, enabled);
+    }
+    /**
      * Replace the document using Obscura's existing html5ever-backed parser.
      * @param {string} html
      */
@@ -634,6 +640,21 @@ class ObscuraCore {
         const ret = wasm.obscuracore_set_html(this.__wbg_ptr, ptr0, len0);
         if (ret[1]) {
             throw takeFromExternrefTable0(ret[0]);
+        }
+    }
+    /**
+     * @returns {string}
+     */
+    takeMemoryTrace() {
+        let deferred1_0;
+        let deferred1_1;
+        try {
+            const ret = wasm.obscuracore_takeMemoryTrace(this.__wbg_ptr);
+            deferred1_0 = ret[0];
+            deferred1_1 = ret[1];
+            return getStringFromWasm0(ret[0], ret[1]);
+        } finally {
+            wasm.__wbindgen_free(deferred1_0, deferred1_1, 1);
         }
     }
     /**
@@ -1242,6 +1263,42 @@ exports.cdpRecordNetwork = cdpRecordNetwork;
 
 /**
  * @param {number} browser_id
+ * @param {boolean} enabled
+ */
+function cdpSetMemoryTraceEnabled(browser_id, enabled) {
+    const ret = wasm.cdpSetMemoryTraceEnabled(browser_id, enabled);
+    if (ret[1]) {
+        throw takeFromExternrefTable0(ret[0]);
+    }
+}
+exports.cdpSetMemoryTraceEnabled = cdpSetMemoryTraceEnabled;
+
+/**
+ * @param {number} browser_id
+ * @returns {string}
+ */
+function cdpTakeMemoryTrace(browser_id) {
+    let deferred2_0;
+    let deferred2_1;
+    try {
+        const ret = wasm.cdpTakeMemoryTrace(browser_id);
+        var ptr1 = ret[0];
+        var len1 = ret[1];
+        if (ret[3]) {
+            ptr1 = 0; len1 = 0;
+            throw takeFromExternrefTable0(ret[2]);
+        }
+        deferred2_0 = ptr1;
+        deferred2_1 = len1;
+        return getStringFromWasm0(ptr1, len1);
+    } finally {
+        wasm.__wbindgen_free(deferred2_0, deferred2_1, 1);
+    }
+}
+exports.cdpTakeMemoryTrace = cdpTakeMemoryTrace;
+
+/**
+ * @param {number} browser_id
  * @param {number} connection_id
  */
 function connectionClose(browser_id, connection_id) {
@@ -1429,6 +1486,15 @@ function version() {
     }
 }
 exports.version = version;
+
+/**
+ * @returns {number}
+ */
+function wasmMemoryBytes() {
+    const ret = wasm.wasmMemoryBytes();
+    return ret >>> 0;
+}
+exports.wasmMemoryBytes = wasmMemoryBytes;
 function __wbg_get_imports() {
     const import0 = {
         __proto__: null,
@@ -1504,6 +1570,10 @@ function __wbg_get_imports() {
         },
         __wbg_node_84ea875411254db1: function(arg0) {
             const ret = arg0.node;
+            return ret;
+        },
+        __wbg_now_d2e0afbad4edbe82: function() {
+            const ret = Date.now();
             return ret;
         },
         __wbg_process_44c7a14e11e9f69e: function(arg0) {

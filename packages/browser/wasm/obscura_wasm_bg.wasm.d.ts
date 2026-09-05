@@ -32,6 +32,8 @@ export const cdpInterceptFetch: (a: number, b: number, c: number, d: number, e: 
 export const cdpOpenStream: (a: number, b: number, c: number, d: number) => [number, number, number, number];
 export const cdpRawAbiVersion: () => number;
 export const cdpRecordNetwork: (a: number, b: number, c: number, d: number, e: number) => [number, number];
+export const cdpSetMemoryTraceEnabled: (a: number, b: number) => [number, number];
+export const cdpTakeMemoryTrace: (a: number) => [number, number, number, number];
 export const connectionClose: (a: number, b: number) => [number, number];
 export const connectionOpen: (a: number) => [number, number, number];
 export const contextExport: (a: number, b: number) => [number, number, number, number];
@@ -69,10 +71,13 @@ export const obscuracore_seedRenderResource: (a: number, b: number, c: number, d
 export const obscuracore_setCookieFromResponse: (a: number, b: number, c: number, d: number, e: number, f: number) => [number, number, number];
 export const obscuracore_setCookieFromScript: (a: number, b: number, c: number, d: number, e: number, f: number) => [number, number, number];
 export const obscuracore_setDocumentMetadata: (a: number, b: number, c: number, d: number, e: number, f: number, g: number) => [number, number];
+export const obscuracore_setMemoryTraceEnabled: (a: number, b: number) => void;
 export const obscuracore_set_html: (a: number, b: number, c: number) => [number, number];
+export const obscuracore_takeMemoryTrace: (a: number) => [number, number];
 export const obscuracore_visibleCookies: (a: number, b: number, c: number, d: number) => [number, number, number, number];
 export const probe: () => [number, number];
 export const version: () => [number, number];
+export const wasmMemoryBytes: () => number;
 export const cdpAbiVersion: () => number;
 export const cookieAbiVersion: () => number;
 export const navigationAbiVersion: () => number;

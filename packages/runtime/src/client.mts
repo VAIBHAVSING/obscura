@@ -30,7 +30,7 @@ const MAX_NAVIGATION_RESPONSE_BYTES = 32 * 1024 * 1024;
 const MAX_NAVIGATION_REDIRECTS = 10;
 const MAX_RENDER_RESOURCE_PREPARE_MS = 30_000;
 const MAX_CDP_STREAM_BASE64_BYTES = 12 * 1024 * 1024;
-function portableWorkerData(modulePath, cwd, bootstrapPath, taskTimeoutMs) {
+function portableWorkerData(modulePath, cwd, bootstrapPath, taskTimeoutMs, memoryTrace) {
   const resolvedPath = resolveModulePath(modulePath, cwd);
   if (resolvedPath && extname(resolvedPath).toLowerCase() === ".node") {
     const error = new Error("Native .node modules are not supported; provide the packaged Obscura WASM module");
@@ -42,6 +42,7 @@ function portableWorkerData(modulePath, cwd, bootstrapPath, taskTimeoutMs) {
     cwd,
     bootstrapPath: bootstrapPath === undefined ? undefined : resolveModulePath(bootstrapPath, cwd),
     taskTimeoutMs,
+    memoryTrace,
   };
 }
 
@@ -282,12 +283,19 @@ export class WasmV8Worker {
   #readyResolve;
   #readyReject;
 
-  constructor(modulePath, { cwd = process.cwd(), bootstrapPath, taskTimeoutMs = 1_000 } = {}) {
+  constructor(modulePath, {
+    cwd = process.cwd(),
+    bootstrapPath,
+    taskTimeoutMs = 1_000,
+    resourceLimits,
+    memoryTrace = false,
+  } = {}) {
     if (bootstrapPath !== undefined && (typeof bootstrapPath !== "string" || bootstrapPath.length === 0)) {
       throw new TypeError("bootstrapPath must be a non-empty string");
     }
+    if (typeof memoryTrace !== "boolean") throw new TypeError("memoryTrace must be a boolean");
     validateVmTimeout(taskTimeoutMs, "taskTimeoutMs");
-    const workerData = portableWorkerData(modulePath, cwd, bootstrapPath, taskTimeoutMs);
+    const workerData = portableWorkerData(modulePath, cwd, bootstrapPath, taskTimeoutMs, memoryTrace);
     this.#ready = new Promise((resolve, reject) => {
       this.#readyResolve = resolve;
       this.#readyReject = reject;
@@ -298,6 +306,7 @@ export class WasmV8Worker {
     this.#worker = new Worker(workerUrl, {
       workerData,
       execArgv: ["--experimental-vm-modules"],
+      ...(resourceLimits === undefined ? {} : { resourceLimits }),
     });
     this.#worker.on("message", (message) => this.#onMessage(message));
     this.#worker.on("error", (error) => this.#fail(error, true));
@@ -558,6 +567,10 @@ export class WasmV8Worker {
     } catch (error) {
       return Promise.reject(error);
     }
+  }
+
+  memorySnapshot(options = {}) {
+    return this.request("memorySnapshot", undefined, options.requestTimeoutMs);
   }
 
   pdf(options = {}) {

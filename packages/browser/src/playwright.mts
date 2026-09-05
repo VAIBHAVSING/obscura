@@ -17,6 +17,13 @@ export async function connectPlaywright<Browser = any>(
   options: PlaywrightAdapterOptions = {},
 ): Promise<Browser> {
   await controller.listen();
+  return connectPlaywrightEndpoint(controller.httpEndpoint(), options);
+}
+
+export async function connectPlaywrightEndpoint<Browser = any>(
+  endpoint: string,
+  options: PlaywrightAdapterOptions = {},
+): Promise<Browser> {
   let loaded: PlaywrightModule;
   try {
     loaded = await import(options.module?.toString() ?? "playwright-core") as PlaywrightModule;
@@ -26,7 +33,7 @@ export async function connectPlaywright<Browser = any>(
     (failure as Error & { cause?: unknown }).cause = error;
     throw failure;
   }
-  return loaded.chromium.connectOverCDP(controller.httpEndpoint(), {
+  return loaded.chromium.connectOverCDP(endpoint, {
     ...(options.timeout === undefined ? {} : { timeout: options.timeout }),
     ...(options.slowMo === undefined ? {} : { slowMo: options.slowMo }),
   }) as Promise<Browser>;

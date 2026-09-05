@@ -38,6 +38,11 @@
       "types": "./dist/src/puppeteer.d.mts",
       "import": "./dist/src/puppeteer.mjs",
       "default": "./dist/src/puppeteer.mjs"
+    },
+    "./profile-process": {
+      "types": "./dist/src/profile-process.d.mts",
+      "import": "./dist/src/profile-process.mjs",
+      "default": "./dist/src/profile-process.mjs"
     }
   },
   "bin": {

@@ -4,6 +4,7 @@ import { readFile } from "node:fs/promises";
 import { existsSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import { parentPort, workerData, threadId } from "node:worker_threads";
+import { getHeapStatistics } from "node:v8";
 
 import {
   BOOTSTRAP_PLATFORM_OP_COMMANDS,
@@ -78,6 +79,9 @@ const SEED_MISSING_RENDER_IMAGE_RESOURCE_NAMES = [
   "seedMissingRenderImageResource",
 ];
 const SCREENSHOT_PNG_NAMES = ["screenshot_png", "screenshotPng"];
+const SET_MEMORY_TRACE_NAMES = ["set_memory_trace_enabled", "setMemoryTraceEnabled"];
+const TAKE_MEMORY_TRACE_NAMES = ["take_memory_trace", "takeMemoryTrace"];
+const WASM_MEMORY_BYTES_NAMES = ["wasm_memory_bytes", "wasmMemoryBytes"];
 const PDF_NAMES = ["pdf"];
 const PDF_ABI_VERSION_NAME = "pdfAbiVersion";
 const NAVIGATION_ABI_VERSION_NAME = "navigationAbiVersion";
@@ -118,6 +122,8 @@ const RAW_CDP_DRAIN_FETCH_RESOLUTIONS_NAMES = ["cdpDrainFetchResolutions"];
 const RAW_CDP_CACHE_DISABLED_NAMES = ["cdpCacheDisabled"];
 const RAW_CDP_CLEAR_RESPONSE_CACHE_NAMES = ["cdpClearResponseCache"];
 const RAW_CDP_CANCEL_FETCH_NAMES = ["cdpCancelFetch"];
+const RAW_CDP_SET_MEMORY_TRACE_NAMES = ["cdpSetMemoryTraceEnabled"];
+const RAW_CDP_TAKE_MEMORY_TRACE_NAMES = ["cdpTakeMemoryTrace"];
 const REQUIRED_CORE_ABI_VERSION = 1;
 const REQUIRED_DOM_OP_ABI_VERSION = 1;
 const REQUIRED_DOM_BATCH_ABI_VERSION = 1;
@@ -454,6 +460,7 @@ let bridgeTaskLastStatus = null;
 let portableCdpCore = null;
 let portableCdpRawBrowserId = null;
 let portableCdpRawApiCache;
+const portableNetworkSessions = new Map();
 let bootstrapRuntime;
 let nextBootstrapFetchId = 1;
 const bootstrapFetches = new Map();
@@ -477,6 +484,7 @@ let moduleRecords = new Map();
 let moduleImportMap = { imports: Object.create(null), scopes: Object.create(null) };
 let enqueueSerializedWork;
 let shuttingDown = false;
+const memoryTraceEnabled = workerData.memoryTrace === true;
 
 function propertyNames(value) {
   const names = new Set();
@@ -495,6 +503,66 @@ function member(object, names) {
     if (typeof value === "function") return { name, fn: value.bind(object) };
   }
   return null;
+}
+
+function memorySnapshot(stage, extra = {}) {
+  const usage = process.memoryUsage();
+  const heap = getHeapStatistics();
+  let wasmLinearBytes = null;
+  try {
+    const readWasmMemory = member(target, WASM_MEMORY_BYTES_NAMES);
+    if (readWasmMemory) wasmLinearBytes = Number(syncCall(readWasmMemory));
+  } catch {
+    wasmLinearBytes = null;
+  }
+  return {
+    timestampMs: Date.now(),
+    monotonicMs: performance.now(),
+    stage,
+    role: "wasm-worker",
+    pid: process.pid,
+    threadId,
+    process: {
+      rssBytes: usage.rss,
+      heapTotalBytes: usage.heapTotal,
+      heapUsedBytes: usage.heapUsed,
+      externalBytes: usage.external,
+      arrayBuffersBytes: usage.arrayBuffers,
+      rssScope: "process",
+      heapScope: "worker-isolate",
+    },
+    v8: {
+      totalHeapBytes: heap.total_heap_size,
+      totalPhysicalBytes: heap.total_physical_size,
+      usedHeapBytes: heap.used_heap_size,
+      heapLimitBytes: heap.heap_size_limit,
+      mallocedBytes: heap.malloced_memory,
+      peakMallocedBytes: heap.peak_malloced_memory,
+      externalBytes: heap.external_memory,
+    },
+    wasmLinearBytes,
+    page: {
+      loaded: Boolean(bridgeCore),
+      generation: bridgeGeneration,
+      documentHandle: bridgeDocumentHandle,
+      revision: bridgePageRevision,
+    },
+    hostState: {
+      httpCacheEntries: portableHttpCache.size,
+      httpCacheBytes: portableHttpCacheBytes,
+      networkEventCount: bootstrapNetworkEvents.length,
+      networkEventBytes: bootstrapNetworkEventBytes,
+      activeFetches: bootstrapFetches.size,
+    },
+    ...extra,
+  };
+}
+
+function traceMemory(stage, extra = {}) {
+  if (!memoryTraceEnabled) return null;
+  const snapshot = memorySnapshot(stage, extra);
+  try { process.stderr.write(`OBSCURA_MEMORY ${JSON.stringify(snapshot)}\n`); } catch {}
+  return snapshot;
 }
 
 function valueMember(object, names) {
@@ -919,6 +987,8 @@ function bridgeApi(core = bridgeCore) {
     seedRenderImageResource: member(core, SEED_RENDER_IMAGE_RESOURCE_NAMES),
     seedMissingRenderImageResource: member(core, SEED_MISSING_RENDER_IMAGE_RESOURCE_NAMES),
     screenshotPng: member(core, SCREENSHOT_PNG_NAMES),
+    setMemoryTraceEnabled: member(core, SET_MEMORY_TRACE_NAMES),
+    takeMemoryTrace: member(core, TAKE_MEMORY_TRACE_NAMES),
     pdf: member(core, PDF_NAMES),
     cookieHeader: member(core, COOKIE_HEADER_NAMES),
     visibleCookies: member(core, VISIBLE_COOKIES_NAMES),
@@ -1376,6 +1446,8 @@ function portableCdpRawApi() {
     cacheDisabled: member(target, RAW_CDP_CACHE_DISABLED_NAMES),
     clearResponseCache: member(target, RAW_CDP_CLEAR_RESPONSE_CACHE_NAMES),
     cancelFetch: member(target, RAW_CDP_CANCEL_FETCH_NAMES),
+    setMemoryTraceEnabled: member(target, RAW_CDP_SET_MEMORY_TRACE_NAMES),
+    takeMemoryTrace: member(target, RAW_CDP_TAKE_MEMORY_TRACE_NAMES),
   };
   return portableCdpRawApiCache;
 }
@@ -1393,6 +1465,9 @@ function portableCdpRawEnsureBrowser(html = "") {
   const config = rawCdpJsonBytes({ html: requireBoundedString(html, MAX_HTML_INPUT_BYTES, "CDP HTML input") });
   try {
     portableCdpRawBrowserId = requireUnsignedU32(api.browserCreate.fn(config), "raw browser ID");
+    if (memoryTraceEnabled && api.setMemoryTraceEnabled) {
+      api.setMemoryTraceEnabled.fn(portableCdpRawBrowserId, true);
+    }
   } catch (error) {
     throw portableCdpError(`raw CDP browser construction failed: ${error?.message ?? String(error)}`);
   }
@@ -1403,14 +1478,44 @@ function portableCdpRawCloseBrowser() {
   const api = portableCdpRawApi();
   const browserId = portableCdpRawBrowserId;
   portableCdpRawBrowserId = null;
+  portableNetworkSessions.clear();
   if (!api || browserId === null) return;
   try { api.browserClose.fn(browserId); } catch {}
+}
+
+function portableNetworkCaptureEnabled() {
+  for (const sessions of portableNetworkSessions.values()) {
+    if (sessions.size > 0) return true;
+  }
+  return false;
+}
+
+function trackPortableNetworkCommand(connectionId, message, response) {
+  if (response?.error) return;
+  let request;
+  try { request = JSON.parse(message); } catch { return; }
+  const sessionId = request?.sessionId;
+  if (request?.method === "Network.enable" && typeof sessionId === "string") {
+    const sessions = portableNetworkSessions.get(connectionId) ?? new Set();
+    sessions.add(sessionId);
+    portableNetworkSessions.set(connectionId, sessions);
+  } else if (request?.method === "Network.disable" && typeof sessionId === "string") {
+    const sessions = portableNetworkSessions.get(connectionId);
+    sessions?.delete(sessionId);
+    if (sessions?.size === 0) portableNetworkSessions.delete(connectionId);
+  } else if (request?.method === "Target.detachFromTarget" && typeof request?.params?.sessionId === "string") {
+    for (const [id, sessions] of portableNetworkSessions) {
+      sessions.delete(request.params.sessionId);
+      if (sessions.size === 0) portableNetworkSessions.delete(id);
+    }
+  }
 }
 
 function portableCdpRawRequest(connectionId, message, html = "") {
   const { api, browserId } = portableCdpRawEnsureBrowser(html);
   const request = rawCdpJsonBytes(message, "CDP message");
   const response = rawCdpDecodeJsonFrame(api.ingest.fn(browserId, connectionId, request));
+  trackPortableNetworkCommand(connectionId, message, response);
   const actions = rawCdpDecodeJsonFrames(api.drainActions.fn(browserId, RAW_CDP_MAX_FRAMES, RAW_CDP_MAX_BYTES));
   drainPortableFetchResolutions();
   return { response, actions };
@@ -1623,7 +1728,9 @@ function portableCdpOperation(payload = {}) {
   const core = portableCdpInstance(payload.html ?? "");
   if (operation === "open") return requireUnsignedU32(core.openConnection(), "CDP connection ID");
   if (operation === "close") {
-    core.closeConnection(requireUnsignedU32(payload.connectionId, "CDP connection ID"));
+    const connectionId = requireUnsignedU32(payload.connectionId, "CDP connection ID");
+    core.closeConnection(connectionId);
+    portableNetworkSessions.delete(connectionId);
     return {};
   }
   if (operation === "openStream") {
@@ -1646,6 +1753,7 @@ function portableCdpOperation(payload = {}) {
     const connectionId = requireUnsignedU32(payload.connectionId, "CDP connection ID");
     requireBoundedString(payload.message, MAX_PLATFORM_REQUEST_BYTES, "CDP message");
     const response = decodeJsonText(core.cdpRequest(connectionId, payload.message));
+    trackPortableNetworkCommand(connectionId, payload.message, response);
     try {
       const request = JSON.parse(payload.message);
       if (request?.method === "Network.clearBrowserCache" ||
@@ -1684,10 +1792,12 @@ function portableCdpRawOperation(payload = {}) {
   }
   if (operation === "close") {
     if (portableCdpRawBrowserId === null) return {};
+    const connectionId = requireUnsignedU32(payload.connectionId, "CDP connection ID");
     api.connectionClose.fn(
       portableCdpRawBrowserId,
-      requireUnsignedU32(payload.connectionId, "CDP connection ID"),
+      connectionId,
     );
+    portableNetworkSessions.delete(connectionId);
     return {};
   }
   if (operation === "contextExport") {
@@ -1713,7 +1823,30 @@ function portableCdpRawOperation(payload = {}) {
   if (operation === "request") {
     const connectionId = requireUnsignedU32(payload.connectionId, "CDP connection ID");
     requireBoundedString(payload.message, MAX_PLATFORM_REQUEST_BYTES, "CDP message");
+    let requestMethod = null;
+    if (memoryTraceEnabled) {
+      try { requestMethod = JSON.parse(payload.message)?.method ?? null; } catch {}
+    }
+    const renderOperation = memoryTraceEnabled &&
+      (requestMethod === "Page.captureScreenshot" || requestMethod === "Page.printToPDF");
+    if (renderOperation) traceMemory(`cdp:${requestMethod}:before-wasm`);
     const routed = portableCdpRawRequest(connectionId, payload.message, payload.html ?? "");
+    if (renderOperation) {
+      traceMemory(`cdp:${requestMethod}:after-wasm`);
+      if (api.takeMemoryTrace && portableCdpRawBrowserId !== null) {
+        const traces = decodeJsonText(api.takeMemoryTrace.fn(portableCdpRawBrowserId));
+        if (Array.isArray(traces)) {
+          for (const targetTrace of traces) {
+            for (const point of targetTrace?.points ?? []) {
+              traceMemory(`cdp:${requestMethod}:wasm:${point.stage ?? "unknown"}`, {
+                targetId: targetTrace?.targetId ?? null,
+                render: point,
+              });
+            }
+          }
+        }
+      }
+    }
     try {
       const request = JSON.parse(payload.message);
       if (request?.method === "Network.clearBrowserCache" ||
@@ -2147,6 +2280,9 @@ async function replaceBridgeCore(html, documentMetadata) {
   html = requireBoundedString(html, MAX_HTML_INPUT_BYTES, "HTML input");
   const next = new constructor.fn(html);
   const nextApi = bridgeApi(next);
+  if (memoryTraceEnabled && nextApi.setMemoryTraceEnabled) {
+    syncCall(nextApi.setMemoryTraceEnabled, true);
+  }
   const hasQueryApi = nextApi.querySnapshot || (nextApi.queryText && nextApi.queryHtml);
   const hasAnyStatefulApi = Boolean(
     nextApi.domOp || nextApi.domBatch || nextApi.pageRevision || nextApi.documentHandle,
@@ -2311,7 +2447,7 @@ function responseEncoding(headers) {
   return match?.[1] ?? "UTF-8";
 }
 
-async function readNavigationBody(response, api, navigationId, signal) {
+async function readNavigationBody(response, api, navigationId, signal, captureNetworkBody = false) {
   if (!response.body) return { bytes: new Uint8Array(), total: 0 };
   const reader = response.body.getReader();
   const captured = [];
@@ -2326,7 +2462,7 @@ async function readNavigationBody(response, api, navigationId, signal) {
       if (total > MAX_NAVIGATION_RESPONSE_BYTES) {
         throw new RangeError(`navigation response exceeds the ${MAX_NAVIGATION_RESPONSE_BYTES}-byte limit`);
       }
-      if (capturedTotal < MAX_NETWORK_RESPONSE_BODY_BYTES) {
+      if (captureNetworkBody && capturedTotal < MAX_NETWORK_RESPONSE_BODY_BYTES) {
         const remaining = MAX_NETWORK_RESPONSE_BODY_BYTES - capturedTotal;
         const copy = chunk.byteLength <= remaining ? chunk : chunk.subarray(0, remaining);
         captured.push(copy.slice());
@@ -2363,7 +2499,7 @@ function networkRecord({ requestId, loaderId, url, method, requestHeaders, statu
     resourceType: typeof resourceType === "string" && resourceType.length > 0 ? resourceType : "Document",
     initiatorType: typeof initiatorType === "string" && initiatorType.length > 0 ? initiatorType : "other",
   };
-  if (!redirect && body && body.byteLength <= MAX_NETWORK_RESPONSE_BODY_BYTES) {
+  if (portableNetworkCaptureEnabled() && !redirect && body && body.byteLength <= MAX_NETWORK_RESPONSE_BODY_BYTES) {
     record.bodyBase64 = Buffer.from(body).toString("base64");
   }
   return record;
@@ -2381,6 +2517,7 @@ function currentNavigationLoaderId() {
 }
 
 function queueBootstrapNetworkEvent(event) {
+  if (!portableNetworkCaptureEnabled()) return;
   if (event === null || typeof event !== "object" || event.generation !== bridgeGeneration ||
       event.runtime !== bootstrapRuntime) return;
   const { generation, runtime, ...record } = event;
@@ -3593,6 +3730,7 @@ async function navigatePortable({ url, options = {}, allowPrivateNetwork = false
   activeAllowPrivateNetwork = Boolean(allowPrivateNetwork);
   const api = bridgeApi();
   await requireNavigationCompatibility(api);
+  const captureNetwork = portableNetworkCaptureEnabled();
   let action = JSON.parse(syncCall(api.beginNavigation, url, JSON.stringify({ method, body, referrer, replaceHistory: Boolean(options.replaceHistory), maxRedirects })));
   const networkEvents = [];
   const controller = new AbortController();
@@ -3606,7 +3744,7 @@ async function navigatePortable({ url, options = {}, allowPrivateNetwork = false
         syncCall(api.navigationResponseHeaders, navigationId, 200, JSON.stringify({ "content-type": "text/html; charset=UTF-8" }));
         syncCall(api.navigationResponseChunk, navigationId, inline.bytes);
         const commit = JSON.parse(syncCall(api.navigationResponseEnd, navigationId, action.url, inline.encoding));
-        networkEvents.push(networkRecord({
+        if (captureNetwork) networkEvents.push(networkRecord({
           requestId: action.loaderId,
           loaderId: action.loaderId,
           url: action.url,
@@ -3713,7 +3851,7 @@ async function navigatePortable({ url, options = {}, allowPrivateNetwork = false
           );
         }
       }
-      const responseRecord = networkRecord({
+      const responseRecord = captureNetwork ? networkRecord({
         requestId,
         loaderId: action.loaderId,
         url: responseUrl,
@@ -3723,10 +3861,10 @@ async function navigatePortable({ url, options = {}, allowPrivateNetwork = false
         responseHeaders: headers,
         mimeType: headers["content-type"] ?? "",
         redirect: responseStatus >= 300 && responseStatus < 400,
-      });
+      }) : null;
       action = JSON.parse(syncCall(api.navigationResponseHeaders, navigationId, responseStatus, serialized));
       if (action.kind === "redirect") {
-        networkEvents.push(responseRecord);
+        if (responseRecord) networkEvents.push(responseRecord);
         try { await response?.body?.cancel(); } catch {}
         continue;
       }
@@ -3740,10 +3878,18 @@ async function navigatePortable({ url, options = {}, allowPrivateNetwork = false
         syncCall(api.navigationResponseChunk, navigationId, fulfilledBytes);
         captured = { bytes: fulfilledBytes, total: fulfilledBytes.byteLength };
       } else {
-        captured = await readNavigationBody(response, api, navigationId, controller.signal);
+        captured = await readNavigationBody(response, api, navigationId, controller.signal, captureNetwork);
       }
       const commit = JSON.parse(syncCall(api.navigationResponseEnd, navigationId, responseUrl, responseEncoding(headers)));
-      networkEvents.push({ ...responseRecord, bodySize: captured.total, ...(captured.bytes.byteLength <= MAX_NETWORK_RESPONSE_BODY_BYTES ? { bodyBase64: Buffer.from(captured.bytes).toString("base64") } : {}) });
+      if (responseRecord) {
+        networkEvents.push({
+          ...responseRecord,
+          bodySize: captured.total,
+          ...(captured.bytes.byteLength <= MAX_NETWORK_RESPONSE_BODY_BYTES
+            ? { bodyBase64: Buffer.from(captured.bytes).toString("base64") }
+            : {}),
+        });
+      }
       resetBridgeRealmAfterNavigation();
       const stylesheets = await loadDocumentStylesheets({ requestTimeoutMs, allowPrivateNetwork });
       const scripts = options.executeScripts === false
@@ -4137,6 +4283,7 @@ async function fetchAndSeedRenderResource(
   let requestHeaders = {};
   let recorded = false;
   let timer;
+  traceMemory("render-resource:before", { requestId, kind: request.kind });
 
   const record = (status, body, bodySize = body?.byteLength ?? 0) => {
     if (recorded) return;
@@ -4192,8 +4339,19 @@ async function fetchAndSeedRenderResource(
       const inline = decodeInlineNavigation(url);
       responseHeaders = { "content-type": "application/octet-stream" };
       record(200, inline.bytes, inline.bytes.byteLength);
+      traceMemory("render-resource:fetched", {
+        requestId,
+        kind: request.kind,
+        status: 200,
+        resourceBytes: inline.bytes.byteLength,
+      });
       seed(inline.bytes);
-      return { loaded: true, url };
+      traceMemory("render-resource:seeded", {
+        requestId,
+        kind: request.kind,
+        resourceBytes: inline.bytes.byteLength,
+      });
+      return { loaded: true, url, bytes: inline.bytes.byteLength };
     }
 
     const cookie = cookieHeaderForUrl(targetUrl, "include");
@@ -4240,6 +4398,7 @@ async function fetchAndSeedRenderResource(
       });
       responseUrl = response.url || decision.url;
       responseStatus = response.status;
+      traceMemory("render-resource:headers", { requestId, kind: request.kind, status: responseStatus });
       storeResponseCookies(responseUrl, response);
       ({ headers: responseHeaders } = responseHeadersObject(response));
       bytes = responseStatus >= 200 && responseStatus < 300
@@ -4269,15 +4428,33 @@ async function fetchAndSeedRenderResource(
       record(responseStatus, undefined, 0);
       try { await response?.body?.cancel(); } catch {}
       seedMissing();
-      return { loaded: false, status: responseStatus, url: responseUrl };
+      return { loaded: false, status: responseStatus, url: responseUrl, bytes: 0 };
     }
     record(responseStatus, bytes, bytes.byteLength);
+    traceMemory("render-resource:fetched", {
+      requestId,
+      kind: request.kind,
+      status: responseStatus,
+      resourceBytes: bytes.byteLength,
+    });
     seed(bytes);
-    return { loaded: true, status: response.status, url: responseUrl };
+    traceMemory("render-resource:seeded", {
+      requestId,
+      kind: request.kind,
+      status: responseStatus,
+      resourceBytes: bytes.byteLength,
+    });
+    return { loaded: true, status: responseStatus, url: responseUrl, bytes: bytes.byteLength };
   } catch (error) {
     record(response?.status ?? 0, undefined, 0);
     seedMissing();
-    return { loaded: false, status: response?.status ?? 0, url: responseUrl, error: error?.name ?? "Error" };
+    traceMemory("render-resource:failed", {
+      requestId,
+      kind: request.kind,
+      status: response?.status ?? 0,
+      error: error?.name ?? "Error",
+    });
+    return { loaded: false, status: response?.status ?? 0, url: responseUrl, bytes: 0, error: error?.name ?? "Error" };
   } finally {
     clearTimeout(timer);
   }
@@ -4321,6 +4498,7 @@ async function prepareRenderResources({
   let requested = 0;
   let loaded = 0;
   let failed = 0;
+  let loadedBytes = 0;
   let done = false;
   const seen = new Set();
   while (!done && performance.now() - started < maxMs) {
@@ -4350,6 +4528,7 @@ async function prepareRenderResources({
       );
       if (result.loaded) loaded += 1;
       else failed += 1;
+      loadedBytes += result.bytes ?? 0;
       if (performance.now() - started >= maxMs) break;
     }
     offset = page.nextOffset;
@@ -4363,6 +4542,7 @@ async function prepareRenderResources({
     revision: identity.revision,
     requested,
     loaded,
+    loadedBytes,
     failed,
     timedOut: !done,
   };
@@ -4395,8 +4575,26 @@ async function screenshotPng({ width, height, scrollX, scrollY, expectedPage } =
   const generation = bridgeGeneration;
   const documentHandle = bridgeDocumentHandle;
   synchronizeBridgeIdentity(generation, documentHandle);
+  traceMemory("screenshot:before-wasm", { width, height });
   const rawBytes = syncCall(api.screenshotPng, width, height, scrollX, scrollY);
+  traceMemory("screenshot:after-wasm", { width, height, outputBytes: rawBytes?.byteLength ?? null });
   const data = requireValidPngBytes(rawBytes, "screenshot PNG");
+  traceMemory("screenshot:after-validation-copy", {
+    outputBytes: data.byteLength,
+    copiedBytes: data.buffer === rawBytes?.buffer ? 0 : data.byteLength,
+  });
+  if (memoryTraceEnabled && api.takeMemoryTrace) {
+    const renderTrace = decodeJsonText(syncCall(api.takeMemoryTrace));
+    if (Array.isArray(renderTrace)) {
+      for (const point of renderTrace) {
+        traceMemory(`screenshot:wasm:${point.stage ?? "unknown"}`, {
+          render: point,
+          width,
+          height,
+        });
+      }
+    }
+  }
   const identity = synchronizeBridgeIdentity(generation, documentHandle);
   return {
     generation,
@@ -4641,6 +4839,8 @@ async function dispatch(operation, payload) {
   switch (operation) {
     case "inspect":
       return { ...metadata, ...describeApi(), runtime: await inspectRuntime(), threadId };
+    case "memorySnapshot":
+      return memorySnapshot("explicit");
     case "version": {
       const version = member(target, VERSION_NAMES);
       if (version) return await version.fn();
@@ -4762,9 +4962,33 @@ async function handleMessage(message) {
     return;
   }
   try {
+    if (["navigate", "prepareRenderResources", "screenshotPng", "pdf", "bridgeRelease", "shutdown"].includes(operation)) {
+      traceMemory(`${operation}:before`);
+    }
     const result = await dispatch(operation, payload);
+    if (["navigate", "prepareRenderResources", "screenshotPng", "pdf", "bridgeRelease", "shutdown"].includes(operation)) {
+      traceMemory(`${operation}:after`, operation === "prepareRenderResources" ? {
+        requested: result?.requested,
+        loaded: result?.loaded,
+        failed: result?.failed,
+        loadedBytes: result?.loadedBytes,
+      } : {});
+    }
     try {
-      parentPort.postMessage({ type: "response", id, result });
+      const data = result?.data;
+      const transferable =
+        (operation === "screenshotPng" || operation === "pdf") &&
+        data instanceof Uint8Array &&
+        data.byteOffset === 0 &&
+        data.byteLength === data.buffer.byteLength &&
+        data.buffer instanceof ArrayBuffer;
+      const transferBytes = transferable ? data.byteLength : 0;
+      if (transferable) traceMemory(`${operation}:before-transfer`, { transferBytes });
+      parentPort.postMessage(
+        { type: "response", id, result },
+        transferable ? [data.buffer] : [],
+      );
+      if (transferable) traceMemory(`${operation}:after-transfer`, { transferBytes });
     } catch (error) {
       postError(id, error);
     }
@@ -4816,6 +5040,7 @@ try {
     type: "ready",
     result: { ...metadata, ...describeApi(), threadId },
   });
+  traceMemory("worker:ready");
 } catch (error) {
   parentPort.postMessage({ type: "fatal", error: serializeError(error) });
   parentPort.close();

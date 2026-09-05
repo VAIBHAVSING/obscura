@@ -47,4 +47,26 @@ export async function connectPuppeteer<Browser = any>(
   }) as Promise<Browser>;
 }
 
+export async function connectPuppeteerEndpoint<Browser = any>(
+  endpoint: string,
+  options: PuppeteerAdapterOptions = {},
+): Promise<Browser> {
+  let loaded: PuppeteerModule;
+  try {
+    loaded = await import(options.module?.toString() ?? "puppeteer-core") as PuppeteerModule;
+  } catch (error) {
+    const failure = new Error("Install puppeteer-core to use browser.puppeteer()");
+    (failure as Error & { code?: string; cause?: unknown }).code = "ERR_OBSCURA_PUPPETEER_MISSING";
+    (failure as Error & { cause?: unknown }).cause = error;
+    throw failure;
+  }
+  const api = typeof loaded.connect === "function" ? loaded : loaded.default;
+  if (!api || typeof api.connect !== "function") throw new TypeError("puppeteer-core does not export connect()");
+  return api.connect({
+    browserWSEndpoint: endpoint,
+    ...(options.defaultViewport === undefined ? {} : { defaultViewport: options.defaultViewport }),
+    ...(options.protocolTimeout === undefined ? {} : { protocolTimeout: options.protocolTimeout }),
+  }) as Promise<Browser>;
+}
+
 export default connectPuppeteer;

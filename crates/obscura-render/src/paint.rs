@@ -14,6 +14,25 @@ use tiny_skia::{
     Pixmap, Point, RadialGradient, Rect, SpreadMode, Transform,
 };
 
+/// Encode an owned framebuffer without cloning its full RGBA allocation.
+///
+/// `tiny_skia::Pixmap::encode_png` must preserve its borrowed pixmap, so it
+/// clones every pixel before demultiplying alpha. Screenshot callers discard
+/// the framebuffer after encoding and can consume it instead.
+pub fn encode_png_owned(pixmap: Pixmap) -> Result<Vec<u8>, png::EncodingError> {
+    let width = pixmap.width();
+    let height = pixmap.height();
+    let demultiplied = pixmap.take_demultiplied();
+    let mut output = Vec::new();
+    {
+        let mut encoder = png::Encoder::new(&mut output, width, height);
+        encoder.set_color(png::ColorType::Rgba);
+        encoder.set_depth(png::BitDepth::Eight);
+        encoder.write_header()?.write_image_data(&demultiplied)?;
+    }
+    Ok(output)
+}
+
 static FONT_BYTES: &[u8] = include_bytes!("../assets/liberation-sans.ttf");
 static SYSTEM_FONT_BYTES: &[u8] = include_bytes!("../assets/dejavu-sans.ttf");
 static SERIF_FONT_BYTES: &[u8] = include_bytes!("../assets/liberation-serif.ttf");
@@ -4180,7 +4199,42 @@ fn paint_laid_dom_scrolled(
             // Opacity is applied to the finished stacking context, never to
             // each primitive. Otherwise two opaque overlapping children at
             // opacity:.5 incorrectly become .75 alpha in their overlap.
-            let layer = Pixmap::new(pixmap.width(), pixmap.height())?;
+            //
+            // Keep the isolated surface to the visible subtree bounds. A
+            // viewport-sized allocation here made every nested opacity group
+            // retain another complete RGBA screenshot until its child paint
+            // returned. Real pages commonly use opacity on small icons and
+            // controls, so that multiplied peak memory by the nesting depth.
+            let surface = paint_surface_rect(&pixmap, raster_scale);
+            // Source bounds do not include scale/rotation of descendants.
+            // Until transformed ink bounds are available, preserve their
+            // overflow using the destination surface instead of clipping it.
+            let transformed_descendant = crate::dom::rendered_descendants(tree, nid)
+                .into_iter()
+                .any(|id| match (laid.styles.get(&id), laid.rects.get(&id)) {
+                    (Some(style), Some(rect)) if has_authored_transform(style) =>
+                        !crate::dom::resolved_transform_matrix(
+                            style, rect, root_font_size, viewport,
+                        ).is_translation(),
+                    _ => false,
+                });
+            let bounds = if transformed_descendant {
+                Some(surface)
+            } else {
+                transform_subtree_source_bounds(tree, laid, &scroll_state, nid)
+                    .and_then(|bounds| bounds.intersect(&surface))
+            };
+            let Some(layer_bounds) = bounds else {
+                continue;
+            };
+            let left = layer_bounds.x.floor();
+            let top = layer_bounds.y.floor();
+            let right = (layer_bounds.x + layer_bounds.width).ceil();
+            let bottom = (layer_bounds.y + layer_bounds.height).ceil();
+            let layer_width = (right - left).max(1.0) as u32;
+            let layer_height = (bottom - top).max(1.0) as u32;
+            let layer_delta = (-left, -top);
+            let layer = Pixmap::new(layer_width, layer_height)?;
             let layer = paint_laid_dom_scrolled(
                 tree,
                 viewport,
@@ -4204,7 +4258,10 @@ fn paint_laid_dom_scrolled(
                 suppress_transform_for,
                 clip_scope_root,
                 surface_extent,
-                surface_offset,
+                (
+                    surface_offset.0 + layer_delta.0,
+                    surface_offset.1 + layer_delta.1,
+                ),
                 raster_scale,
                 print_economy,
                 canvas_background,
@@ -4214,8 +4271,8 @@ fn paint_laid_dom_scrolled(
                 ..tiny_skia::PixmapPaint::default()
             };
             pixmap.draw_pixmap(
-                0,
-                0,
+                left as i32,
+                top as i32,
                 layer.as_ref(),
                 &group_paint,
                 Transform::identity(),
@@ -7582,8 +7639,33 @@ fn percent_decode(s: &str) -> Vec<u8> {
 /// Decode raster image bytes (GIF/JPEG/PNG/WebP) to a premultiplied-alpha pixmap
 /// resized to `w`x`h`.
 fn raster_to_pixmap(bytes: &[u8], w: u32, h: u32) -> Option<Pixmap> {
-    let img = image::load_from_memory(bytes).ok()?.to_rgba8();
-    let resized = image::imageops::resize(&img, w, h, image::imageops::FilterType::Triangle);
+    let decoded = image::load_from_memory(bytes).ok()?;
+    let resized = match decoded {
+        // JPEGs and ordinary RGB PNGs do not need a full source-sized RGBA
+        // copy just to add an opaque alpha channel. Resize their three color
+        // channels first, release the large source, then expand only the
+        // destination. Keep every alpha-bearing and higher-depth format on
+        // the established RGBA-first path so its sampling remains unchanged.
+        image::DynamicImage::ImageRgb8(source) => {
+            let resized = image::imageops::resize(
+                &source,
+                w,
+                h,
+                image::imageops::FilterType::Triangle,
+            );
+            drop(source);
+            image::DynamicImage::ImageRgb8(resized).into_rgba8()
+        }
+        decoded => {
+            let source = decoded.into_rgba8();
+            image::imageops::resize(
+                &source,
+                w,
+                h,
+                image::imageops::FilterType::Triangle,
+            )
+        }
+    };
     let mut raw = resized.into_raw();
     for pixel in raw.chunks_exact_mut(4) {
         let a = pixel[3] as u32;

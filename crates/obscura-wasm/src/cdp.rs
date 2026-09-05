@@ -240,6 +240,8 @@ pub struct PortableCdp {
     io: obscura_cdp::portable_io::IoState,
     fetch_resolutions: VecDeque<Value>,
     raw_abi_mode: bool,
+    #[cfg(feature = "render")]
+    memory_trace_enabled: bool,
 }
 
 #[wasm_bindgen]
@@ -283,6 +285,8 @@ impl PortableCdp {
             io: obscura_cdp::portable_io::IoState::with_limits(128, MAX_STREAM_BYTES),
             fetch_resolutions: VecDeque::new(),
             raw_abi_mode: false,
+            #[cfg(feature = "render")]
+            memory_trace_enabled: false,
         })
     }
 
@@ -2220,6 +2224,8 @@ impl PortableCdp {
         let target_id = format!("page-{page_number}");
         debug_assert_eq!(shared_page_id(&target_id), Some(shared_page));
         let mut core = ObscuraCore::new(html).expect("empty document is valid");
+        #[cfg(feature = "render")]
+        core.set_memory_trace_enabled(self.memory_trace_enabled);
         let _ = core.set_document_metadata(url, "", "UTF-8");
         let loader_id = format!("loader-{target_id}-{}", self.next_loader_id);
         self.next_loader_id = self.next_loader_id.saturating_add(1);
@@ -2473,6 +2479,26 @@ impl PortableCdp {
     fn discard_session_events(&mut self, connection_id: u32, session_id: &str) {
         self.shared_state
             .discard_session_events(ConnectionId::new(u64::from(connection_id)), session_id);
+    }
+}
+
+#[cfg(feature = "render")]
+impl PortableCdp {
+    pub(crate) fn set_memory_trace_enabled(&mut self, enabled: bool) {
+        self.memory_trace_enabled = enabled;
+        for target in self.targets.values_mut() {
+            target.core.set_memory_trace_enabled(enabled);
+        }
+    }
+
+    pub(crate) fn take_memory_trace_json(&mut self) -> String {
+        let mut targets = Vec::new();
+        for (target_id, target) in &mut self.targets {
+            let points = serde_json::from_str::<Value>(&target.core.take_memory_trace())
+                .unwrap_or_else(|_| Value::Array(Vec::new()));
+            targets.push(json!({"targetId": target_id, "points": points}));
+        }
+        serde_json::to_string(&targets).unwrap_or_else(|_| "[]".to_string())
     }
 }
 

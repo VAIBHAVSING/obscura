@@ -142,10 +142,12 @@ export class ObscuraCore {
      * facade. Metadata changes do not invalidate DOM node wrappers.
      */
     setDocumentMetadata(url: string, referrer: string, encoding: string): void;
+    setMemoryTraceEnabled(enabled: boolean): void;
     /**
      * Replace the document using Obscura's existing html5ever-backed parser.
      */
     set_html(html: string): void;
+    takeMemoryTrace(): string;
     /**
      * Return the non-HttpOnly document.cookie view for the current page.
      */
@@ -304,6 +306,10 @@ export function cdpRawAbiVersion(): number;
  */
 export function cdpRecordNetwork(browser_id: number, target_id: string, metadata: Uint8Array): void;
 
+export function cdpSetMemoryTraceEnabled(browser_id: number, enabled: boolean): void;
+
+export function cdpTakeMemoryTrace(browser_id: number): string;
+
 export function connectionClose(browser_id: number, connection_id: number): void;
 
 export function connectionOpen(browser_id: number): number;
@@ -347,3 +353,5 @@ export function probe(): string;
 export function sharedCdpProtocolAbiVersion(): number;
 
 export function version(): string;
+
+export function wasmMemoryBytes(): number;

@@ -6,6 +6,7 @@ import { CdpClient, CdpController, connect, type CdpAdapter, type CdpConnection,
 import { defaultWasmModulePath, ObscuraCdpServer } from "./cdp-server.mjs";
 import { connectPlaywright, type PlaywrightAdapterOptions } from "./playwright.mjs";
 import { connectPuppeteer, type PuppeteerAdapterOptions } from "./puppeteer.mjs";
+import { launchProfileProcess, ProfileBrowserProcess } from "./profile-process.mjs";
 import { local, openProfile, sealProfile, type ProfileStore } from "./internal/storage.mjs";
 
 const PACKAGE_VERSION = "0.1.0-portable";
@@ -54,6 +55,12 @@ export interface ScreenshotOptions {
   height?: number;
   scrollX?: number;
   scrollY?: number;
+}
+
+export interface ViewportOptions {
+  width: number;
+  height: number;
+  deviceScaleFactor?: number;
 }
 
 export interface PdfOptions {
@@ -181,12 +188,14 @@ export class Page {
   }
 
   static async create(context: BrowserContext, client: CdpConnection): Promise<Page> {
-    const params: Record<string, unknown> = { url: "about:blank" };
-    if (context.id !== "default") params.browserContextId = context.id;
-    const { targetId } = await client.command<{ targetId: string }>("Target.createTarget", params);
-    const { sessionId } = await client.command<{ sessionId: string }>("Target.attachToTarget", { targetId, flatten: true });
-    await Promise.all([client.command("Runtime.enable", {}, sessionId), client.command("Page.enable", {}, sessionId)]);
-    return new Page(context, client, targetId, sessionId);
+    let targetId = context.claimInitialTarget();
+    if (!targetId) targetId = await context.createTarget();
+    try {
+      return new Page(context, client, targetId, "");
+    } catch (error) {
+      await context.closeTarget(targetId).catch(() => undefined);
+      throw error;
+    }
   }
 
   url(): string { return this.#url; }
@@ -194,12 +203,11 @@ export class Page {
   async goto(url: string, options: NavigationOptions = {}): Promise<Record<string, unknown>> {
     this.#ensureOpen();
     if (typeof url !== "string" || url.length === 0) throw new TypeError("navigation URL must be a non-empty string");
-    const result = await this.#client.command<Record<string, unknown>>("Page.navigate", {
-      url,
+    const result = await this.#context.navigateTarget(this.#targetId, url, {
       ...(options.referrer === undefined ? {} : { referrer: options.referrer }),
       ...(options.extraHTTPHeaders === undefined ? {} : { extraHTTPHeaders: options.extraHTTPHeaders }),
       ...(options.timeout === undefined ? {} : { timeout: options.timeout }),
-    }, this.#sessionId);
+    });
     this.#url = url;
     this.#context.markDirty();
     return result;
@@ -210,24 +218,24 @@ export class Page {
   async evaluate<T = unknown, Argument = unknown>(expression: (arg: Argument) => T, arg: Argument): Promise<T>;
   async evaluate<T = unknown>(expression: string | ((arg?: unknown) => T), arg?: unknown): Promise<T> {
     this.#ensureOpen();
-    const result = await this.#client.command<{ result?: { value?: T }; exceptionDetails?: unknown }>("Runtime.evaluate", {
-      expression: expressionFor(expression, arg),
-      returnByValue: true,
-      awaitPromise: true,
-    }, this.#sessionId);
-    if (result.exceptionDetails) throw codedError("Page evaluation failed", "ERR_OBSCURA_EVALUATION");
+    const result = await this.#context.evaluateTarget<T>(this.#targetId, expressionFor(expression, arg));
     this.#context.markDirty();
-    return result.result?.value as T;
+    return result;
   }
 
   title(): Promise<string> { return this.evaluate<string>("document.title"); }
   content(): Promise<string> { return this.evaluate<string>("document.documentElement.outerHTML"); }
 
+  async setViewport(options: ViewportOptions): Promise<void> {
+    this.#ensureOpen();
+    this.#context.setTargetViewport(this.#targetId, options);
+  }
+
   async screenshot(options: ScreenshotOptions = {}): Promise<Uint8Array> {
     this.#ensureOpen();
     const { path, ...params } = options;
-    const result = await this.#client.command<{ data: string }>("Page.captureScreenshot", params, this.#sessionId);
-    const bytes = new Uint8Array(Buffer.from(result.data, "base64"));
+    const result = await this.#context.captureScreenshot(this.#targetId, params);
+    const bytes = result instanceof Uint8Array ? result : new Uint8Array(result);
     if (path) await writeFile(resolve(path), bytes);
     return bytes;
   }
@@ -235,8 +243,8 @@ export class Page {
   async pdf(options: PdfOptions = {}): Promise<Uint8Array> {
     this.#ensureOpen();
     const { path, ...params } = options;
-    const result = await this.#client.command<{ data: string }>("Page.printToPDF", params as Record<string, unknown>, this.#sessionId);
-    const bytes = new Uint8Array(Buffer.from(result.data, "base64"));
+    const result = await this.#context.capturePdf(this.#targetId, params);
+    const bytes = result instanceof Uint8Array ? result : new Uint8Array(result);
     if (path) await writeFile(resolve(path), bytes);
     return bytes;
   }
@@ -244,7 +252,7 @@ export class Page {
   async close(): Promise<void> {
     if (this.#closed) return;
     this.#closed = true;
-    await this.#client.command("Target.closeTarget", { targetId: this.#targetId }).catch(() => undefined);
+    await this.#context.closeTarget(this.#targetId).catch(() => undefined);
     this.#context.removePage(this);
   }
 
@@ -298,6 +306,45 @@ export class BrowserContext {
   }
 
   pages(): readonly Page[] { return [...this.#pages]; }
+
+  claimInitialTarget(): string | null {
+    this.#ensureOpen();
+    return this.#browser.server.claimInitialTarget(this.id);
+  }
+
+  async createTarget(): Promise<string> {
+    this.#ensureOpen();
+    return this.#browser.server.createEmbeddedTarget(this.id);
+  }
+
+  navigateTarget(targetId: string, url: string, options: NavigationOptions): Promise<Record<string, unknown>> {
+    this.#ensureOpen();
+    return this.#browser.server.navigateTarget(targetId, url, options);
+  }
+
+  evaluateTarget<T>(targetId: string, expression: string): Promise<T> {
+    this.#ensureOpen();
+    return this.#browser.server.evaluateTarget(targetId, expression) as Promise<T>;
+  }
+
+  setTargetViewport(targetId: string, options: ViewportOptions): void {
+    this.#ensureOpen();
+    this.#browser.server.setTargetViewport(targetId, options);
+  }
+
+  closeTarget(targetId: string): Promise<boolean> {
+    return this.#browser.server.closeTarget(targetId);
+  }
+
+  captureScreenshot(targetId: string, options: Omit<ScreenshotOptions, "path">): Promise<Uint8Array> {
+    this.#ensureOpen();
+    return this.#browser.server.captureScreenshot(targetId, options);
+  }
+
+  capturePdf(targetId: string, options: Omit<PdfOptions, "path">): Promise<Uint8Array> {
+    this.#ensureOpen();
+    return this.#browser.server.capturePdf(targetId, options);
+  }
 
   async newPage(): Promise<Page> {
     this.#ensureOpen();
@@ -543,5 +590,19 @@ export async function launch(options: BrowserOptions & CdpListenOptions = {}): P
 }
 
 export { CdpClient, connect, ObscuraCdpServer, defaultWasmModulePath };
-export type { CdpAdapter, CdpConnection, CdpListenOptions, PlaywrightAdapterOptions, PuppeteerAdapterOptions, ProfileStore };
+export { launchProfileProcess, ProfileBrowserProcess };
+export type {
+  CdpAdapter,
+  CdpConnection,
+  CdpListenOptions,
+  PlaywrightAdapterOptions,
+  PuppeteerAdapterOptions,
+  ProfileStore,
+};
+export type {
+  ProfileProcessExit,
+  ProfileProcessInfo,
+  ProfileProcessOptions,
+  ProfileProcessResourceLimits,
+} from "./profile-process.mjs";
 export default createBrowser;
