@@ -320,13 +320,20 @@ test("real WASM artifact is reachable through package CDP", { skip: !modulePath 
     assert.match(Buffer.from(pausedStylesheetBody.body, "base64").toString("utf8"), /render-target/);
     await pendingRenderNavigation;
     const pendingRenderScreenshot = client.command("Page.captureScreenshot", {}, sessionId);
+    let screenshotFinished = false;
+    void pendingRenderScreenshot.then(
+      () => { screenshotFinished = true; },
+      () => { screenshotFinished = true; },
+    );
     let imagePaused;
-    for (let attempt = 0; attempt < 200; attempt += 1) {
-      imagePaused = resourceFetchEvents.find((event) => event.params?.request?.url === imageUrl && !event.__continued);
-      if (imagePaused) {
-        imagePaused.__continued = true;
-        await client.command("Fetch.continueRequest", { requestId: imagePaused.params.requestId }, sessionId);
-        break;
+    // CSS backgrounds and img elements can fetch distinct profiles of one URL.
+    // Release every intercepted profile while the screenshot is pending.
+    for (let attempt = 0; attempt < 200 && !screenshotFinished; attempt += 1) {
+      const nextImage = resourceFetchEvents.find((event) => event.params?.request?.url === imageUrl && !event.__continued);
+      if (nextImage) {
+        imagePaused = nextImage;
+        nextImage.__continued = true;
+        await client.command("Fetch.continueRequest", { requestId: nextImage.params.requestId }, sessionId);
       }
       await new Promise((resolve) => setTimeout(resolve, 10));
     }
