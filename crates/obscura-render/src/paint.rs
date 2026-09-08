@@ -3850,7 +3850,11 @@ fn paint_laid_dom_scrolled(
         Vec<crate::dom::GeneratedBox>,
     > = std::collections::HashMap::new();
     let mut generated_after_at: Vec<Vec<crate::dom::GeneratedBox>> =
-        vec![Vec::new(); paint_order.len()];
+        if laid.generated_boxes.is_empty() {
+            Vec::new()
+        } else {
+            vec![Vec::new(); paint_order.len()]
+        };
     if !laid.generated_boxes.is_empty() {
         let paint_indices: std::collections::HashMap<obscura_dom::tree::NodeId, usize> =
             paint_order
@@ -3860,8 +3864,7 @@ fn paint_laid_dom_scrolled(
                 .collect();
         let mut last_index: std::collections::HashMap<obscura_dom::tree::NodeId, usize> =
             paint_indices.clone();
-        let dom_preorder = paint_nodes.clone();
-        for nid in dom_preorder.into_iter().rev() {
+        for nid in paint_nodes.iter().copied().rev() {
             let Some(index) = last_index.get(&nid).copied() else {
                 continue;
             };
@@ -4008,7 +4011,7 @@ fn paint_laid_dom_scrolled(
             } else {
                 paint_text_node(tree, nid, laid, &scroll_state, &mut pixmap, raster_scale);
             }
-            for generated in &generated_after_at[paint_index] {
+            for generated in generated_after_at.get(paint_index).into_iter().flatten() {
                 paint_in_flow_generated_box(
                     &mut pixmap,
                     generated,
@@ -5000,7 +5003,7 @@ fn paint_laid_dom_scrolled(
                 }
             }
         }
-        for generated in &generated_after_at[paint_index] {
+        for generated in generated_after_at.get(paint_index).into_iter().flatten() {
             paint_in_flow_generated_box(
                 &mut pixmap,
                 generated,
@@ -5231,7 +5234,7 @@ fn paint_inline_fragment_decorations(
         let background_origin = background_geometry(&union, style).origin_rect;
         let background_path = background_clip_path(background);
         let element_clip_mask = background_extra_clip(ancestor_clip_mask, clip_path_mask.as_ref());
-        let background_mask = element_clip_mask.clone();
+        let background_mask = &element_clip_mask;
 
         if let Some(shadow) = fragment_style.box_shadow {
             paint_box_shadow(
@@ -7057,15 +7060,13 @@ fn draw_text(
                 if px >= 0 && px < width && py >= 0 && py < height {
                     let alpha = (a_full as f32 * c) as u8;
                     if alpha > 0 {
-                        let mut px_indices = vec![(py * width + px) as usize];
-                        if is_bold {
-                            for dx in 1..raster_scale.ceil().max(1.0) as i32 {
-                                if px + dx < width {
-                                    px_indices.push((py * width + px + dx) as usize);
-                                }
-                            }
-                        }
-                        for idx in px_indices {
+                        let spread = if is_bold {
+                            raster_scale.ceil().max(1.0) as i32
+                        } else {
+                            1
+                        };
+                        for dx in 0..spread.min(width - px) {
+                            let idx = (py * width + px + dx) as usize;
                             let mask_alpha = clip_mask
                                 .and_then(|mask| mask.data().get(idx))
                                 .copied()
@@ -8813,7 +8814,7 @@ fn paint_in_flow_generated_box(
     let background_path = background_clip_path(background);
     let element_clip_mask =
         background_extra_clip(ancestor_clip_mask.as_ref(), clip_path_mask.as_ref());
-    let background_mask = element_clip_mask.clone();
+    let background_mask = &element_clip_mask;
     if style.mask_image.is_none() && !style.background_clip_text {
         if let (Some(color), Some(path)) = (style.background_color, background_path.as_ref()) {
             let mut paint = Paint::default();
@@ -9057,7 +9058,7 @@ fn paint_positioned_pseudo(
     let background_path = background_clip_path(background);
     let element_clip_mask =
         background_extra_clip(ancestor_clip_mask.as_ref(), clip_path_mask.as_ref());
-    let background_mask = element_clip_mask.clone();
+    let background_mask = &element_clip_mask;
     if style.mask_image.is_none() && !style.background_clip_text {
         if let (Some(color), Some(path)) = (style.background_color, background_path.as_ref()) {
             let mut paint = Paint::default();
