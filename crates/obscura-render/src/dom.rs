@@ -14,6 +14,36 @@ use taffy::prelude::*;
 
 use crate::{to_taffy_style, Rect};
 
+#[cfg(not(target_arch = "wasm32"))]
+struct RenderTimer(std::time::Instant);
+
+#[cfg(target_arch = "wasm32")]
+struct RenderTimer;
+
+impl RenderTimer {
+    fn start() -> Self {
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            Self(std::time::Instant::now())
+        }
+        #[cfg(target_arch = "wasm32")]
+        {
+            Self
+        }
+    }
+
+    fn elapsed(&self) -> std::time::Duration {
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            self.0.elapsed()
+        }
+        #[cfg(target_arch = "wasm32")]
+        {
+            std::time::Duration::ZERO
+        }
+    }
+}
+
 /// Text width for layout. With the `paint` feature this is exact (real glyph
 /// metrics from the embedded font, shared with rasterization). Without it
 /// (layout-only builds, e.g. for `getBoundingClientRect`), fall back to a
@@ -4243,7 +4273,8 @@ fn layout_dom_with_web_fonts_pass_limit_at_animation_time(
     animation_sample: crate::AnimationSample,
     animation_timeline: &mut crate::AnimationTimelineState,
 ) -> (DomLayout, ContainerLayoutTelemetry) {
-    let timing = std::env::var("OBSCURA_RENDER_TIMING").is_ok();
+    let timing = cfg!(not(target_arch = "wasm32"))
+        && std::env::var("OBSCURA_RENDER_TIMING").is_ok();
 
     // Collect the text of every <style> block in document order.
     let mut css_sources = Vec::new();
@@ -4266,7 +4297,7 @@ fn layout_dom_with_web_fonts_pass_limit_at_animation_time(
         }
     }
 
-    let t0 = std::time::Instant::now();
+    let t0 = RenderTimer::start();
     let (sheet, stylesheet_cache_hit) = match stylesheet_cache {
         Some(cache) => cache.get_or_parse(tree, &css_sources, viewport, media_type),
         None => (
@@ -4566,7 +4597,7 @@ fn layout_dom_once(
     crate::css::ContainerQueryStats,
     std::time::Duration,
 ) {
-    let t1 = std::time::Instant::now();
+    let t1 = RenderTimer::start();
     let mut matcher = tree.matcher();
     let (mut styles, mut custom_properties, fresh_styles) = match retained {
         Some((retained, fresh)) => (retained.styles, retained.custom_properties, Some(fresh)),

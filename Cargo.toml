@@ -2,6 +2,7 @@
 resolver = "2"
 members = [
     "crates/obscura-dom",
+    "crates/obscura-platform",
     "crates/obscura-net",
     "crates/obscura-browser",
     "crates/obscura-cdp",
@@ -9,6 +10,7 @@ members = [
     "crates/obscura-mcp",
     "crates/obscura-render",
     "crates/obscura-cli",
+    "crates/obscura-wasm",
     "crates/obscura",
 ]
 
@@ -20,9 +22,10 @@ repository = "https://github.com/h4ckf0r0day/obscura"
 
 [workspace.dependencies]
 obscura-dom = { path = "crates/obscura-dom" }
+obscura-platform = { path = "crates/obscura-platform" }
 obscura-net = { path = "crates/obscura-net" }
 obscura-browser = { path = "crates/obscura-browser" }
-obscura-cdp = { path = "crates/obscura-cdp" }
+obscura-cdp = { path = "crates/obscura-cdp", default-features = false }
 obscura-js = { path = "crates/obscura-js" }
 obscura-mcp = { path = "crates/obscura-mcp" }
 obscura-render = { path = "crates/obscura-render" }

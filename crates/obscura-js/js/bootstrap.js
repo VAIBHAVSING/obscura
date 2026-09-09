@@ -93,7 +93,7 @@ let _domMutationEpoch = 0;
 let _treeMutationEpoch = 0;
 const _DOM_MUTATION_COMMANDS = new Set([
   "append_child", "insert_before", "remove_child",
-  "set_attribute", "remove_attribute",
+  "set_attribute", "remove_attribute", "set_attribute_ns", "remove_attribute_ns",
   "set_text_content", "set_inner_html", "set_inner_html_context",
   "set_fragment_html_executable",
 ]);
@@ -743,11 +743,32 @@ globalThis.console = {
   assert: (c, ...a) => { if (!c) _consoleFn("error", ["Assertion failed:", ...a]); },
 };
 
+const _MAX_TIMER_ID = 0x7fffffff;
 let _tid = 0;
-const _clearedTimers = new Set();
+// HTML timers and animation callbacks share one positive, bounded ID space in
+// this realm. Keeping only live IDs avoids the unbounded cancellation
+// tombstones the old `_clearedTimers` set accumulated, including for unknown
+// IDs passed by page code.
+const _activeTimerIds = new Set();
 const _intervals = new Set();
 const _nativeTimerIds = new Map();
 const __obscuraPendingTimeoutDeadlines = new Map();
+function _allocateTimerId() {
+  // The HTML timer algorithm requires an implementation-defined positive
+  // integer which is not already active. Wrap before Number loses integer
+  // precision, and scan only on wrap/collision in normal use.
+  for (let attempts = 0; attempts < _MAX_TIMER_ID; attempts++) {
+    _tid = _tid >= _MAX_TIMER_ID ? 1 : _tid + 1;
+    if (!_activeTimerIds.has(_tid)) {
+      _activeTimerIds.add(_tid);
+      return _tid;
+    }
+  }
+  throw new RangeError("No browser timer IDs are available");
+}
+function _releaseTimerId(id) {
+  _activeTimerIds.delete(id);
+}
 Object.defineProperty(globalThis, '__obscura_nextPendingTimeoutDelay', {
   value: function() {
     const now = performance.now();
@@ -809,51 +830,96 @@ const _coerceTimerFn = (fn) => {
 
 globalThis.setTimeout = (fn, delay = 0, ...args) => {
   const f = _coerceTimerFn(fn);
-  if (f === null) return ++_tid;
-  const id = ++_tid;
+  if (f === null) {
+    const id = _allocateTimerId();
+    _releaseTimerId(id);
+    return id;
+  }
   const normalizedDelay = Math.max(0, Number(delay) || 0);
-  const nativeId = _scheduleAfter(normalizedDelay, () => {
-    _nativeTimerIds.delete(id);
-    __obscuraPendingTimeoutDeadlines.delete(id);
-    if (_clearedTimers.has(id)) return;
-    try { f(...args); } catch(e) { console.error("Timer error:", e); }
-  });
+  const id = _allocateTimerId();
+  let nativeId;
+  try {
+    nativeId = _scheduleAfter(normalizedDelay, () => {
+      _nativeTimerIds.delete(id);
+      __obscuraPendingTimeoutDeadlines.delete(id);
+      _releaseTimerId(id);
+      try { f(...args); } catch(e) { console.error("Timer error:", e); }
+    });
+  } catch (error) {
+    _releaseTimerId(id);
+    throw error;
+  }
   if (nativeId !== undefined) {
     _nativeTimerIds.set(id, nativeId);
     __obscuraPendingTimeoutDeadlines.set(id, performance.now() + normalizedDelay);
+  } else {
+    _releaseTimerId(id);
   }
   return id;
 };
 
 globalThis.clearTimeout = (id) => {
-  _clearedTimers.add(id);
+  // setTimeout() and setInterval() draw from the same ordered map. Either
+  // clear function may therefore cancel either kind, including an interval
+  // clearing itself from inside its currently running callback.
+  const ownedId = _intervals.delete(id)
+    || _nativeTimerIds.has(id)
+    || __obscuraPendingTimeoutDeadlines.has(id);
   __obscuraPendingTimeoutDeadlines.delete(id);
   const nativeId = _nativeTimerIds.get(id);
   if (nativeId !== undefined) {
     Deno.core.cancelTimer(nativeId);
     _nativeTimerIds.delete(id);
   }
+  if (ownedId) _releaseTimerId(id);
 };
 
 globalThis.setInterval = (fn, delay = 0, ...args) => {
   const f = _coerceTimerFn(fn);
-  if (f === null) return ++_tid;
-  const id = ++_tid;
-  _intervals.add(id);
+  if (f === null) {
+    const id = _allocateTimerId();
+    _releaseTimerId(id);
+    return id;
+  }
+  const normalizedDelay = Math.max(0, Number(delay) || 0);
+  const id = _allocateTimerId();
   const tick = () => {
+    _nativeTimerIds.delete(id);
     if (!_intervals.has(id)) return;
     try { f(...args); } catch(e) { console.error("Interval error:", e); }
     if (!_intervals.has(id)) return;
-    const nativeId = _scheduleAfter(delay, tick);
-    if (nativeId !== undefined) _nativeTimerIds.set(id, nativeId);
+    let nativeId;
+    try {
+      nativeId = _scheduleAfter(normalizedDelay, tick);
+    } catch (error) {
+      _intervals.delete(id);
+      _releaseTimerId(id);
+      throw error;
+    }
+    if (nativeId !== undefined) {
+      _nativeTimerIds.set(id, nativeId);
+    } else {
+      _intervals.delete(id);
+      _releaseTimerId(id);
+    }
   };
-  const nativeId = _scheduleAfter(delay, tick);
-  if (nativeId !== undefined) _nativeTimerIds.set(id, nativeId);
+  let nativeId;
+  try {
+    nativeId = _scheduleAfter(normalizedDelay, tick);
+  } catch (error) {
+    _releaseTimerId(id);
+    throw error;
+  }
+  if (nativeId !== undefined) {
+    _intervals.add(id);
+    _nativeTimerIds.set(id, nativeId);
+  } else {
+    _releaseTimerId(id);
+  }
   return id;
 };
 
 globalThis.clearInterval = (id) => {
-  _intervals.delete(id);
   globalThis.clearTimeout(id);
 };
 
@@ -889,7 +955,12 @@ function _scheduleRenderingOpportunity() {
   if (_renderOpportunityScheduled || _renderOpportunityRunning
       || !_renderOpportunityHasWork()) return;
   _renderOpportunityScheduled = true;
-  _scheduleAfter(_RAF_FRAME_DELAY_MS, _runRenderingOpportunity);
+  try {
+    _scheduleAfter(_RAF_FRAME_DELAY_MS, _runRenderingOpportunity);
+  } catch (error) {
+    _renderOpportunityScheduled = false;
+    throw error;
+  }
 }
 
 function _runRenderingOpportunity() {
@@ -929,6 +1000,7 @@ function _runAnimationFrameBatch() {
       // callback in the same frame is running.
       if (!batch.has(id)) continue;
       batch.delete(id);
+      _releaseTimerId(id);
       try { callback(timestamp); }
       catch (e) { console.error("Animation frame error:", e); }
     }
@@ -945,17 +1017,34 @@ globalThis.requestAnimationFrame = (fn) => {
       "Failed to execute 'requestAnimationFrame' on 'Window': parameter 1 is not of type 'Function'."
     );
   }
-  const id = ++_tid;
+  const id = _allocateTimerId();
   _rafPending.set(id, fn);
-  _scheduleAnimationFrame();
+  try {
+    _scheduleAnimationFrame();
+  } catch (error) {
+    _rafPending.delete(id);
+    _releaseTimerId(id);
+    throw error;
+  }
   return id;
 };
 
 globalThis.cancelAnimationFrame = (id) => {
-  _rafPending.delete(id);
-  if (_rafCurrentBatch) _rafCurrentBatch.delete(id);
+  const ownedId = _rafPending.delete(id)
+    || (_rafCurrentBatch ? _rafCurrentBatch.delete(id) : false);
+  if (ownedId) _releaseTimerId(id);
 };
-globalThis.queueMicrotask = globalThis.queueMicrotask || ((fn) => Promise.resolve().then(fn));
+const _resolvedMicrotaskPromise = Promise.resolve();
+globalThis.queueMicrotask = function queueMicrotask(callback) {
+  if (typeof callback !== "function") {
+    throw new TypeError(
+      "Failed to execute 'queueMicrotask' on 'Window': parameter 1 is not of type 'Function'."
+    );
+  }
+  // Do not return the Promise: queueMicrotask returns undefined. The host's
+  // end-of-task checkpoint drains this reaction before the next browser task.
+  _resolvedMicrotaskPromise.then(callback);
+};
 
 // Browser posted tasks need an event-loop boundary but no clock delay. Tokio's
 // timer wheel imposes roughly a one-millisecond floor even for delay zero,
@@ -2348,17 +2437,21 @@ class CDATASection extends Text {
   cloneNode() { return new CDATASection(+_dom("create_text_node", this.data)); }
 }
 
-// ProcessingInstruction: nodeType 7, nodeName === target. Extends CharacterData
-// and carries a separate target. Backed by a text node so data/nodeValue/
-// textContent/length work without native PI support.
+// ProcessingInstruction: nodeType 7, nodeName === target. The immutable target
+// is stored in the native node; wrappers created by traversal recover it lazily.
 class ProcessingInstruction extends CharacterData {
   constructor(nid, target) { super(nid); this._target = target; }
-  get target() { return this._target; }
-  get nodeName() { return this._target; }
+  get target() {
+    if (this._target === undefined) {
+      this._target = _domParse("pi_target", this._nid) ?? "";
+    }
+    return this._target;
+  }
+  get nodeName() { return this.target; }
   get nodeType() { return 7; }
   get nodeValue() { return this.data; }
   set nodeValue(v) { this.data = v; }
-  cloneNode() { return new ProcessingInstruction(+_dom("create_text_node", this.data), this._target); }
+  cloneNode() { return document.createProcessingInstruction(this.target, this.data); }
 }
 
 // Document character encoding (WHATWG canonical name, e.g. "UTF-8", "EUC-JP").
@@ -4872,7 +4965,7 @@ class Document extends Node {
     if (str.indexOf("?>") !== -1) {
       throw new DOMException("Processing instruction data must not contain '?>'", "InvalidCharacterError");
     }
-    const nid = +_dom("create_text_node", str);
+    const nid = +_dom("create_processing_instruction", tgt, str);
     const n = new ProcessingInstruction(nid, tgt);
     _seedDetachedTreeState(n);
     _cache.set(nid, n);
@@ -5183,13 +5276,18 @@ class Document extends Node {
         if (name === "" || /[\t\n\f\r >]/.test(name)) {
           throw new DOMException("The qualified name '" + name + "' contains an invalid character", "InvalidCharacterError");
         }
+        const publicIdValue = publicId === undefined ? "" : String(publicId);
+        const systemIdValue = systemId === undefined ? "" : String(systemId);
+        const nid = +_dom("create_doctype", name, publicIdValue);
         const dt = new DocumentType(
-          +_dom("create_comment_node", ""),
+          nid,
           name,
-          publicId === undefined ? "" : String(publicId),
-          systemId === undefined ? "" : String(systemId)
+          publicIdValue,
+          systemIdValue
         );
         dt._ownerDocument = ownerDoc;
+        _seedDetachedTreeState(dt);
+        _cache.set(nid, dt);
         return dt;
       },
       hasFeature() { return true; },
@@ -5293,10 +5391,20 @@ class DocumentType extends Node {
     this._systemId = systemId;
   }
   get nodeType() { return 10; }
-  get nodeName() { return this._name; }
-  get name() { return this._name; }
-  get publicId() { return this._publicId; }
-  get systemId() { return this._systemId; }
+  get nodeName() { return this.name; }
+  get name() {
+    if (this._name === undefined) {
+      this._name = _domParse("doctype_name", this._nid) ?? "";
+    }
+    return this._name;
+  }
+  get publicId() {
+    if (this._publicId === undefined) {
+      this._publicId = _domParse("doctype_public_id", this._nid) ?? "";
+    }
+    return this._publicId;
+  }
+  get systemId() { return this._systemId ?? ""; }
   get nodeValue() { return null; }
   set nodeValue(v) {}
   get ownerDocument() { return this._ownerDocument || globalThis.document; }
@@ -5884,8 +5992,10 @@ function _wrap(nid) {
   let n;
   if (t === 1) { const C = _elementClassFor(nid); n = new C(nid); }
   else if (t === 3) n = new Text(nid);
+  else if (t === 7) n = new ProcessingInstruction(nid);
   else if (t === 8) n = new Comment(nid);
   else if (t === 9) n = new Document(nid);
+  else if (t === 10) n = new DocumentType(nid);
   else n = new Node(nid);
   _cache.set(nid, n);
   return n;
@@ -6532,6 +6642,28 @@ function _serializeBody(initBody, headers) {
   return typeof initBody === 'string' ? initBody : String(initBody);
 }
 
+// Keep fetch cancellation in the page realm. The host request remains behind
+// its own bounded deadline, while an AbortSignal immediately rejects the
+// page-owned promise without exposing a host Promise or controller.
+function _fetchAbortReason(signal) {
+  if (signal && signal.reason !== undefined && signal.reason !== null) return signal.reason;
+  return new DOMException('The operation was aborted.', 'AbortError');
+}
+function _awaitFetchWithSignal(promise, signal) {
+  if (!signal || typeof signal.addEventListener !== 'function') return promise;
+  if (signal.aborted) return Promise.reject(_fetchAbortReason(signal));
+  let remove = null;
+  const aborted = new Promise((resolve, reject) => {
+    const onAbort = () => reject(_fetchAbortReason(signal));
+    remove = () => {
+      try { signal.removeEventListener('abort', onAbort); } catch (_) {}
+    };
+    try { signal.addEventListener('abort', onAbort); } catch (_) {}
+    if (signal.aborted) onAbort();
+  });
+  return Promise.race([promise, aborted]).finally(() => { if (remove) remove(); });
+}
+
 globalThis.fetch = async (input, init = {}) => {
   init = init || {};
   let url = typeof input === "string"
@@ -6556,8 +6688,13 @@ globalThis.fetch = async (input, init = {}) => {
   if (fetchCredentials !== "omit" && fetchCredentials !== "same-origin" && fetchCredentials !== "include") {
     throw new TypeError("Failed to execute 'fetch': '" + fetchCredentials + "' is not a valid RequestCredentials value");
   }
+  const fetchSignal = init.signal || (input instanceof Request ? input.signal : undefined);
+  if (fetchSignal && fetchSignal.aborted) throw _fetchAbortReason(fetchSignal);
   const pageOrigin = (function() { try { const u = new URL(_domParse("document_url") || "about:blank"); return u.origin; } catch(e) { return ""; } })();
-  const raw = await Deno.core.ops.op_fetch_url(url, method, hdrs, body, pageOrigin, fetchMode, fetchCredentials);
+  const raw = await _awaitFetchWithSignal(
+    Deno.core.ops.op_fetch_url(url, method, hdrs, body, pageOrigin, fetchMode, fetchCredentials),
+    fetchSignal,
+  );
   const parsed = JSON.parse(raw);
   if (parsed.blocked) {
     const err = new TypeError('net::ERR_FAILED');
@@ -6662,6 +6799,12 @@ globalThis.XMLHttpRequest = class XMLHttpRequest extends XMLHttpRequestEventTarg
     this._headers = {};
     this._responseHeaders = {};
     this._aborted = false;
+    this._timedOut = false;
+    this._requestToken = 0;
+    this._requestController = null;
+    this._timeoutId = null;
+    this._sendActive = false;
+    this._async = true;
     this._listeners = {};
     this.onreadystatechange = null;
     this.onload = null;
@@ -6674,8 +6817,17 @@ globalThis.XMLHttpRequest = class XMLHttpRequest extends XMLHttpRequestEventTarg
   }
 
   open(method, url, async_) {
-    this._method = method;
-    this._url = url;
+    if (async_ === false) {
+      throw new DOMException('Synchronous XMLHttpRequest is not supported.', 'NotSupportedError');
+    }
+    if (this._timeoutId !== null) { clearTimeout(this._timeoutId); this._timeoutId = null; }
+    try { this._requestController?.abort(); } catch (_) {}
+    this._requestController = null;
+    this._requestToken += 1;
+    this._sendActive = false;
+    this._method = String(method || 'GET').toUpperCase();
+    this._url = String(url || '');
+    this._async = true;
     this._headers = {};
     this._responseHeaders = {};
     this._aborted = false;
@@ -6687,7 +6839,13 @@ globalThis.XMLHttpRequest = class XMLHttpRequest extends XMLHttpRequestEventTarg
   }
 
   setRequestHeader(name, value) {
-    this._headers[name] = value;
+    if (this.readyState !== this.OPENED || this._sendActive) {
+      throw new DOMException('The XHR is not in the OPENED state.', 'InvalidStateError');
+    }
+    const key = String(name);
+    const next = String(value);
+    const previous = Object.keys(this._headers).find((entry) => entry.toLowerCase() === key.toLowerCase());
+    this._headers[previous || key] = previous ? `${this._headers[previous]}, ${next}` : next;
   }
 
   getResponseHeader(name) {
@@ -6707,11 +6865,30 @@ globalThis.XMLHttpRequest = class XMLHttpRequest extends XMLHttpRequestEventTarg
   overrideMimeType(mime) { this._overrideMime = mime; }
 
   send(body) {
-    if (this.readyState !== 1) return;
+    if (this.readyState !== this.OPENED || this._sendActive) {
+      throw new DOMException('The XHR is not in the OPENED state.', 'InvalidStateError');
+    }
     if (this._aborted) return;
 
     const xhr = this;
+    const token = ++this._requestToken;
+    this._sendActive = true;
+    this._timedOut = false;
+    this._requestController = typeof AbortController === 'function' ? new AbortController() : null;
     this._fireEvent('loadstart');
+
+    const current = () => xhr._requestToken === token && !xhr._aborted && !xhr._timedOut;
+    const clearRequestTimer = () => {
+      if (xhr._timeoutId !== null) {
+        clearTimeout(xhr._timeoutId);
+        xhr._timeoutId = null;
+      }
+    };
+    const completeRequest = () => {
+      clearRequestTimer();
+      xhr._sendActive = false;
+      xhr._requestController = null;
+    };
 
     let url = this._url;
     if (url && !url.includes('://')) {
@@ -6721,14 +6898,35 @@ globalThis.XMLHttpRequest = class XMLHttpRequest extends XMLHttpRequestEventTarg
       } catch(e) {}
     }
 
+    const timeout = Number(xhr.timeout);
+    if (Number.isFinite(timeout) && timeout > 0) {
+      xhr._timeoutId = setTimeout(() => {
+        if (!current()) return;
+        xhr._timedOut = true;
+        xhr._aborted = true;
+        xhr._requestToken += 1;
+        const controller = xhr._requestController;
+        try { controller?.abort(new DOMException('The XHR request timed out.', 'TimeoutError')); } catch (_) {}
+        completeRequest();
+        xhr.status = 0;
+        xhr.statusText = '';
+        xhr.response = null;
+        xhr.responseText = '';
+        xhr._setReadyState(4);
+        xhr._fireEvent('timeout');
+        xhr._fireEvent('loadend');
+      }, Math.min(timeout, 2 ** 31 - 1));
+    }
+
     fetch(url, {
       method: this._method,
       headers: this._headers,
       body: body || undefined,
       mode: 'cors',
       credentials: this.withCredentials ? 'include' : 'same-origin',
+      signal: this._requestController?.signal,
     }).then(async (resp) => {
-      if (xhr._aborted) return;
+      if (!current()) return;
 
       xhr.status = resp.status;
       xhr.statusText = resp.statusText || '';
@@ -6741,10 +6939,11 @@ globalThis.XMLHttpRequest = class XMLHttpRequest extends XMLHttpRequestEventTarg
       xhr._setReadyState(2); // HEADERS_RECEIVED
 
       const text = await resp.text();
-      if (xhr._aborted) return;
+      if (!current()) return;
 
       xhr.responseText = text;
       xhr._setReadyState(3); // LOADING
+      xhr._fireEvent('progress', { loaded: text.length, total: text.length, lengthComputable: true });
 
       switch (xhr.responseType) {
         case 'json':
@@ -6768,10 +6967,12 @@ globalThis.XMLHttpRequest = class XMLHttpRequest extends XMLHttpRequestEventTarg
       }
 
       xhr._setReadyState(4); // DONE
+      completeRequest();
       xhr._fireEvent('load');
       xhr._fireEvent('loadend');
     }).catch((err) => {
-      if (xhr._aborted) return;
+      if (xhr._requestToken !== token || xhr._aborted || xhr._timedOut) return;
+      completeRequest();
       xhr.status = 0;
       xhr.readyState = 4;
       xhr._fireEvent('readystatechange');
@@ -6779,18 +6980,23 @@ globalThis.XMLHttpRequest = class XMLHttpRequest extends XMLHttpRequestEventTarg
         xhr._aborted = true;
         xhr._fireEvent('abort');
         xhr._fireEvent('loadend');
-        if (xhr.onabort) xhr.onabort(err);
       } else {
         xhr._fireEvent('error');
         xhr._fireEvent('loadend');
-        if (xhr.onerror) xhr.onerror(err);
       }
     });
   }
 
   abort() {
+    if (this.readyState === this.UNSENT || (this.readyState === this.DONE && !this._sendActive)) return;
     this._aborted = true;
+    this._requestToken += 1;
+    if (this._timeoutId !== null) { clearTimeout(this._timeoutId); this._timeoutId = null; }
+    try { this._requestController?.abort(); } catch (_) {}
+    this._requestController = null;
+    this._sendActive = false;
     if (this.readyState > 0 && this.readyState < 4) {
+      this.status = 0;
       this._setReadyState(4);
       this._fireEvent('abort');
       this._fireEvent('loadend');
@@ -6834,8 +7040,8 @@ globalThis.XMLHttpRequest = class XMLHttpRequest extends XMLHttpRequestEventTarg
     }
   }
 
-  _fireEvent(type) {
-    const event = { type, target: this, currentTarget: this, bubbles: false };
+  _fireEvent(type, detail = {}) {
+    const event = { type, target: this, currentTarget: this, bubbles: false, ...detail };
     const handlers = this._listeners[type] || [];
     for (const h of handlers) { try { h.call(this, event); } catch(e) {} }
     const prop = 'on' + type;
@@ -9657,7 +9863,11 @@ globalThis.DOMParser = class DOMParser {
         const t = String(target), s = String(data);
         if (!_isValidPITarget(t)) throw new DOMException("Invalid processing instruction target", "InvalidCharacterError");
         if (s.indexOf("?>") !== -1) throw new DOMException("Processing instruction data must not contain '?>'", "InvalidCharacterError");
-        return new ProcessingInstruction(+_dom("create_text_node", s), t);
+        const nid = +_dom("create_processing_instruction", t, s);
+        const n = new ProcessingInstruction(nid, t);
+        _seedDetachedTreeState(n);
+        _cache.set(nid, n);
+        return n;
       },
       adoptNode: (n) => n,
       importNode: (n) => n,

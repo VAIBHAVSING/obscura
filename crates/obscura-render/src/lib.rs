@@ -96,8 +96,12 @@ mod image_capability_tests {
 #[cfg(feature = "paint")]
 mod paint;
 #[cfg(feature = "paint")]
+pub use obscura_dom::resolve_document_base_url;
+#[cfg(feature = "paint")]
 pub use paint::{
-    image_intrinsic_dimensions, paint_dom, paint_dom_scrolled,
+    encode_png_owned,
+    css_resource_requests, css_resource_urls, image_intrinsic_dimensions, paint_dom,
+    paint_dom_scrolled, CssResourceKind, CssResourceRequest,
     paint_dom_scrolled_at_animation_time,
     paint_dom_scrolled_at_animation_time_with_surface_color, paint_prepared,
     paint_prepared_region_with_scroll, paint_prepared_region_with_scroll_and_surface_color,
@@ -128,6 +132,14 @@ pub use paint::{
     CanvasSurface, CanvasSurfaceSource, ImageRequestProfile, PreparedRender, RenderResourceCache, RenderResourceLoader,
     ResolvedScrollState, SelectedImage,
     MAX_CAPTURE_DIMENSION, MAX_CAPTURE_PIXELS,
+};
+
+#[cfg(feature = "paint")]
+pub mod pdf;
+#[cfg(feature = "paint")]
+pub use pdf::{
+    raster_pdf_from_png_capture, RasterPdfError, RasterPdfOptions, RasterPdfPageRange,
+    MAX_PDF_OUTPUT_BYTES, MAX_PDF_PAGES,
 };
 
 // Real inline text layout (cosmic-text) lives behind the paint feature; the
