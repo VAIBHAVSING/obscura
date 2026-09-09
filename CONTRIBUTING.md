@@ -30,12 +30,12 @@ A few notes to keep the project maintainable:
 ## Building
 
 ```bash
-cargo build --release --features render  # binary at ./target/release/obscura
+cargo build --release --workspace --exclude obscura-wasm --features render
 ```
 
 - The first build compiles V8 from source: roughly 5 minutes and a few GB of
   disk. Incremental builds are seconds.
-- Iterating on one crate? Scope it: `cargo build -p obscura-cli`.
+- Iterating on one crate? Scope it: `cargo build -p <crate>`.
 - **Stealth** (`--features render,stealth`) retains rendering and adds the
   wreq/BoringSSL transport, browser-identity protections, and tracker blocklist.
   BoringSSL builds through CMake, so `cmake` must be installed. The rendering
@@ -56,15 +56,8 @@ cargo nextest run --release --features render --no-fail-fast
 single V8 isolate per process, so the runtime tests fail under it. `nextest`
 runs each test in its own process, which is the only supported way.
 
-The authoritative behavioral gate is the **obstacle course** in the companion
-repo [`obscura-benchmark`](https://github.com/h4ckf0r0day/obscura-benchmark)
-(33 capability and speed stages, must stay 33/33):
-
-```bash
-OBSCURA_BIN=./target/release/obscura python3 obstacle-course/run.py --runs 1 --warmup 0
-```
-
-It serves local fixtures, so it is deterministic and offline.
+The companion [`obscura-benchmark`](https://github.com/h4ckf0r0day/obscura-benchmark)
+repository contains the broader behavioral and performance suites.
 
 ## Before you open a PR
 
@@ -72,8 +65,8 @@ For any code change:
 
 1. `cargo nextest run --release --features render` passes for the crates you touched.
 2. The full render-feature nextest command above passes.
-3. `CARGO_INCREMENTAL=0 CARGO_BUILD_JOBS=2 cargo build --release --features render` compiles clean.
-4. The obstacle course still reports **33/33**.
+3. `CARGO_INCREMENTAL=0 CARGO_BUILD_JOBS=2 cargo build --release --workspace --exclude obscura-wasm --features render` compiles clean.
+4. The companion benchmark remains green.
 5. **Performance is a hard constraint.** Obscura is roughly 12x faster and uses
    about 6x less memory than headless Chrome on framework pages. Keep native
    Rust fast paths and add a JS fallback only for real spec edge cases. If your
@@ -86,12 +79,12 @@ For any code change:
    Confirm resource and navigation success before interpreting image diffs;
    pixel error is a tripwire, not a verdict. Never add hostname-specific layout
    or style behavior.
-7. For stealth changes, re-test with `--stealth`. A non-stealth binary does not
-   exercise the `wreq` path.
+7. For stealth changes, re-test the relevant Rust feature path. A render-only
+   build does not exercise the `wreq` path.
 
 Keep ops panic-safe: a panic in an op must degrade to a null result, never
 unwind into V8's FFI frame. Do not remove the robustness guards described in
-AGENTS.md (the V8 watchdog, the `tree.rs` reparenting guards, the CLI deadline).
+AGENTS.md, including the V8 watchdog and the `tree.rs` reparenting guards.
 
 Do not bulk-run `cargo fmt`. The tree is not rustfmt-clean, so a blanket format
 produces a large unrelated diff. Match the surrounding style in the files you
@@ -112,7 +105,7 @@ Fixes #316.
 ```
 
 - `type` is one of `fix`, `feat`, `docs`, `test`, `perf`, `chore`. The `scope`
-  is optional and lowercase (for example `cdp`, `js`, `net`, `stealth`, `cli`).
+  is optional and lowercase (for example `cdp`, `js`, `net`, or `stealth`).
 - No em dashes. Use commas, periods, or restructure the sentence.
 - No AI-generated filler ("This commit improves...", "As an AI...").
 - Do not add `Co-Authored-By` lines or list yourself as a co-author.

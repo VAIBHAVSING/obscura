@@ -47,10 +47,10 @@ is the responsibility of the calling code and the operator to use it safely. The
 security boundaries Obscura is meant to hold, and which are in scope:
 
 - **Egress / SSRF control.** Page content reaching loopback, RFC 1918, or
-  link-local addresses without `--allow-private-network` being set.
+  link-local addresses without the embedding API's private-network opt-in.
 - **Availability.** A page, script, or DOM structure that defeats the V8
-  termination watchdog, the CLI hard deadline, or the panic guards and so hangs
-  or aborts the process.
+  termination watchdog, the embedding process's hard deadline, or the panic
+  guards and so hangs or aborts the process.
 - **Memory safety** in Obscura's own `unsafe` Rust or in an op that bridges JS
   to Rust.
 - **Process and data integrity.** A page that escapes the intended op surface,
@@ -66,10 +66,10 @@ feature requests, but they will not be treated as security issues:
   browser fingerprint is the intended, privacy-first design of stealth mode.
   Requests to add detection-evasion for abusive purposes are out of scope.
 - **Anything behind an explicit opt-in,** such as reaching a private address
-  when `--allow-private-network` (or `OBSCURA_ALLOW_PRIVATE_NETWORK=1`) is set,
+  when the private-network option (or `OBSCURA_ALLOW_PRIVATE_NETWORK=1`) is set,
   or behavior that requires local access to the machine running Obscura.
 - **Resource use from a page you chose to load** that stays within the watchdog
-  and deadline limits. Slow pages are not a vulnerability.
+  and embedding-process deadline limits. Slow pages are not a vulnerability.
 - **Findings against the companion benchmark repo fixtures** rather than the
   engine itself.
 
@@ -89,8 +89,9 @@ system isolation:
 - The **V8 termination watchdog** terminates the isolate from a separate thread
   when synchronous script work overruns, because `tokio` timeouts only cancel at
   await points.
-- The **CLI process-level hard deadline** is an absolute backstop for a hang
-  inside a Rust op that neither `tokio` nor `terminate_execution` can interrupt.
+- An **embedding process-level hard deadline** is an absolute backstop for a
+  hang inside a Rust op that neither `tokio` nor `terminate_execution` can
+  interrupt.
 - **Panic safety:** ops are wrapped so a panic degrades to a null result instead
   of aborting the process inside V8's FFI frame; `panic = "unwind"` is pinned in
   the release profile.

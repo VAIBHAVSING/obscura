@@ -1,8 +1,8 @@
 ## Setup
 
 ```bash
-obscura serve --port 9222
-npm install puppeteer-core
+npm install @obscura/browser puppeteer-core
+npx --package @obscura/browser obscura-browser serve --port 9222 --json
 ```
 
 ## Connect
@@ -159,7 +159,7 @@ Frames are activity-driven page captures, not fixed-rate desktop video.
 ## Disconnect
 
 ```js
-await browser.disconnect();  // leaves obscura serve running
+await browser.disconnect();  // leaves the browser service running
 ```
 
 ## Current limits

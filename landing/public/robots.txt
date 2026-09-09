@@ -1,0 +1,5 @@
+User-agent: *
+Allow: /
+
+Sitemap: https://domjet.dev/sitemap-index.xml
+

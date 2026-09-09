@@ -36,7 +36,7 @@ body:
     attributes:
       label: How are you using obscura?
       options:
-        - CLI (fetch / serve / scrape / mcp)
+        - Node CLI (eval / screenshot / pdf / serve)
         - CDP server with Puppeteer or Playwright
         - Embedded Rust library (obscura crate)
         - Other
@@ -48,8 +48,8 @@ body:
       label: Stealth mode
       options:
         - "Off (default build)"
-        - "On (--stealth, default build)"
-        - "On (--stealth, --features stealth build)"
+        - "On (Rust --features stealth build)"
+        - "On (custom embedding configuration)"
     validations:
       required: false
   - type: textarea
@@ -58,7 +58,7 @@ body:
       label: Reproduction
       description: A URL, an `--eval` snippet, or a short CDP sequence. Multi-statement `--eval` that starts with `const` returns null, so wrap it in an IIFE.
       placeholder: |
-        obscura fetch https://example.com --eval "(function(){ return document.title; })()"
+        npx --package @obscura/browser obscura-browser eval https://example.com "document.title"
     validations:
       required: true
   - type: textarea

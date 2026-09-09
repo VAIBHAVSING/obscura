@@ -49,9 +49,9 @@ async fn my_test() {
 ## Logging
 
 ```bash
-RUST_LOG=obscura=info  obscura serve
-RUST_LOG=obscura=debug obscura serve
-RUST_LOG=obscura_cdp=trace,obscura_browser=debug obscura serve
+RUST_LOG=obscura=info cargo nextest run --release -p obscura-cdp
+RUST_LOG=obscura=debug cargo nextest run --release -p obscura-browser
+RUST_LOG=obscura_cdp=trace,obscura_browser=debug cargo nextest run --release -p obscura-cdp
 ```
 
 Logs go to stderr.
@@ -61,7 +61,7 @@ Logs go to stderr.
 ## Driving the CDP server manually
 
 ```bash
-obscura serve --port 9222 --verbose
+npx --package @obscura/browser obscura-browser serve --port 9222 --json
 ```
 
 In another shell:
@@ -110,10 +110,8 @@ Start with the committed deterministic fixtures, then use the representative
 real-site suite at both the top and bottom of pages:
 
 ```bash
-RUN_ROOT="$(mktemp -d)"
-OBSCURA_BIN=./target/release/obscura render-repros/run.sh "$RUN_ROOT/fixtures"
-OBSCURA_BIN=./target/release/obscura render-repros/representative-suite/run.sh "$RUN_ROOT/top"
-OBSCURA_BIN=./target/release/obscura render-repros/representative-suite/run.sh "$RUN_ROOT/bottom" bottom
+npm run build
+npm test -w @obscura/browser
 ```
 
 Set `BASELINE_BIN` or `CHROMIUM_BIN` when producing paired captures. Keep the
@@ -129,23 +127,25 @@ CPU with `perf` and a flamegraph:
 
 ```bash
 cargo build --release --features render
-perf record -F 99 -g -- ./target/release/obscura fetch https://heavy-spa.example
+perf record -F 99 -g -- cargo test -p obscura-browser --release
 perf script | flamegraph.pl > flame.svg
 ```
 
 Memory with heaptrack:
 
 ```bash
-heaptrack ./target/release/obscura serve
+heaptrack cargo test -p obscura-browser --release
 ```
 
 Tokio task inspection:
 
 ```bash
-RUSTFLAGS="--cfg tokio_unstable" cargo build --release --features render
-./target/release/obscura serve
+RUSTFLAGS="--cfg tokio_unstable" cargo build --release -p obscura-cdp --features render
+npx --package @obscura/browser obscura-browser serve --port 9222 --json
 # in another shell
 tokio-console
 ```
 
-Requires the workspace `tokio` dependency to be built with the `tracing` feature; not enabled by default, add it in the relevant `Cargo.toml` before profiling.
+Requires the workspace `tokio` dependency to be built with the `tracing`
+feature; not enabled by default, add it in the relevant `Cargo.toml` before
+profiling.

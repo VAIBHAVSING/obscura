@@ -120,7 +120,7 @@ page.goto("https://example.com").await?;
 page.settle(2000).await;
 ```
 
-A `Continue` with `url: Some(...)` rewrites the target. The new URL is re-checked against the SSRF / private-network gate, so a rewrite cannot reach an internal address that would otherwise need `--allow-private-network`.
+A `Continue` with `url: Some(...)` rewrites the target. The new URL is re-checked against the SSRF / private-network gate, so a rewrite cannot reach an internal address unless the embedding configuration explicitly permits it.
 
 ### Preload scripts
 
@@ -138,5 +138,7 @@ page.goto("https://example.com").await?;
 
 - Embedding the engine in a Rust service: this crate.
 - Driving from Node/Python with existing Puppeteer/Playwright code: the [CDP server](Connect-Puppeteer-or-Playwright.md).
-- Giving an AI agent browser tools: the [MCP server](Use-the-MCP-server.md).
-- One-off fetches and scraping from the shell: the [CLI](CLI-reference.md).
+- Giving an AI agent browser tools: build an integration on top of
+  `BrowserContext` and `Page`, or use the Node.js browser package.
+- One-off evaluation and capture from the shell: use the
+  `obscura-browser` utility from `@obscura/browser`.

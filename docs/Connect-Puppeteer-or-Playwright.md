@@ -4,7 +4,8 @@ Playwright can connect to its CDP endpoint for the supported workflows below.
 ## Start the server
 
 ```bash
-obscura serve --port 9222
+npm install @obscura/browser
+npx --package @obscura/browser obscura-browser serve --port 9222 --json
 ```
 
 ```
@@ -95,9 +96,8 @@ await page.screenshot({ path: 'full-page.png', fullPage: true });
 await page.pdf({ path: 'page.pdf', format: 'A4', printBackground: true });
 ```
 
-Rendering is included in official binaries and requires `--features render`
-for source builds. The client-specific guides cover scrolling, raw CDP
-screencasting, and current output limits.
+Rendering is included in the `@obscura/browser` package. The client-specific
+guides cover scrolling, raw CDP screencasting, and current output limits.
 
 ## Current limits
 

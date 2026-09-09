@@ -1,8 +1,8 @@
 ## Setup
 
 ```bash
-obscura serve --port 9222
-npm install playwright
+npm install @obscura/browser playwright
+npx --package @obscura/browser obscura-browser serve --port 9222 --json
 ```
 
 ## Connect
@@ -144,7 +144,7 @@ Frames are activity-driven page captures, not fixed-rate desktop video.
 ## Disconnect
 
 ```js
-await browser.close();  // closes the CDP connection, leaves obscura serve running
+await browser.close();  // closes the CDP connection, leaves the service running
 ```
 
 ## Current limits
@@ -152,8 +152,7 @@ await browser.close();  // closes the CDP connection, leaves obscura serve runni
 - Playwright `page.video()` and tracing artifacts that require desktop capture
   are not implemented. Use the raw CDP flow above for page frames.
 - `BrowserContext` storage-state save/restore remains limited; use
-  `--storage-dir` on `obscura serve`, as described in
-  [Persist cookies and storage](Persist-cookies-and-storage.md).
+  the profile persistence options in the `@obscura/browser` package.
 - Service workers, native media, some Web APIs, long-tail CSS, and compositor
   behavior remain incomplete relative to Chromium.
 - PDF text is not selectable/searchable and tagged PDF is not yet available.
